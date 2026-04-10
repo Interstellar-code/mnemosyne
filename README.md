@@ -77,7 +77,7 @@ We benchmarked Mnemosyne on **LongMemEval** (ICLR 2025), the standard benchmark 
 | Full-context GPT-4o baseline | ~60.2% accuracy | No memory system, just raw context |
 | ChatGPT (GPT-4o) online | ~57.7% accuracy | Drops sharply on multi-session tasks |
 
-**Takeaway:** Mnemosyne’s dense-retrieval upgrade puts it in the top tier of published LongMemEval results — competitive with Mempalace, Backboard, and Hindsight — while remaining 100% local and open-source.
+**Takeaway:** Mnemosyne's dense-retrieval upgrade puts it in the top tier of published LongMemEval results — competitive with Mempalace, Backboard, and Hindsight — while remaining 100% local and open-source.
 
 ---
 
@@ -94,7 +94,37 @@ Benchmarked on standard developer hardware:
 
 \* Search latency with dense retrieval depends on corpus size. Sub-10ms for <10k memories on CPU.
 
-**Why this matters for Hermes:** Every millisecond counts when your agent is processing tool calls. Mnemosyne's sub-millisecond latency means memory retrieval adds zero perceptible delay to agent responses.
+---
+
+## 🚀 BEAM Architecture Benchmarks (April 2026)
+
+Run on CPU with `sqlite-vec` + FTS5 enabled:
+
+### Write & Insert Latency
+
+| Operation | Count | Total | Avg | Throughput |
+|-----------|-------|-------|-----|------------|
+| Working memory writes | 500 | 8.7s | **17.4 ms** | 58 ops/sec |
+| Episodic inserts (with embedding) | 500 | 10.7s | **21.3 ms** | 47 ops/sec |
+| Scratchpad write | 100 | 0.58s | **5.8 ms** | 172 ops/sec |
+| Sleep consolidation | 300 old items | 33 ms | — | — |
+
+*Write latency is dominated by ONNX embedding generation (`fastembed`) on CPU. This is expected and can be batched for bulk ingestion.*
+
+### Hybrid Recall Scaling
+
+The killer feature: query latency stays flat as the episodic corpus grows because `sqlite-vec` and FTS5 handle ranking inside SQLite.
+
+| Corpus Size | Query | Avg Latency | p95 |
+|-------------|-------|-------------|-----|
+| 100 | "concept 42" | **5.1 ms** | 6.9 ms |
+| 500 | "concept 42" | **5.0 ms** | 5.7 ms |
+| 1,000 | "concept 42" | **5.3 ms** | 6.5 ms |
+| **2,000** | **"concept 42"** | **7.0 ms** | **8.6 ms** |
+
+At 2,000 episodic memories, hybrid recall is still **sub-10ms** on a standard CPU. The old flat-scan architecture would linearly degrade past a few hundred rows because it scored every embedding in Python.
+
+**Why this matters for Hermes:** Memory retrieval stays invisible. Even as your agent accumulates months of conversation, context injection never becomes a bottleneck.
 
 ---
 
