@@ -31,6 +31,7 @@
 
 ---
 
+<a id="built-for-hermes-agent"></a>
 ## 🏛️ Built for Hermes Agent
 
 **Mnemosyne was purpose-built for the Hermes AI Agent framework** to provide native, zero-cloud memory that rivals cloud solutions without the latency, cost, or privacy concerns.
@@ -46,6 +47,7 @@ While other memory systems such as Honcho offer a hosted cloud option (accessed 
 
 ---
 
+<a id="what-is-new--the-level-up"></a>
 ## 🚀 What is New — The "Level Up"
 
 Mnemosyne recently underwent a major upgrade to compete with state-of-the-art memory systems:
@@ -112,6 +114,7 @@ User preferences should travel everywhere. `remember(..., scope="global")` makes
 
 ---
 
+<a id="upgrading-from-earlier-mnemosyne-versions"></a>
 ## 🔄 Upgrading from Earlier Mnemosyne Versions
 
 If you started with Mnemosyne before the BEAM architecture (pre-April 2026), run the migration script:
@@ -155,6 +158,7 @@ python scripts/migrate_from_legacy.py --dry-run
 
 ---
 
+<a id="benchmarks-mnemosyne-vs-the-field"></a>
 ## 📊 Benchmarks: Mnemosyne vs. The Field
 
 We benchmarked Mnemosyne on **LongMemEval** (ICLR 2025), a widely-cited benchmark for long-term conversational memory. Like any synthetic eval, it measures retrieval under controlled conditions and should be paired with real-world usage tests.
@@ -177,6 +181,7 @@ We benchmarked Mnemosyne on **LongMemEval** (ICLR 2025), a widely-cited benchmar
 
 ---
 
+<a id="performance-mnemosyne-vs-cloud-alternatives"></a>
 ## ⚡ Performance: Mnemosyne vs. Cloud Alternatives
 
 Benchmarked on standard developer hardware:
@@ -192,6 +197,7 @@ Benchmarked on standard developer hardware:
 
 ---
 
+<a id="beam-architecture-benchmarks-april-2026"></a>
 ## 🚀 BEAM Architecture Benchmarks (April 2026)
 
 Run on CPU with `sqlite-vec` + FTS5 enabled:
@@ -234,6 +240,7 @@ At 10,000 working memories, recall is still **sub-10ms**. The old architecture w
 
 ---
 
+<a id="hermes-plugin-integration"></a>
 ## 🚀 Hermes Plugin Integration
 
 ### Zero-Config Auto-Context
@@ -272,6 +279,7 @@ Global memories are injected first, followed by session-specific context. Expire
 
 ---
 
+<a id="installation-for-hermes"></a>
 ## 📦 Installation for Hermes
 
 ### Option 1: Native Plugin (Recommended)
@@ -340,6 +348,7 @@ pip install ctransformers huggingface-hub
 
 ---
 
+<a id="usage-in-hermes"></a>
 ## 🔧 Usage in Hermes
 
 ### As a User
@@ -402,6 +411,7 @@ kg.query("Maya", as_of="2026-02-01")
 
 ---
 
+<a id="cli-commands"></a>
 ## 💻 CLI Commands
 
 Mnemosyne is primarily a library. Use Python directly:
@@ -419,6 +429,7 @@ python tests/benchmark_beam_working_memory.py
 
 ---
 
+<a id="architecture"></a>
 ## 🏗️ Architecture
 
 ### BEAM: Native SQLite + sqlite-vec + FTS5
@@ -463,6 +474,7 @@ python tests/benchmark_beam_working_memory.py
 
 ---
 
+<a id="disaster-recovery"></a>
 ## 🛡️ Disaster Recovery
 
 Mnemosyne stores everything in a single SQLite file. Back it up like any database:
@@ -484,6 +496,7 @@ cp ~/backups/mnemosyne_20260405.db ~/.hermes/mnemosyne/data/mnemosyne.db
 
 ---
 
+<a id="comparison-mnemosyne-vs-alternatives"></a>
 ## 📊 Comparison: Mnemosyne vs. Alternatives
 
 *Scores and latencies are self-reported by each project unless noted otherwise.*
@@ -522,6 +535,7 @@ cp ~/backups/mnemosyne_20260405.db ~/.hermes/mnemosyne/data/mnemosyne.db
 
 ---
 
+<a id="testing-with-hermes"></a>
 ## 🧪 Testing with Hermes
 
 ```bash
@@ -542,6 +556,7 @@ python tests/benchmark_beam_working_memory.py
 
 ---
 
+<a id="contributing"></a>
 ## 🤝 Contributing
 
 Mnemosyne is the default memory system for Hermes. Contributions welcome:
