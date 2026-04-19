@@ -23,7 +23,9 @@ Add behavioral memory tracking (recall counts, timestamps) and recency-aware sco
 | 4 | Plugin tool updates | `hermes_plugin/tools.py` | Low — additive params |
 | 5 | Integration test + live DB migration | `tests/`, live DB | Medium — schema change on prod |
 | 6 | Backup, deploy, verify | `dr/`, git | Low — DR exists |
-| 7 | **Local LLM consolidation (replaces aaak)** | `local_llm.py`, `beam.py` | Medium — new dependency, optional |
+| 7 | Local LLM consolidation (replaces aaak) | `local_llm.py`, `beam.py` | Medium — new dependency, optional |
+| 8 | **Temporal validity + invalidation** | `beam.py` | Medium — schema + query changes |
+| 9 | **Cross-session global memory** | `beam.py` | Medium — scope filtering in recall |
 
 **Out of scope:** Auto-context injection (requires Hermes core changes), graph edge traversal.
 
@@ -110,10 +112,10 @@ Inside `BeamMemory.remember()`:
 
 **Goal:** Replace lossy aaak compression with actual semantic summarization via a tiny local model.
 
-**Model:** Qwen2.5-0.5B-Instruct (GGUF Q4_K_M, ~400MB)  
-**Runtime:** `llama-cpp-python` (CPU-only, no GPU/CUDA required)  
+**Model:** TinyLlama-1.1B-Chat-v1.0-GGUF (Q4_K_M, ~640MB)  
+**Runtime:** `ctransformers` (CPU-only, no GPU/CUDA required)  
 **Model cache:** `~/.hermes/mnemosyne/models/`  
-**Download:** On-demand via HuggingFace `bartowski/` GGUF mirror  
+**Download:** On-demand via HuggingFace  
 **Fallback:** If LLM unavailable, model missing, or inference fails → fall back to aaak encoding
 
 **Architecture:**
@@ -130,8 +132,8 @@ Inside `BeamMemory.remember()`:
     └────┬────┘
          │
     ┌────▼────┐     ┌──────────────┐
-    │ llama   │     │ aaak_encode  │
-    │ _cpp    │     │ (fallback)   │
+    │ ctrans  │     │ aaak_encode  │
+    │ formers │     │ (fallback)   │
     └────┬────┘     └──────────────┘
          │
     ┌────▼────┐
@@ -140,30 +142,48 @@ Inside `BeamMemory.remember()`:
     └─────────┘
 ```
 
-**Prompt template:**
-```
-You are a memory consolidation system. Summarize the following memories 
-into 1-3 concise sentences. Preserve facts, names, preferences, and 
-decisions. Discard fluff and temporal noise.
-
-Memories:
-- {memory_1}
-- {memory_2}
-...
-
-Summary:
-```
-
 **Config via env vars:**
 ```
-MNEMOSYNE_LLM_ENABLED=true           # default true
-MNEMOSYNE_LLM_MODEL=Qwen2.5-0.5B     # default model key
-MNEMOSYNE_LLM_MAX_TOKENS=256         # max output tokens
-MNEMOSYNE_LLM_N_THREADS=4            # CPU threads
-MNEMOSYNE_LLM_N_CTX=2048             # context window
+MNEMOSYNE_LLM_ENABLED=true
+MNEMOSYNE_LLM_MAX_TOKENS=256
+MNEMOSYNE_LLM_N_THREADS=4
+MNEMOSYNE_LLM_REPO=TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF
+MNEMOSYNE_LLM_FILE=tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
 ```
 
-**Memory budget:** Model loads once per process (lazy singleton). ~400MB RAM when loaded. Unloaded after idle timeout (optional).
+### 5.5 Temporal validity + invalidation (Phase 8)
+
+**Goal:** Memories like "Cartesia API key is X" have a shelf life. Allow setting `valid_until` and marking memories as superseded.
+
+**Schema:**
+```sql
+ALTER TABLE working_memory ADD COLUMN valid_until TIMESTAMP DEFAULT NULL;
+ALTER TABLE working_memory ADD COLUMN superseded_by TEXT DEFAULT NULL;
+ALTER TABLE episodic_memory ADD COLUMN valid_until TIMESTAMP DEFAULT NULL;
+ALTER TABLE episodic_memory ADD COLUMN superseded_by TEXT DEFAULT NULL;
+```
+
+**Behavior:**
+- `remember(..., valid_until="2026-12-31T00:00:00")` → memory auto-expires after that date
+- `recall()` filters out `valid_until < now()` AND `superseded_by IS NOT NULL`
+- `invalidate(memory_id)` sets `superseded_by = new_memory_id` or `valid_until = now()`
+- Triple store already has `valid_from` — we extend this to the memory tables
+
+### 5.6 Cross-session global memory (Phase 9)
+
+**Goal:** User preferences should travel across sessions. Conversation-specific context stays bounded.
+
+**Schema:**
+```sql
+ALTER TABLE working_memory ADD COLUMN scope TEXT DEFAULT 'session';
+ALTER TABLE episodic_memory ADD COLUMN scope TEXT DEFAULT 'session';
+```
+
+**Behavior:**
+- `remember(..., scope="global")` → visible in all sessions
+- `recall()` searches: current `session_id` + all `scope='global'` memories
+- `get_context()` injects global memories first, then session memories
+- Default scope is `"session"` for backward compatibility
 
 ---
 
@@ -203,6 +223,11 @@ MNEMOSYNE_LLM_N_CTX=2048             # context window
 - [x] LLM fallback to aaak works when model unavailable
 - [x] Model loads once and reuses across sleep() calls
 - [x] No cloud API calls during consolidation
+- [x] `valid_until` auto-filters expired memories from recall
+- [x] `invalidate()` marks memories as expired/superseded
+- [x] `scope='global'` memories visible across all sessions
+- [x] `get_context()` prioritizes global memories
+- [x] Backward compatibility: old calls without valid_until/scope still work
 
 ---
 
@@ -218,3 +243,5 @@ MNEMOSYNE_LLM_N_CTX=2048             # context window
 | Phase 5: Test + migrate | DONE | 2026-04-19 02:27 UTC |
 | Phase 6: Deploy + verify | DONE | 2026-04-19 02:27 UTC |
 | Phase 7: Local LLM consolidation | DONE | 2026-04-19 02:39 UTC |
+| Phase 8: Temporal validity + invalidation | DONE | 2026-04-19 02:42 UTC |
+| Phase 9: Cross-session global memory | DONE | 2026-04-19 02:42 UTC |

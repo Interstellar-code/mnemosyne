@@ -247,6 +247,14 @@ def init_beam(db_path: Path = None):
     _add_column_if_missing(conn, "episodic_memory", "recall_count", "INTEGER DEFAULT 0")
     _add_column_if_missing(conn, "episodic_memory", "last_recalled", "TIMESTAMP DEFAULT NULL")
 
+    # --- Migration: temporal validity + scope (v2.2) ---
+    _add_column_if_missing(conn, "working_memory", "valid_until", "TIMESTAMP DEFAULT NULL")
+    _add_column_if_missing(conn, "working_memory", "superseded_by", "TEXT DEFAULT NULL")
+    _add_column_if_missing(conn, "working_memory", "scope", "TEXT DEFAULT 'session'")
+    _add_column_if_missing(conn, "episodic_memory", "valid_until", "TIMESTAMP DEFAULT NULL")
+    _add_column_if_missing(conn, "episodic_memory", "superseded_by", "TEXT DEFAULT NULL")
+    _add_column_if_missing(conn, "episodic_memory", "scope", "TEXT DEFAULT 'session'")
+
 
 def _generate_id(content: str) -> str:
     return hashlib.sha256(f"{content}{datetime.now().isoformat()}".encode()).hexdigest()[:16]
@@ -406,7 +414,8 @@ class BeamMemory:
         return row["id"] if row else None
 
     def remember(self, content: str, source: str = "conversation",
-                 importance: float = 0.5, metadata: Dict = None) -> str:
+                 importance: float = 0.5, metadata: Dict = None,
+                 valid_until: str = None, scope: str = "session") -> str:
         """Store into working_memory. Deduplicates exact content matches."""
         # --- Deduplication: exact match ---
         existing_id = self._find_duplicate(content)
@@ -414,9 +423,12 @@ class BeamMemory:
             cursor = self.conn.cursor()
             cursor.execute("""
                 UPDATE working_memory
-                SET importance = MAX(importance, ?), timestamp = ?, source = ?
+                SET importance = MAX(importance, ?), timestamp = ?, source = ?,
+                    valid_until = COALESCE(?, valid_until),
+                    scope = COALESCE(?, scope)
                 WHERE id = ? AND session_id = ?
-            """, (importance, datetime.now().isoformat(), source, existing_id, self.session_id))
+            """, (importance, datetime.now().isoformat(), source,
+                  valid_until, scope, existing_id, self.session_id))
             self.conn.commit()
             return existing_id
 
@@ -424,9 +436,11 @@ class BeamMemory:
         timestamp = datetime.now().isoformat()
         cursor = self.conn.cursor()
         cursor.execute("""
-            INSERT INTO working_memory (id, content, source, timestamp, session_id, importance, metadata_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (memory_id, content, source, timestamp, self.session_id, importance, json.dumps(metadata or {})))
+            INSERT INTO working_memory
+            (id, content, source, timestamp, session_id, importance, metadata_json, valid_until, scope)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (memory_id, content, source, timestamp, self.session_id, importance,
+              json.dumps(metadata or {}), valid_until, scope))
         self.conn.commit()
         self._trim_working_memory()
         return memory_id
@@ -476,16 +490,48 @@ class BeamMemory:
         self.conn.commit()
 
     def get_context(self, limit: int = 10) -> List[Dict]:
-        """Get recent working_memory for prompt injection."""
+        """Get recent working_memory for prompt injection.
+        Global memories are returned first, then session memories."""
         cursor = self.conn.cursor()
+        now = datetime.now().isoformat()
         cursor.execute("""
-            SELECT id, content, source, timestamp, importance
+            SELECT id, content, source, timestamp, importance, scope
             FROM working_memory
-            WHERE session_id = ?
-            ORDER BY timestamp DESC
+            WHERE (session_id = ? OR scope = 'global')
+              AND (valid_until IS NULL OR valid_until > ?)
+              AND superseded_by IS NULL
+            ORDER BY
+                CASE WHEN scope = 'global' THEN 0 ELSE 1 END,
+                timestamp DESC
             LIMIT ?
-        """, (self.session_id, limit))
+        """, (self.session_id, now, limit))
         return [dict(row) for row in cursor.fetchall()]
+
+    def invalidate(self, memory_id: str, replacement_id: str = None) -> bool:
+        """
+        Mark a memory as invalid/superseded.
+        If replacement_id is provided, sets superseded_by.
+        Otherwise sets valid_until to now (immediate expiry).
+        """
+        cursor = self.conn.cursor()
+        now = datetime.now().isoformat()
+        # Try working_memory first
+        cursor.execute("""
+            UPDATE working_memory
+            SET valid_until = ?, superseded_by = ?
+            WHERE id = ? AND (session_id = ? OR scope = 'global')
+        """, (now, replacement_id, memory_id, self.session_id))
+        if cursor.rowcount > 0:
+            self.conn.commit()
+            return True
+        # Try episodic_memory
+        cursor.execute("""
+            UPDATE episodic_memory
+            SET valid_until = ?, superseded_by = ?
+            WHERE id = ? AND (session_id = ? OR scope = 'global')
+        """, (now, replacement_id, memory_id, self.session_id))
+        self.conn.commit()
+        return cursor.rowcount > 0
 
     def get_working_stats(self) -> Dict:
         cursor = self.conn.cursor()
@@ -506,7 +552,8 @@ class BeamMemory:
     # ------------------------------------------------------------------
     def consolidate_to_episodic(self, summary: str, source_wm_ids: List[str],
                                 source: str = "consolidation", importance: float = 0.6,
-                                metadata: Dict = None) -> str:
+                                metadata: Dict = None, valid_until: str = None,
+                                scope: str = "session") -> str:
         """
         Store a consolidated summary into episodic_memory with optional embedding.
         """
@@ -514,10 +561,11 @@ class BeamMemory:
         timestamp = datetime.now().isoformat()
         cursor = self.conn.cursor()
         cursor.execute("""
-            INSERT INTO episodic_memory (id, content, source, timestamp, session_id, importance, metadata_json, summary_of)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO episodic_memory
+            (id, content, source, timestamp, session_id, importance, metadata_json, summary_of, valid_until, scope)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (memory_id, summary, source, timestamp, self.session_id, importance,
-              json.dumps(metadata or {}), ",".join(source_wm_ids)))
+              json.dumps(metadata or {}), ",".join(source_wm_ids), valid_until, scope))
         rowid = cursor.lastrowid
 
         if _embeddings.available():
@@ -551,21 +599,26 @@ class BeamMemory:
             placeholders = ",".join("?" * len(wm_ids))
             cursor = self.conn.cursor()
             cursor.execute(f"""
-                SELECT id, content, source, timestamp, importance, recall_count, last_recalled
+                SELECT id, content, source, timestamp, importance, recall_count, last_recalled, valid_until, superseded_by, scope
                 FROM working_memory
-                WHERE id IN ({placeholders}) AND session_id = ?
-            """, (*tuple(wm_ids), self.session_id))
+                WHERE id IN ({placeholders})
+                  AND (session_id = ? OR scope = 'global')
+                  AND (valid_until IS NULL OR valid_until > ?)
+                  AND superseded_by IS NULL
+            """, (*tuple(wm_ids), self.session_id, datetime.now().isoformat()))
             rows = cursor.fetchall()
         else:
             # Fallback: fetch recent items and score in Python (old path)
             cursor = self.conn.cursor()
             cursor.execute(f"""
-                SELECT id, content, source, timestamp, importance, recall_count, last_recalled
+                SELECT id, content, source, timestamp, importance, recall_count, last_recalled, valid_until, superseded_by, scope
                 FROM working_memory
-                WHERE session_id = ?
+                WHERE (session_id = ? OR scope = 'global')
+                  AND (valid_until IS NULL OR valid_until > ?)
+                  AND superseded_by IS NULL
                 ORDER BY timestamp DESC
                 LIMIT {min(EPISODIC_RECALL_LIMIT, 2000)}
-            """, (self.session_id,))
+            """, (self.session_id, datetime.now().isoformat()))
             rows = cursor.fetchall()
 
         if wm_ranks:
@@ -599,7 +652,10 @@ class BeamMemory:
                     "importance": row["importance"],
                     "recall_count": row["recall_count"] or 0,
                     "last_recalled": row["last_recalled"],
-                    "recency_decay": round(decay, 4)
+                    "recency_decay": round(decay, 4),
+                    "scope": row["scope"] if "scope" in row.keys() else "session",
+                    "valid_until": row["valid_until"] if "valid_until" in row.keys() else None,
+                    "superseded_by": row["superseded_by"] if "superseded_by" in row.keys() else None
                 })
 
         # ---- Episodic memory (vec + FTS5 hybrid) ----
@@ -627,10 +683,13 @@ class BeamMemory:
             placeholders = ",".join("?" * len(episodic_rowids))
             cursor = self.conn.cursor()
             cursor.execute(f"""
-                SELECT rowid, id, content, source, timestamp, importance, recall_count, last_recalled
+                SELECT rowid, id, content, source, timestamp, importance, recall_count, last_recalled, valid_until, superseded_by, scope
                 FROM episodic_memory
-                WHERE rowid IN ({placeholders}) AND session_id = ?
-            """, (*tuple(episodic_rowids), self.session_id))
+                WHERE rowid IN ({placeholders})
+                  AND (session_id = ? OR scope = 'global')
+                  AND (valid_until IS NULL OR valid_until > ?)
+                  AND superseded_by IS NULL
+            """, (*tuple(episodic_rowids), self.session_id, datetime.now().isoformat()))
             for row in cursor.fetchall():
                 rid = row["rowid"]
                 sim = vec_results.get(rid, 0.0)
@@ -651,7 +710,10 @@ class BeamMemory:
                     "importance": row["importance"],
                     "recall_count": row["recall_count"] or 0,
                     "last_recalled": row["last_recalled"],
-                    "recency_decay": round(decay, 4)
+                    "recency_decay": round(decay, 4),
+                    "scope": row["scope"] if "scope" in row.keys() else "session",
+                    "valid_until": row["valid_until"] if "valid_until" in row.keys() else None,
+                    "superseded_by": row["superseded_by"] if "superseded_by" in row.keys() else None
                 })
 
         results.sort(key=lambda x: x["score"], reverse=True)
