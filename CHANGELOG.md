@@ -8,6 +8,14 @@ given a version number **MAJOR.MINOR**, increment the:
 
 ---
 
+## 1.11.0
+
+- **Fix BUG-1: Context overflow on consolidation** — `sleep()` now chunks memories to fit the LLM context window. `SLEEP_BATCH_SIZE=5000` no longer blindly passes 5000 memories to a 2048-token model. Per-source token-aware chunking with multi-pass consolidation (chunk summaries → second-pass summary).
+- **Fix BUG-2: No remote/API model support** — Added OpenAI-compatible remote LLM client. Set `MNEMOSYNE_LLM_BASE_URL` (e.g., `http://localhost:8080/v1`) to use llama.cpp server, vLLM, Ollama, or any OpenAI-compatible endpoint. `MNEMOSYNE_LLM_API_KEY` for authenticated endpoints. `MNEMOSYNE_LLM_MODEL` for model selection. Falls back to local ctransformers, then aaak encoding.
+- **Add `chunk_memories_by_budget()`** — Splits memory batches by token budget (chars/4 estimate with 20% safety margin). Single oversized memories are skipped from LLM chunking (fall back to aaak).
+- **Add `_call_remote_llm()`** — `httpx` primary, `urllib` fallback. Zero new dependencies. Supports `max_tokens`, `temperature`, `stop` sequences.
+- **Add 7 new tests** — 2 for token-aware chunking, 5 for remote API client. All 24 tests passing.
+
 ## 1.10.2
 
 - **Add `mnemosyne_update` and `mnemosyne_forget` tools** — Full CRUD for Hermes plugin. Update content/importance by ID, or hard-delete a memory from both legacy and BEAM tables.

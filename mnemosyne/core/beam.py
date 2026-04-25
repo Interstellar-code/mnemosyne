@@ -918,12 +918,35 @@ class BeamMemory:
                     if aggregated_valid_until is None or item["valid_until"] < aggregated_valid_until:
                         aggregated_valid_until = item["valid_until"]
 
-            # --- Try local LLM summarization first ---
+            # --- Try LLM summarization (chunked to fit context) ---
             summary = None
             if local_llm.llm_available():
-                summary = local_llm.summarize_memories(lines, source=source)
-                if summary:
-                    llm_used_count += 1
+                chunks = local_llm.chunk_memories_by_budget(lines, source=source)
+                if chunks:
+                    if len(chunks) == 1:
+                        # All memories fit in one prompt
+                        summary = local_llm.summarize_memories(chunks[0], source=source)
+                    else:
+                        # Multi-chunk: summarize each chunk, then summarize the summaries
+                        chunk_summaries = []
+                        for chunk in chunks:
+                            chunk_summary = local_llm.summarize_memories(chunk, source=source)
+                            if chunk_summary:
+                                chunk_summaries.append(chunk_summary)
+                        if chunk_summaries:
+                            # Second-pass: summarize the chunk summaries
+                            if len(chunk_summaries) == 1:
+                                summary = chunk_summaries[0]
+                            else:
+                                summary = local_llm.summarize_memories(
+                                    chunk_summaries,
+                                    source=f"{source} (consolidated)"
+                                )
+                                # If second-pass also overflows, concatenate
+                                if not summary:
+                                    summary = " | ".join(chunk_summaries)
+                    if summary:
+                        llm_used_count += 1
 
             # --- Fallback to aaak encoding ---
             if summary is None:

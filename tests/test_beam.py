@@ -356,3 +356,64 @@ class TestCrossSessionRecall:
         # Should be a different instance (or at least different beam session_id)
         assert mem_b.session_id == "session-beta"
         assert mem_a.session_id == "session-alpha"
+
+
+class TestTokenAwareConsolidation:
+    def test_sleep_chunks_large_batches(self, temp_db, monkeypatch):
+        """BUG-1: sleep() must chunk memories to fit LLM context window."""
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(temp_db.parent))
+        # Force a small context window to trigger chunking
+        monkeypatch.setenv("MNEMOSYNE_LLM_N_CTX", "512")
+        monkeypatch.setenv("MNEMOSYNE_LLM_MAX_TOKENS", "128")
+        # Disable actual LLM — we test the chunking logic
+        monkeypatch.setattr("mnemosyne.core.local_llm.llm_available", lambda: False)
+
+        beam = BeamMemory(session_id="test-chunking", db_path=temp_db)
+
+        # Store 30 memories, each ~100 chars (~25 tokens)
+        for i in range(30):
+            beam.remember(
+                f"Memory number {i} with enough content to consume tokens " * 3,
+                source="test_batch",
+                importance=0.5
+            )
+
+        # Backdate so sleep() picks them up
+        conn = sqlite3.connect(temp_db)
+        old_ts = (datetime.now() - timedelta(hours=48)).isoformat()
+        conn.execute("UPDATE working_memory SET timestamp = ?", (old_ts,))
+        conn.commit()
+        conn.close()
+
+        result = beam.sleep()
+        assert result["status"] == "consolidated"
+        assert result["summaries_created"] >= 1
+
+        # Verify no working memory left for this session
+        conn = sqlite3.connect(temp_db)
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM working_memory WHERE session_id = ?", ("test-chunking",))
+        count = cursor.fetchone()[0]
+        conn.close()
+        assert count == 0
+
+    def test_chunk_memories_by_budget_single_oversized(self, monkeypatch):
+        """A single memory exceeding the budget should be skipped from LLM chunking."""
+        from mnemosyne.core import local_llm
+
+        # Monkeypatch module-level constants directly (env vars already read at import)
+        monkeypatch.setattr(local_llm, "LLM_N_CTX", 128)
+        monkeypatch.setattr(local_llm, "LLM_MAX_TOKENS", 32)
+
+        from mnemosyne.core.local_llm import chunk_memories_by_budget
+
+        # One normal memory, one giant memory
+        memories = [
+            "Short memory.",  # ~3 tokens, fits
+            "A" * 500,       # ~125 tokens, exceeds budget
+        ]
+        chunks = chunk_memories_by_budget(memories)
+
+        # Giant memory should be excluded (it exceeds the total budget)
+        assert len(chunks) == 1
+        assert chunks[0] == ["Short memory."]

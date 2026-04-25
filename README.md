@@ -430,6 +430,30 @@ hermes mnemosyne import --input mnemosyne_backup.json
 | `MNEMOSYNE_WM_MAX_ITEMS` | `10000` | Working memory item limit |
 | `MNEMOSYNE_WM_TTL_HOURS` | `24` | Working memory TTL |
 | `MNEMOSYNE_RECENCY_HALFLIFE` | `168` | Recency decay halflife in hours (1 week) |
+| `MNEMOSYNE_SLEEP_BATCH` | `5000` | Max working memories to fetch for consolidation |
+
+### Local LLM (ctransformers/GGUF)
+
+| Variable | Default | Description |
+|---|---|---|
+| `MNEMOSYNE_LLM_ENABLED` | `true` | Enable LLM summarization in sleep cycle |
+| `MNEMOSYNE_LLM_N_CTX` | `2048` | Context window size for local model |
+| `MNEMOSYNE_LLM_MAX_TOKENS` | `256` | Max output tokens per summary |
+| `MNEMOSYNE_LLM_N_THREADS` | `4` | CPU threads for local inference |
+| `MNEMOSYNE_LLM_REPO` | `TheBloke/TinyLlama...` | HuggingFace repo for GGUF download |
+| `MNEMOSYNE_LLM_FILE` | `tinyllama...Q4_K_M.gguf` | GGUF filename |
+
+### Remote LLM (OpenAI-compatible)
+
+Use a remote model (llama.cpp server, vLLM, Ollama, etc.) instead of local TinyLlama:
+
+| Variable | Default | Description |
+|---|---|---|
+| `MNEMOSYNE_LLM_BASE_URL` | *(none)* | OpenAI-compatible API base URL, e.g. `http://localhost:8080/v1` |
+| `MNEMOSYNE_LLM_API_KEY` | *(none)* | API key for authenticated endpoints |
+| `MNEMOSYNE_LLM_MODEL` | *(none)* | Model identifier sent in requests |
+
+When `BASE_URL` is set, Mnemosyne skips local ctransformers and uses your remote model for consolidation. Falls back to local if remote is unreachable, then to aaak encoding.
 
 ---
 

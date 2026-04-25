@@ -32,6 +32,11 @@ if _env_repo and _env_file:
     DEFAULT_MODEL_REPO = _env_repo
     DEFAULT_MODEL_FILE = _env_file
 
+# Remote API config
+LLM_BASE_URL = os.environ.get("MNEMOSYNE_LLM_BASE_URL", "").rstrip("/")
+LLM_API_KEY = os.environ.get("MNEMOSYNE_LLM_API_KEY", "")
+LLM_REMOTE_MODEL = os.environ.get("MNEMOSYNE_LLM_MODEL", "")
+
 # --- Lazy singleton ----------------------------------------------------------
 _llm_instance = None
 _llm_available = None  # None = not checked yet
@@ -144,13 +149,133 @@ def _clean_output(text: str) -> str:
     return text.strip()
 
 
+def _estimate_tokens(text: str) -> int:
+    """Rough token count: ~4 chars per token for English, with safety margin."""
+    return max(1, len(text) // 4)
+
+
+def _prompt_token_budget() -> int:
+    """Return usable token budget for memory content (reserves overhead + output)."""
+    overhead = 80  # system prompt, formatting tokens, stop sequences
+    output_reserve = LLM_MAX_TOKENS
+    safety_margin = int(LLM_N_CTX * 0.2)  # 20% safety buffer
+    return max(64, LLM_N_CTX - overhead - output_reserve - safety_margin)
+
+
+def chunk_memories_by_budget(memories: List[str], source: str = "") -> List[List[str]]:
+    """
+    Split memories into chunks that fit within the LLM context window.
+    Returns list of memory sublists, each safe to pass to summarize_memories().
+    """
+    if not memories:
+        return []
+
+    budget = _prompt_token_budget()
+    chunks = []
+    current_chunk = []
+    current_tokens = 0
+
+    # Header overhead
+    header = (
+        "Summarize the following memories into 1-3 concise sentences. "
+        "Preserve facts, names, preferences, and decisions. Discard fluff."
+    )
+    if source:
+        header += f" Source: {source}."
+    header_tokens = _estimate_tokens(header + "\n\n")
+
+    # Format overhead per memory ("- " + "\n")
+    format_overhead = _estimate_tokens("- \n")
+
+    available = budget - header_tokens
+
+    for memory in memories:
+        mem_tokens = _estimate_tokens(memory) + format_overhead
+
+        # If a single memory exceeds the entire budget, skip it (will fall back to aaak)
+        if mem_tokens > budget:
+            continue
+
+        if current_tokens + mem_tokens > available and current_chunk:
+            chunks.append(current_chunk)
+            current_chunk = []
+            current_tokens = 0
+
+        current_chunk.append(memory)
+        current_tokens += mem_tokens
+
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    return chunks
+
+
 def llm_available() -> bool:
     """Check whether the local LLM is loaded and ready."""
     global _llm_available
+    # Remote LLM is always "available" if configured (we'll discover at call time)
+    if LLM_BASE_URL:
+        return True
     if _llm_available is not None:
         return _llm_available
     _load_llm()
     return bool(_llm_available)
+
+
+def _call_remote_llm(prompt: str) -> Optional[str]:
+    """Call an OpenAI-compatible remote endpoint for summarization."""
+    if not LLM_BASE_URL:
+        return None
+
+    import json
+
+    # Try httpx first, fall back to urllib
+    try:
+        import httpx
+        has_httpx = True
+    except ImportError:
+        has_httpx = False
+
+    url = f"{LLM_BASE_URL}/chat/completions"
+    headers = {"Content-Type": "application/json"}
+    if LLM_API_KEY:
+        headers["Authorization"] = f"Bearer {LLM_API_KEY}"
+
+    model = LLM_REMOTE_MODEL or "local"  # llama.cpp server accepts any model name
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "user", "content": prompt}
+        ],
+        "max_tokens": LLM_MAX_TOKENS,
+        "temperature": 0.3,
+        "stop": ["</s>", "<|user|>"]
+    }
+
+    try:
+        if has_httpx:
+            with httpx.Client(timeout=60.0) as client:
+                response = client.post(url, json=payload, headers=headers)
+                response.raise_for_status()
+                data = response.json()
+        else:
+            import urllib.request
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode(),
+                headers=headers,
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=60.0) as resp:
+                data = json.loads(resp.read().decode())
+
+        choices = data.get("choices", [])
+        if choices and choices[0].get("message", {}).get("content"):
+            return choices[0]["message"]["content"]
+        return None
+    except Exception:
+        return None
 
 
 def summarize_memories(memories: List[str], source: str = "") -> Optional[str]:
@@ -162,14 +287,24 @@ def summarize_memories(memories: List[str], source: str = "") -> Optional[str]:
     if not memories:
         return None
 
-    llm = _load_llm()
-    if llm is None:
-        return None
-
     prompt = _build_prompt(memories, source=source)
-    try:
-        raw = llm(prompt, max_new_tokens=LLM_MAX_TOKENS, stop=["</s>", "<|user|>"])
-        cleaned = _clean_output(raw)
-        return cleaned if cleaned else None
-    except Exception:
-        return None
+    raw = None
+
+    # --- Try remote LLM first if configured ---
+    if LLM_BASE_URL:
+        raw = _call_remote_llm(prompt)
+        if raw:
+            cleaned = _clean_output(raw)
+            return cleaned if cleaned else None
+
+    # --- Fall back to local ctransformers ---
+    llm = _load_llm()
+    if llm is not None:
+        try:
+            raw = llm(prompt, max_new_tokens=LLM_MAX_TOKENS, stop=["</s>", "<|user|>"])
+            cleaned = _clean_output(raw)
+            return cleaned if cleaned else None
+        except Exception:
+            pass
+
+    return None
