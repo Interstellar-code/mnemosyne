@@ -485,6 +485,10 @@ class BeamMemory:
               json.dumps(metadata or {}), valid_until, scope))
         self.conn.commit()
         self._trim_working_memory()
+        
+        # Auto-generate temporal triple
+        self._add_temporal_triple(memory_id, timestamp, source, content)
+        
         return memory_id
 
     def remember_batch(self, items: List[Dict]) -> List[str]:
@@ -513,6 +517,33 @@ class BeamMemory:
         self.conn.commit()
         self._trim_working_memory()
         return ids
+
+    def _add_temporal_triple(self, memory_id: str, timestamp: str, source: str, content: str):
+        """Auto-generate temporal triple for a memory. Bridges BEAM and TripleStore."""
+        try:
+            # Import triples module lazily to avoid circular dependency
+            from mnemosyne.core.triples import TripleStore, init_triples
+            date_str = timestamp[:10]  # YYYY-MM-DD
+            # Ensure triples table exists
+            init_triples(db_path=self.db_path)
+            triple_store = TripleStore(db_path=self.db_path)
+            triple_store.add(
+                subject=memory_id,
+                predicate="occurred_on",
+                object=date_str,
+                valid_from=date_str
+            )
+            # Also tag source type
+            if source and source not in ("conversation", "user", "assistant"):
+                triple_store.add(
+                    subject=memory_id,
+                    predicate="has_source",
+                    object=source,
+                    valid_from=date_str
+                )
+        except Exception:
+            # TripleStore is optional; don't fail memory write if triples fail
+            pass
 
     def _trim_working_memory(self):
         """Keep working_memory within size/time limits."""
@@ -652,11 +683,16 @@ class BeamMemory:
         self.conn.commit()
         return memory_id
 
-    def recall(self, query: str, top_k: int = 5) -> List[Dict]:
+    def recall(self, query: str, top_k: int = 5, *, from_date: Optional[str] = None, to_date: Optional[str] = None, source: Optional[str] = None, topic: Optional[str] = None) -> List[Dict]:
         """
         Hybrid recall across working_memory + episodic_memory.
         Uses sqlite-vec + FTS5 for episodic, FTS5 for working.
         Falls back to recency-only for working memory if FTS5 unavailable.
+        
+        Temporal filtering:
+            from_date/to_date: ISO date strings (YYYY-MM-DD) to filter by timestamp.
+            source: Filter by memory source (e.g., 'cron', 'user', 'conversation').
+            topic: Filter by topic tag (stored in source field for now, pending dedicated column).
         """
         results = []
         query_lower = query.lower()
@@ -671,6 +707,30 @@ class BeamMemory:
         wm_ids = {r["id"] for r in wm_fts}
         wm_ranks = {r["id"]: r["rank"] for r in wm_fts}
 
+        # Build temporal filter clause for working memory
+        wm_where_clauses = [
+            "(session_id = ? OR scope = 'global')",
+            "(valid_until IS NULL OR valid_until > ?)",
+            "superseded_by IS NULL"
+        ]
+        wm_params = [self.session_id, datetime.now().isoformat()]
+        
+        if from_date:
+            wm_where_clauses.append("timestamp >= ?")
+            wm_params.append(f"{from_date}T00:00:00")
+        if to_date:
+            wm_where_clauses.append("timestamp <= ?")
+            wm_params.append(f"{to_date}T23:59:59")
+        if source:
+            wm_where_clauses.append("source = ?")
+            wm_params.append(source)
+        if topic:
+            # Topic stored in source field for now (pending dedicated topic column)
+            wm_where_clauses.append("source = ?")
+            wm_params.append(topic)
+        
+        wm_where = " AND ".join(wm_where_clauses)
+
         if wm_ids:
             placeholders = ",".join("?" * len(wm_ids))
             cursor = self.conn.cursor()
@@ -678,10 +738,8 @@ class BeamMemory:
                 SELECT id, content, source, timestamp, importance, recall_count, last_recalled, valid_until, superseded_by, scope
                 FROM working_memory
                 WHERE id IN ({placeholders})
-                  AND (session_id = ? OR scope = 'global')
-                  AND (valid_until IS NULL OR valid_until > ?)
-                  AND superseded_by IS NULL
-            """, (*tuple(wm_ids), self.session_id, datetime.now().isoformat()))
+                  AND {wm_where}
+            """, (*tuple(wm_ids), *wm_params))
             rows = cursor.fetchall()
         else:
             # Fallback: fetch recent items and score in Python (old path)
@@ -689,18 +747,20 @@ class BeamMemory:
             cursor.execute(f"""
                 SELECT id, content, source, timestamp, importance, recall_count, last_recalled, valid_until, superseded_by, scope
                 FROM working_memory
-                WHERE (session_id = ? OR scope = 'global')
-                  AND (valid_until IS NULL OR valid_until > ?)
-                  AND superseded_by IS NULL
+                WHERE {wm_where}
                 ORDER BY timestamp DESC
                 LIMIT {min(EPISODIC_RECALL_LIMIT, 2000)}
-            """, (self.session_id, datetime.now().isoformat()))
+            """, wm_params)
             rows = cursor.fetchall()
 
+        # Precompute min_rank/rng for wm_ranks normalization
         if wm_ranks:
             min_rank = min(wm_ranks.values())
             max_rank = max(wm_ranks.values())
             rng = max_rank - min_rank if max_rank != min_rank else 1.0
+        else:
+            min_rank = 0.0
+            rng = 1.0
 
         for row in rows:
             content_lower = row["content"].lower()
@@ -772,6 +832,30 @@ class BeamMemory:
                 fts_results[fr["rowid"]] = normalized
 
         episodic_rowids = set(vec_results.keys()) | set(fts_results.keys())
+        
+        # Build temporal filter for episodic memory
+        em_where_clauses = [
+            "(session_id = ? OR scope = 'global')",
+            "(valid_until IS NULL OR valid_until > ?)",
+            "superseded_by IS NULL"
+        ]
+        em_params = [self.session_id, datetime.now().isoformat()]
+        
+        if from_date:
+            em_where_clauses.append("timestamp >= ?")
+            em_params.append(f"{from_date}T00:00:00")
+        if to_date:
+            em_where_clauses.append("timestamp <= ?")
+            em_params.append(f"{to_date}T23:59:59")
+        if source:
+            em_where_clauses.append("source = ?")
+            em_params.append(source)
+        if topic:
+            em_where_clauses.append("source = ?")
+            em_params.append(topic)
+        
+        em_where = " AND ".join(em_where_clauses)
+        
         if episodic_rowids:
             placeholders = ",".join("?" * len(episodic_rowids))
             cursor = self.conn.cursor()
@@ -779,10 +863,8 @@ class BeamMemory:
                 SELECT rowid, id, content, source, timestamp, importance, recall_count, last_recalled, valid_until, superseded_by, scope
                 FROM episodic_memory
                 WHERE rowid IN ({placeholders})
-                  AND (session_id = ? OR scope = 'global')
-                  AND (valid_until IS NULL OR valid_until > ?)
-                  AND superseded_by IS NULL
-            """, (*tuple(episodic_rowids), self.session_id, datetime.now().isoformat()))
+                  AND {em_where}
+            """, (*tuple(episodic_rowids), *em_params))
             for row in cursor.fetchall():
                 rid = row["rowid"]
                 sim = vec_results.get(rid, 0.0)
@@ -815,12 +897,10 @@ class BeamMemory:
             cursor.execute(f"""
                 SELECT rowid, id, content, source, timestamp, importance, recall_count, last_recalled, valid_until, superseded_by, scope
                 FROM episodic_memory
-                WHERE (session_id = ? OR scope = 'global')
-                  AND (valid_until IS NULL OR valid_until > ?)
-                  AND superseded_by IS NULL
+                WHERE {em_where}
                 ORDER BY timestamp DESC
                 LIMIT {min(EPISODIC_RECALL_LIMIT, 500)}
-            """, (self.session_id, datetime.now().isoformat()))
+            """, em_params)
             for row in cursor.fetchall():
                 content_lower = row["content"].lower()
                 exact = sum(1 for w in query_words if w in content_lower)

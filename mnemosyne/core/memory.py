@@ -147,12 +147,13 @@ class Mnemosyne:
 
         return memory_id
 
-    def recall(self, query: str, top_k: int = 5) -> List[Dict]:
+    def recall(self, query: str, top_k: int = 5, *, from_date: Optional[str] = None, to_date: Optional[str] = None, source: Optional[str] = None, topic: Optional[str] = None) -> List[Dict]:
         """
         Search memories with hybrid relevance scoring.
         Uses BEAM episodic + working memory retrieval (sqlite-vec + FTS5).
+        Supports temporal filtering: from_date, to_date, source, topic.
         """
-        return self.beam.recall(query, top_k=top_k)
+        return self.beam.recall(query, top_k=top_k, from_date=from_date, to_date=to_date, source=source, topic=topic)
 
     def get_context(self, limit: int = 10) -> List[Dict]:
         """
@@ -414,9 +415,9 @@ def remember(content: str, source: str = "conversation",
                                    scope=scope, valid_until=valid_until)
 
 
-def recall(query: str, top_k: int = 5) -> List[Dict]:
-    """Search memories using the global instance"""
-    return _get_default().recall(query, top_k)
+def recall(query: str, top_k: int = 5, *, from_date: Optional[str] = None, to_date: Optional[str] = None, source: Optional[str] = None, topic: Optional[str] = None) -> List[Dict]:
+    """Search memories using the global instance with temporal filtering"""
+    return _get_default().recall(query, top_k, from_date=from_date, to_date=to_date, source=source, topic=topic)
 
 
 def get_context(limit: int = 10) -> List[Dict]:

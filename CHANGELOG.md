@@ -8,6 +8,14 @@ given a version number **MAJOR.MINOR**, increment the:
 
 ---
 
+## 1.13.0
+
+- **Add temporal queries to `recall()`** — Issue #16. `BeamMemory.recall()` now accepts `from_date`, `to_date`, `source`, and `topic` filters. Date filters are applied at the SQL layer for both working_memory and episodic_memory, reducing result sets before hybrid scoring. Source/topic filter by the `source` column (topic pending dedicated column). All filters are keyword-only and backward-compatible.
+- **Auto-generate temporal triples on `remember()`** — Every `remember()` call now creates a `occurred_on` triple in the TripleStore with the memory ID as subject and YYYY-MM-DD as object. Non-generic sources also get a `has_source` triple. TripleStore initialization is lazy and failure-safe — memory writes never fail if triples are unavailable.
+- **Propagate temporal params through API layers** — `Mnemosyne.recall()` (class), `recall()` (module-level), and `BeamMemory.recall()` all accept the same keyword-only filter signature.
+- **Fix `min_rank` UnboundLocalError in fallback scoring** — When FTS5 returns no working-memory matches but temporal filters are active, `wm_ranks` is empty. Precompute `min_rank`/`rng` before the row loop to avoid referencing undefined locals.
+- **Add 6 tests for temporal queries** — from_date, to_date, source, date range, episodic temporal filter, and auto-generated triples. All 25 tests passing.
+
 ## 1.12.0
 
 - **Fix: embeddings generated but discarded when sqlite-vec is absent** — Previously, installing `mnemosyne-memory[embeddings]` without `sqlite-vec` produced identical behavior to the core install. Embeddings were generated during consolidation but thrown away because `_vec_available()` returned False. Now embeddings fall back to the `memory_embeddings` table, and `recall()` uses in-memory numpy cosine similarity when sqlite-vec is unavailable. Semantic search works with just `[embeddings]` installed. Closes #15.

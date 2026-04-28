@@ -358,6 +358,116 @@ class TestCrossSessionRecall:
         assert mem_a.session_id == "session-alpha"
 
 
+class TestTemporalQueries:
+    """Temporal filtering for BEAM recall — Issue #16."""
+
+    def test_recall_from_date_filter(self, temp_db):
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        beam.remember("Meeting about Q1 goals", source="meeting", importance=0.8)
+
+        # Backdate an old memory directly
+        conn = sqlite3.connect(temp_db)
+        old_ts = "2025-01-15T10:00:00"
+        conn.execute(
+            "INSERT INTO working_memory (id, content, source, timestamp, session_id, importance) VALUES (?, ?, ?, ?, ?, ?)",
+            ("old1", "Old project kickoff", "meeting", old_ts, "s1", 0.7)
+        )
+        conn.commit()
+        conn.close()
+
+        # Filter from 2025-04-01 should exclude January memory
+        results = beam.recall("project", from_date="2025-04-01")
+        assert all("Old project kickoff" not in r["content"] for r in results)
+
+    def test_recall_to_date_filter(self, temp_db):
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        beam.remember("Recent standup notes", source="meeting", importance=0.8)
+
+        # Backdate an old memory
+        conn = sqlite3.connect(temp_db)
+        old_ts = "2025-01-15T10:00:00"
+        conn.execute(
+            "INSERT INTO working_memory (id, content, source, timestamp, session_id, importance) VALUES (?, ?, ?, ?, ?, ?)",
+            ("old1", "January planning session", "meeting", old_ts, "s1", 0.7)
+        )
+        conn.commit()
+        conn.close()
+
+        # Filter to 2025-02-01 should only include January memory
+        results = beam.recall("planning", to_date="2025-02-01")
+        assert any("January" in r["content"] for r in results)
+        assert all("Recent" not in r["content"] for r in results)
+
+    def test_recall_source_filter(self, temp_db):
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        beam.remember("Bug fix for auth", source="github", importance=0.8)
+        beam.remember("Lunch with team", source="conversation", importance=0.5)
+
+        results = beam.recall("auth", source="github")
+        assert len(results) >= 1
+        assert all(r.get("source") == "github" for r in results)
+
+    def test_recall_date_range_filter(self, temp_db):
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+
+        # Insert memories on different dates
+        conn = sqlite3.connect(temp_db)
+        dates = [
+            ("2025-01-10T10:00:00", "January task A"),
+            ("2025-03-15T10:00:00", "March task B"),
+            ("2025-06-20T10:00:00", "June task C"),
+        ]
+        for ts, content in dates:
+            conn.execute(
+                "INSERT INTO working_memory (id, content, source, timestamp, session_id, importance) VALUES (?, ?, ?, ?, ?, ?)",
+                (f"m_{content[:5]}", content, "test", ts, "s1", 0.7)
+            )
+        conn.commit()
+        conn.close()
+
+        # Range: March to May
+        results = beam.recall("task", from_date="2025-03-01", to_date="2025-05-31")
+        contents = [r["content"] for r in results]
+        assert any("March" in c for c in contents)
+        assert all("January" not in c for c in contents)
+        assert all("June" not in c for c in contents)
+
+    def test_recall_with_episodic_temporal_filter(self, temp_db):
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        # Consolidated memory with old timestamp
+        beam.consolidate_to_episodic(
+            summary="Q4 review discussion",
+            source_wm_ids=["wm1"],
+            source="meeting",
+            importance=0.8
+        )
+        # Backdate the episodic memory
+        conn = sqlite3.connect(temp_db)
+        conn.execute("UPDATE episodic_memory SET timestamp = ? WHERE content = ?", ("2024-12-01T10:00:00", "Q4 review discussion"))
+        conn.commit()
+        conn.close()
+
+        # Should find it without date filter
+        results_all = beam.recall("Q4 review")
+        assert any("Q4" in r["content"] for r in results_all)
+
+        # Should exclude it with from_date in 2025
+        results_filtered = beam.recall("Q4 review", from_date="2025-01-01")
+        assert all("Q4" not in r["content"] for r in results_filtered)
+
+    def test_temporal_triple_auto_generated(self, temp_db):
+        """Temporal triples should be auto-generated on remember()."""
+        from mnemosyne.core.triples import TripleStore
+
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        mid = beam.remember("Deploy script updated", source="dev", importance=0.8)
+
+        triple_store = TripleStore(db_path=temp_db)
+        triples = triple_store.query(subject=mid)
+        assert len(triples) >= 1
+        assert any(t["predicate"] == "occurred_on" for t in triples)
+
+
 class TestTokenAwareConsolidation:
     def test_sleep_chunks_large_batches(self, temp_db, monkeypatch):
         """BUG-1: sleep() must chunk memories to fit LLM context window."""
