@@ -61,6 +61,8 @@ TIER1_WEIGHT = float(os.environ.get("MNEMOSYNE_TIER1_WEIGHT", "1.0"))
 TIER2_WEIGHT = float(os.environ.get("MNEMOSYNE_TIER2_WEIGHT", "0.5"))
 TIER3_WEIGHT = float(os.environ.get("MNEMOSYNE_TIER3_WEIGHT", "0.25"))
 DEGRADE_BATCH_SIZE = int(os.environ.get("MNEMOSYNE_DEGRADE_BATCH", "100"))
+SMART_COMPRESS = os.environ.get("MNEMOSYNE_SMART_COMPRESS", "1") not in ("0", "false", "no")
+TIER3_MAX_CHARS = int(os.environ.get("MNEMOSYNE_TIER3_MAX_CHARS", "300"))
 
 # Vector compression: float32 | int8 | bit
 VEC_TYPE = os.environ.get("MNEMOSYNE_VEC_TYPE", "int8").lower()
@@ -1708,6 +1710,69 @@ class BeamMemory:
     # ------------------------------------------------------------------
     # Tiered Episodic Degradation
     # ------------------------------------------------------------------
+    def _extract_key_signal(self, content: str, max_chars: int = 300) -> str:
+        """Extract the highest-signal sentences from content for tier 3 compression.
+
+        Scores each sentence by entity/keyword density (proper nouns, technical
+        terms, preference indicators) and keeps top-scoring sentences until the
+        character budget is reached. Falls back to first-N-chars if content has
+        no clear sentence boundaries.
+        """
+        import re
+        if len(content) <= max_chars:
+            return content
+
+        # Split into sentences
+        sentences = re.split(r'(?<=[.!?])\s+', content)
+        if len(sentences) <= 1:
+            # No sentence boundaries — take first max_chars
+            return content[:max_chars] + " [...]"
+
+        # Scoring patterns
+        signal_patterns = [
+            (r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b', 3),     # Proper nouns: "GitHub Actions", "Docker Compose"
+            (r'\b[A-Z]{2,}\b', 3),                            # Acronyms: "XKCD", "CI/CD", "API", "AWS"
+            (r'\b(Docker|Kubernetes|AWS|GCP|Azure|Terraform|Python|Rust|Go|TypeScript|React|Next\.?js|Node\.?js|SQLite|Postgres|Redis|nginx|systemd|Linux|macOS|Windows)\b', 4),
+            (r'\b(prefers?|uses?|likes?|loves?|hates?|dislikes?|wants?|needs?)\b', 2),  # Preference indicators
+            (r'\b(password|token|secret|key|credential|auth|encrypt|decrypt|private)\b', 3),  # Security terms
+            (r'\b(production|staging|deploy|database|backup|migration)\b', 2),  # Infra terms
+            (r'\b(critical|urgent|important|breaking|incident|outage|down)\b', 3),  # Urgency
+            (r'\b(always|never|every|must|should)\b', 1),  # Emphasis words
+            (r'\b(\d{1,3}\.\d{1,3}\.\d{1,3})\b', 3),  # Version numbers
+            (r'\b(https?://|www\.|[a-z]+\.[a-z]{2,})\b', 2),  # URLs / domains
+            (r'["\'].*?["\']', 1),  # Quoted strings
+        ]
+
+        scored = []
+        for sentence in sentences:
+            if not sentence.strip():
+                continue
+            score = 0
+            # Bonus for shorter sentences (signal density)
+            if len(sentence) < 120:
+                score += 1
+            for pattern, weight in signal_patterns:
+                score += len(re.findall(pattern, sentence)) * weight
+            scored.append((score, sentence))
+
+        # Sort by score descending, keep top sentences up to max_chars
+        scored.sort(key=lambda x: x[0], reverse=True)
+        result = []
+        used = 0
+        for _, sentence in scored:
+            if used + len(sentence) + 1 > max_chars:
+                break
+            result.append(sentence)
+            used += len(sentence) + 1  # +1 for space
+
+        if not result:
+            return content[:max_chars] + " [...]"
+
+        compressed = " ".join(result)
+        if len(content) > len(compressed):
+            compressed += " [...]"
+        return compressed
+
     def degrade_episodic(self, dry_run: bool = False) -> Dict:
         """Degrade old episodic memories through tier 1→2→3 compression.
 
@@ -1764,14 +1829,16 @@ class BeamMemory:
             except Exception:
                 pass
 
-        # --- Degrade tier 2 → tier 3: text extraction (keep key entities) ---
+        # --- Degrade tier 2 → tier 3: smart extraction (keep key entities) ---
         for row in tier2_rows:
             try:
                 content = row["content"]
-                # Extract first 200 chars as key summary — keep the signal
-                compressed = content[:200]
-                if len(content) > 200:
-                    compressed += " [...]"
+                if SMART_COMPRESS and len(content) > TIER3_MAX_CHARS:
+                    compressed = self._extract_key_signal(content, max_chars=TIER3_MAX_CHARS)
+                else:
+                    compressed = content[:TIER3_MAX_CHARS]
+                    if len(content) > TIER3_MAX_CHARS:
+                        compressed += " [...]"
                 cursor.execute(
                     "UPDATE episodic_memory SET content = ?, tier = 3, degraded_at = ? WHERE id = ?",
                     (compressed, now.isoformat(), row["id"])

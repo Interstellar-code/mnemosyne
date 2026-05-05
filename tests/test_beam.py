@@ -894,3 +894,87 @@ class TestTieredDegradation:
         assert any("Rust" in c for c in contents), (
             f"Tier 3 memory should contain 'Rust', got contents: {contents}"
         )
+
+
+class TestSmartCompression:
+    """Phase 2: entity-aware extraction for tier 2→3 degradation."""
+
+    def test_extract_key_signal_keeps_proper_nouns(self, temp_db):
+        """Entities like names, tools, and versions should survive compression."""
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        content = (
+            "The user's favorite editor is Neovim with LazyVim. "
+            "They deploy everything with Docker Compose. "
+            "Their preferred language is Rust for systems work. "
+            "The weather was nice on Tuesday. "
+            "Nothing special happened in the morning. "
+            "They also use GitHub Actions for CI/CD."
+        )
+        result = beam._extract_key_signal(content, max_chars=200)
+        # Signal sentences should be present
+        assert "Neovim" in result, f"Lost 'Neovim': {result}"
+        assert "Docker" in result, f"Lost 'Docker': {result}"
+        assert "Rust" in result, f"Lost 'Rust': {result}"
+        # Low-signal sentences should be dropped
+        assert "weather" not in result, f"Weather survived: {result}"
+        assert "Nothing special" not in result, f"Noise survived: {result}"
+
+    def test_extract_key_signal_handles_no_sentences(self, temp_db):
+        """Single blob of text without sentence boundaries — falls back to prefix."""
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        content = "A" * 500  # No punctuation
+        result = beam._extract_key_signal(content, max_chars=100)
+        assert len(result) <= 110  # 100 chars + " [...]"
+        assert result.startswith("A" * 90)
+
+    def test_extract_key_signal_short_content_passthrough(self, temp_db):
+        """Content under max_chars should be returned as-is."""
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        content = "Short memory about Python."
+        result = beam._extract_key_signal(content, max_chars=500)
+        assert result == content
+
+    def test_smart_compress_preserves_entities_in_degradation(self, temp_db, monkeypatch):
+        """End-to-end: smart compression keeps key facts where naive prefix would lose them."""
+        monkeypatch.setattr("mnemosyne.core.beam.TIER2_DAYS", 1)
+        monkeypatch.setattr("mnemosyne.core.beam.TIER3_DAYS", 5)
+        monkeypatch.setattr("mnemosyne.core.beam.SMART_COMPRESS", True)
+        monkeypatch.setattr("mnemosyne.core.beam.TIER3_MAX_CHARS", 200)
+        monkeypatch.setattr("mnemosyne.core.local_llm.llm_available", lambda: False)
+
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+
+        # Memory where the most important fact is at the END
+        eid = beam.consolidate_to_episodic(
+            summary=(
+                "Morning standup was uneventful. The coffee was cold. "
+                "Lunch was a sandwich from the deli. Team discussed vacation plans. "
+                "CRITICAL: The production database password was changed to XKCD-correct-horse-battery-staple. "
+                "Afternoon was quiet. Went home at 5pm."
+            ),
+            source_wm_ids=["wm1"],
+            importance=0.9
+        )
+
+        # Backdate and degrade to tier 3
+        conn = sqlite3.connect(temp_db)
+        very_old_ts = (datetime.now() - timedelta(days=200)).isoformat()
+        conn.execute("UPDATE episodic_memory SET created_at = ? WHERE id = ?", (very_old_ts, eid))
+        conn.commit()
+        beam.degrade_episodic(dry_run=False)  # t1→t2
+        conn.execute("UPDATE episodic_memory SET tier = 2 WHERE id = ?", (eid,))
+        conn.commit()
+        conn.close()
+        beam.degrade_episodic(dry_run=False)  # t2→t3
+
+        # Verify the critical fact survived
+        conn = sqlite3.connect(temp_db)
+        tier3_content = conn.execute(
+            "SELECT content FROM episodic_memory WHERE id = ?", (eid,)
+        ).fetchone()[0]
+        conn.close()
+
+        assert "XKCD" in tier3_content or "password" in tier3_content, (
+            f"Smart compression should preserve critical entities. Got: {tier3_content}"
+        )
+        # Naive prefix would have kept "Morning standup was uneventful" — useless
