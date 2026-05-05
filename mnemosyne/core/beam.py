@@ -1753,7 +1753,9 @@ class BeamMemory:
             try:
                 compressed = row["content"]
                 if local_llm.llm_available() and len(row["content"]) > 300:
-                    compressed = local_llm.summarize(row["content"], max_chars=400)
+                    summary = local_llm.summarize_memories([row["content"]])
+                    if summary:
+                        compressed = summary[:400]
                 cursor.execute(
                     "UPDATE episodic_memory SET content = ?, tier = 2, degraded_at = ? WHERE id = ?",
                     (compressed[:800], now.isoformat(), row["id"])

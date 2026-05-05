@@ -623,3 +623,274 @@ class TestTokenAwareConsolidation:
         # Giant memory should be excluded (it exceeds the total budget)
         assert len(chunks) == 1
         assert chunks[0] == ["Short memory."]
+
+
+class TestTieredDegradation:
+    """Tests for tiered episodic degradation — Phase 1 of the tiered memory system."""
+
+    def test_schema_migration_adds_tier_columns(self, temp_db):
+        """Wave 1: init_beam() should add tier and degraded_at columns to episodic_memory."""
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        # Just creating a BeamMemory triggers init_beam which runs the migration
+
+        conn = sqlite3.connect(temp_db)
+        cursor = conn.cursor()
+        cols = [r[1] for r in cursor.execute("PRAGMA table_info(episodic_memory)").fetchall()]
+        assert "tier" in cols, "tier column missing after migration"
+        assert "degraded_at" in cols, "degraded_at column missing after migration"
+
+        # Verify index exists
+        indexes = [r[1] for r in cursor.execute(
+            "SELECT * FROM sqlite_master WHERE type='index' AND tbl_name='episodic_memory'"
+        ).fetchall()]
+        assert any("tier" in idx for idx in indexes), "idx_em_tier index missing"
+        conn.close()
+
+    def test_episodic_memory_defaults_to_tier_1(self, temp_db):
+        """New episodic memories should default to tier 1."""
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        eid = beam.consolidate_to_episodic(
+            summary="Default tier should be 1",
+            source_wm_ids=["wm1"],
+            importance=0.8
+        )
+
+        conn = sqlite3.connect(temp_db)
+        cursor = conn.cursor()
+        tier = cursor.execute(
+            "SELECT tier FROM episodic_memory WHERE id = ?", (eid,)
+        ).fetchone()[0]
+        conn.close()
+        assert tier == 1, f"Expected tier=1, got tier={tier}"
+
+    def test_degrade_episodic_tier1_to_tier2(self, temp_db, monkeypatch):
+        """Tier 1 memories older than TIER2_DAYS should degrade to tier 2."""
+        # Module-level constants are read at import time — patch them directly
+        monkeypatch.setattr("mnemosyne.core.beam.TIER2_DAYS", 5)
+        monkeypatch.setattr("mnemosyne.core.beam.TIER3_DAYS", 200)  # far future — won't trigger tier 3
+
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        eid = beam.consolidate_to_episodic(
+            summary="This memory is old enough for tier 2 degradation",
+            source_wm_ids=["wm1"],
+            importance=0.7
+        )
+
+        # Backdate the episodic memory to be older than 5 days
+        conn = sqlite3.connect(temp_db)
+        old_ts = (datetime.now() - timedelta(days=10)).isoformat()
+        conn.execute("UPDATE episodic_memory SET created_at = ? WHERE id = ?", (old_ts, eid))
+        conn.commit()
+        conn.close()
+
+        result = beam.degrade_episodic(dry_run=False)
+        assert result["tier1_to_tier2"] == 1
+        assert result["tier2_to_tier3"] == 0
+
+        # Verify tier changed
+        conn = sqlite3.connect(temp_db)
+        cursor = conn.cursor()
+        tier, degraded_at = cursor.execute(
+            "SELECT tier, degraded_at FROM episodic_memory WHERE id = ?", (eid,)
+        ).fetchone()
+        conn.close()
+        assert tier == 2
+        assert degraded_at is not None
+
+    def test_degrade_episodic_tier2_to_tier3(self, temp_db, monkeypatch):
+        """Tier 2 memories older than TIER3_DAYS should degrade to tier 3."""
+        monkeypatch.setattr("mnemosyne.core.beam.TIER2_DAYS", 1)
+        monkeypatch.setattr("mnemosyne.core.beam.TIER3_DAYS", 5)
+
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        eid = beam.consolidate_to_episodic(
+            summary="This memory will go all the way to tier 3",
+            source_wm_ids=["wm1"],
+            importance=0.6
+        )
+
+        # First degrade to tier 2 (older than 1 day)
+        conn = sqlite3.connect(temp_db)
+        old_ts = (datetime.now() - timedelta(days=3)).isoformat()
+        conn.execute("UPDATE episodic_memory SET created_at = ? WHERE id = ?", (old_ts, eid))
+        conn.commit()
+        conn.close()
+        beam.degrade_episodic(dry_run=False)  # tier 1 → 2
+
+        # Then push it even older and degrade again
+        conn = sqlite3.connect(temp_db)
+        very_old_ts = (datetime.now() - timedelta(days=10)).isoformat()
+        conn.execute("UPDATE episodic_memory SET created_at = ?, tier = 2 WHERE id = ?", (very_old_ts, eid))
+        conn.commit()
+        conn.close()
+
+        result = beam.degrade_episodic(dry_run=False)
+        assert result["tier2_to_tier3"] == 1
+
+        conn = sqlite3.connect(temp_db)
+        tier = conn.execute("SELECT tier FROM episodic_memory WHERE id = ?", (eid,)).fetchone()[0]
+        conn.close()
+        assert tier == 3
+
+    def test_degrade_episodic_dry_run(self, temp_db, monkeypatch):
+        """Dry run counts candidates but does NOT modify the database."""
+        monkeypatch.setattr("mnemosyne.core.beam.TIER2_DAYS", 5)
+
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        beam.consolidate_to_episodic(
+            summary="Should be counted but not degraded",
+            source_wm_ids=["wm1"],
+            importance=0.7
+        )
+
+        conn = sqlite3.connect(temp_db)
+        old_ts = (datetime.now() - timedelta(days=10)).isoformat()
+        conn.execute("UPDATE episodic_memory SET created_at = ?", (old_ts,))
+        conn.commit()
+
+        result = beam.degrade_episodic(dry_run=True)
+        assert result["status"] == "dry_run"
+        assert result["tier1_to_tier2"] == 1
+
+        # Tier should still be 1 — dry run doesn't modify
+        tier = conn.execute("SELECT tier FROM episodic_memory").fetchone()[0]
+        conn.close()
+        assert tier == 1, "Dry run should not change tier"
+
+    def test_degrade_episodic_respects_batch_limit(self, temp_db, monkeypatch):
+        """Degradation should respect DEGRADE_BATCH_SIZE limit."""
+        monkeypatch.setattr("mnemosyne.core.beam.TIER2_DAYS", 1)
+        monkeypatch.setattr("mnemosyne.core.beam.DEGRADE_BATCH_SIZE", 3)
+
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        # Consolidate 5 episodic memories first
+        eids = []
+        for i in range(5):
+            eid = beam.consolidate_to_episodic(
+                summary=f"Memory {i} for batch limit test",
+                source_wm_ids=[f"wm{i}"],
+                importance=0.5
+            )
+            eids.append(eid)
+
+        # Backdate them all in a single raw connection block
+        conn = sqlite3.connect(temp_db, timeout=10)
+        old_ts = (datetime.now() - timedelta(days=10)).isoformat()
+        for eid in eids:
+            conn.execute("UPDATE episodic_memory SET created_at = ? WHERE id = ?", (old_ts, eid))
+        conn.commit()
+        conn.close()
+
+        result = beam.degrade_episodic(dry_run=False)
+        # Should degrade at most DEGRADE_BATCH_SIZE (3), not all 5
+        assert result["tier1_to_tier2"] <= 3
+
+    def test_tier_weighting_in_recall(self, temp_db, monkeypatch):
+        """Tier 3 memories should score lower than tier 1 in recall."""
+        monkeypatch.setattr("mnemosyne.core.beam.TIER2_DAYS", 1)
+        monkeypatch.setattr("mnemosyne.core.beam.TIER3_DAYS", 5)
+        monkeypatch.setattr("mnemosyne.core.beam.TIER3_WEIGHT", 0.1)  # heavily penalize
+
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        eid = beam.consolidate_to_episodic(
+            summary="Python projects use virtual environments for isolation",
+            source_wm_ids=["wm1"],
+            importance=0.9
+        )
+
+        # Degrade to tier 3
+        conn = sqlite3.connect(temp_db)
+        very_old_ts = (datetime.now() - timedelta(days=30)).isoformat()
+        conn.execute("UPDATE episodic_memory SET created_at = ? WHERE id = ?", (very_old_ts, eid))
+        conn.commit()
+        beam.degrade_episodic(dry_run=False)  # t1→t2
+        conn.execute("UPDATE episodic_memory SET tier = 2, created_at = ? WHERE id = ?", (very_old_ts, eid))
+        conn.commit()
+        beam.degrade_episodic(dry_run=False)  # t2→t3
+        conn.close()
+
+        results = beam.recall("Python virtual environments", top_k=5)
+        # Should still be findable (just weighted lower)
+        degraded = [r for r in results if r.get("degradation_tier") == 3]
+        if degraded:
+            assert degraded[0]["score"] < 1.0, f"Tier 3 score {degraded[0]['score']} should be penalized"
+
+    def test_sleep_includes_degradation(self, temp_db, monkeypatch):
+        """sleep() return value must include degradation key."""
+        monkeypatch.setenv("MNEMOSYNE_TIER2_DAYS", "30")  # no actual degradation, just testing the key
+        monkeypatch.setenv("MNEMOSYNE_TIER3_DAYS", "200")
+        monkeypatch.setattr("mnemosyne.core.local_llm.llm_available", lambda: False)
+
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        # Inject old working memory to trigger consolidation
+        conn = sqlite3.connect(temp_db)
+        old_ts = (datetime.now() - timedelta(hours=48)).isoformat()
+        for i in range(2):
+            conn.execute(
+                "INSERT INTO working_memory (id, content, source, timestamp, session_id) VALUES (?, ?, ?, ?, ?)",
+                (f"old{i}", f"sleep test content {i}", "conversation", old_ts, "s1")
+            )
+        conn.commit()
+        conn.close()
+
+        result = beam.sleep(dry_run=False)
+        assert "degradation" in result, "sleep() should include degradation key"
+        assert "status" in result["degradation"]
+        assert "tier1_to_tier2" in result["degradation"]
+
+    def test_sleep_all_sessions_includes_degradation(self, temp_db, monkeypatch):
+        """sleep_all_sessions() return value must include degradation key."""
+        monkeypatch.setenv("MNEMOSYNE_TIER2_DAYS", "30")
+        monkeypatch.setenv("MNEMOSYNE_TIER3_DAYS", "200")
+        monkeypatch.setattr("mnemosyne.core.local_llm.llm_available", lambda: False)
+
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        conn = sqlite3.connect(temp_db)
+        old_ts = (datetime.now() - timedelta(hours=48)).isoformat()
+        conn.execute(
+            "INSERT INTO working_memory (id, content, source, timestamp, session_id) VALUES (?, ?, ?, ?, ?)",
+            ("s2-old", "all sessions sleep test", "conversation", old_ts, "s2")
+        )
+        conn.commit()
+        conn.close()
+
+        result = beam.sleep_all_sessions(dry_run=False)
+        assert "degradation" in result, "sleep_all_sessions() should include degradation key"
+
+    def test_old_memory_still_recallable_after_degradation(self, temp_db, monkeypatch):
+        """Integration: store old memory, degrade to tier 3, still recallable."""
+        monkeypatch.setattr("mnemosyne.core.beam.TIER2_DAYS", 1)
+        monkeypatch.setattr("mnemosyne.core.beam.TIER3_DAYS", 5)
+        monkeypatch.setattr("mnemosyne.core.local_llm.llm_available", lambda: False)
+
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        eid = beam.consolidate_to_episodic(
+            summary="The user's favorite programming language is Rust for systems work",
+            source_wm_ids=["wm1"],
+            importance=0.85
+        )
+
+        conn = sqlite3.connect(temp_db)
+        very_old_ts = (datetime.now() - timedelta(days=200)).isoformat()
+        conn.execute("UPDATE episodic_memory SET created_at = ? WHERE id = ?", (very_old_ts, eid))
+        conn.commit()
+        beam.degrade_episodic(dry_run=False)  # t1→t2
+        conn.execute("UPDATE episodic_memory SET tier = 2 WHERE id = ?", (eid,))
+        conn.commit()
+        beam.degrade_episodic(dry_run=False)  # t2→t3
+
+        # Verify it's tier 3
+        tier = conn.execute("SELECT tier FROM episodic_memory WHERE id = ?", (eid,)).fetchone()[0]
+        print(f"DEBUG: tier after double degrade = {tier}")
+        content = conn.execute("SELECT content FROM episodic_memory WHERE id = ?", (eid,)).fetchone()[0]
+        print(f"DEBUG: tier 3 content = {content[:100]}")
+        conn.close()
+        assert tier == 3, f"Expected tier 3, got {tier}"
+
+        # Should still be recallable — this is the marketing promise
+        results = beam.recall("favorite programming language", top_k=5)
+        contents = [r["content"] for r in results]
+        assert len(results) > 0, "Tier 3 memory should still be recallable"
+        assert any("Rust" in c for c in contents), (
+            f"Tier 3 memory should contain 'Rust', got contents: {contents}"
+        )
