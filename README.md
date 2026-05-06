@@ -15,24 +15,20 @@ Mnemosyne is a local-first memory system for the [Hermes Agent](https://github.c
 
 ## BEAM Benchmark (ICLR 2026)
 
-**Mnemosyne achieves SOTA retrieval performance** on the official BEAM long-context memory benchmark:
+Mnemosyne is evaluated on the [BEAM](https://github.com/mohammadtavakoli78/BEAM) long-context memory benchmark (Tavakoli et al., ICLR 2026) using the official end-to-end protocol: retrieved memories feed into an LLM, answers are scored by an LLM-as-judge.
 
-![Mnemosyne BEAM SOTA](docs/assets/charts/beam_sota_card.png)
+**Preliminary end-to-end results** (16 questions, 2 per ability, 1 conversation per scale):
 
-| Scale | Recall@10 | Latency | Storage | Throughput |
-|-------|-----------|---------|---------|------------|
-| 100K | 20% | 372ms | 1.8 MB | 2.7 qps |
-| 500K | 20% | 412ms | 3.2 MB | 2.4 qps |
-| 1M | 20% | 493ms | 4.8 MB | 2.0 qps |
-| **10M** | **20%** | **35ms** | **7.2 MB** | **28.6 qps** |
+| Scale | E2E QA Score | Published Baselines (10M) |
+|-------|-------------|---------------------------|
+| 100K | 26.9% | Hindsight: 64.1% |
+| 1M | 19.0% | Honcho: 40.6% |
+| | | LIGHT: 26.6% |
+| | | RAG: 24.9% |
 
-**Key innovations:**
-- **9.4x episodic compression** (35 MB to 3.8 MB) via automatic conversation window consolidation
-- **100% abstention accuracy** -- Mnemosyne never hallucinates on unknown information
-- **Linear scaling** -- recall holds at 20% across ALL scales with zero degradation
-- **35ms latency at 10M tokens** -- 6.8x faster than naive retrieval via episodic skip-lists
+**Status**: These are proof-of-concept results on minimal sample sizes. The benchmark infrastructure is built but full-scale evaluation (all 100 conversations, all 2,000 questions) is pending. Performance at 100K is roughly RAG-tier; degradation at 1M suggests the episodic consolidation pipeline needs tuning.
 
-Full benchmark report with charts: [docs/beam-benchmark.md](docs/beam-benchmark.md)
+Full benchmark report: [docs/beam-benchmark.md](docs/beam-benchmark.md)
 
 ---
 
