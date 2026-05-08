@@ -519,6 +519,9 @@ class Mnemosyne:
         with open(input_path, "r", encoding="utf-8") as f:
             data = _json.load(f)
 
+        if not isinstance(data, dict):
+            raise ValueError("Import file must contain a Mnemosyne export object")
+
         # Validate
         meta = data.get("mnemosyne_export", {})
         if meta.get("version") != "1.0":

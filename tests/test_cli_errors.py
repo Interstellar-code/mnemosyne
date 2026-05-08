@@ -56,3 +56,15 @@ def test_import_malformed_json_reports_error_without_traceback(tmp_path):
     assert result.returncode != 0
     assert "Invalid JSON" in result.stderr
     assert "Traceback" not in result.stderr
+
+
+def test_import_non_object_json_reports_error_without_traceback(tmp_path):
+    for payload in ("[]", '"not an export"'):
+        bad_export = tmp_path / "not-an-export.json"
+        bad_export.write_text(payload, encoding="utf-8")
+
+        result = run_cli(["import", str(bad_export)], tmp_path)
+
+        assert result.returncode != 0
+        assert "Import file must contain a Mnemosyne export object" in result.stderr
+        assert "Traceback" not in result.stderr
