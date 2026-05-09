@@ -83,6 +83,40 @@ def test_json_mode():
     assert "quality_score" in data, "Missing quality_score in JSON"
     assert isinstance(data["working_memory"]["total"], int), "wm_total not int"
 
+
+def test_json_mode_uses_mnemosyne_data_dir(tmp_path):
+    """Stats should read mnemosyne.db from MNEMOSYNE_DATA_DIR when configured."""
+    home = tmp_path / "home"
+    data_dir = tmp_path / "custom-data"
+    env = os.environ.copy()
+    env["HOME"] = str(home)
+    env["MNEMOSYNE_DATA_DIR"] = str(data_dir)
+
+    store = subprocess.run(
+        [sys.executable, "-m", "mnemosyne.cli", "store", "stats data dir probe"],
+        cwd=str(SCRIPT.parent.parent),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert store.returncode == 0, store.stderr
+    assert (data_dir / "mnemosyne.db").exists()
+    assert not (home / ".hermes" / "mnemosyne" / "data" / "mnemosyne.db").exists()
+
+    stats = subprocess.run(
+        [sys.executable, str(SCRIPT), "--json"],
+        cwd=str(SCRIPT.parent),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert stats.returncode == 0, stats.stderr
+    payload = json.loads(stats.stdout)
+    assert "error" not in payload
+    assert payload["working_memory"]["total"] == 1
+
 def test_save_snapshot():
     code, out, err = run("--save-snapshot")
     assert code == 0, f"Exit code {code}: {err}"
