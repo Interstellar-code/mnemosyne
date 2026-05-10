@@ -6,6 +6,7 @@ the host backend), and the registration flow added to initialize().
 
 from __future__ import annotations
 
+import json
 import time
 from unittest.mock import MagicMock, patch
 
@@ -337,3 +338,55 @@ def test_handle_remember_defaults_when_new_kwargs_omitted(monkeypatch):
     assert kwargs.get("metadata") in (None, {}), kwargs.get("metadata")
     # veracity may be "unknown" (passed through) or absent (beam default)
     assert kwargs.get("veracity", "unknown") == "unknown"
+
+
+def test_handle_remember_clamps_unknown_veracity_to_unknown(monkeypatch, caplog):
+    """[C12.b — adversarial review] An LLM typo or a caller passing a
+    non-canonical veracity label (e.g. 'STATED' capitalization, 'state'
+    truncation, 'random_garbage') must be clamped to 'unknown' at the
+    trust boundary. Beam itself does not validate; the row would persist
+    with the junk label and pollute the contamination filter
+    (`veracity != 'stated'`). Locks the handler-side allowlist."""
+    from hermes_memory_provider import MnemosyneMemoryProvider
+
+    provider = MnemosyneMemoryProvider()
+    beam = MagicMock()
+    beam.remember.return_value = "mem-789"
+    provider._beam = beam
+
+    # 'STATED' (capitalization) — should normalize to 'stated', not clamp.
+    provider._handle_remember({"content": "x", "veracity": "STATED"})
+    assert beam.remember.call_args.kwargs.get("veracity") == "stated"
+
+    # 'state' (truncated) — not in allowlist, must clamp to 'unknown'.
+    beam.remember.reset_mock()
+    with caplog.at_level("WARNING", logger="hermes_memory_provider"):
+        provider._handle_remember({"content": "y", "veracity": "state"})
+    assert beam.remember.call_args.kwargs.get("veracity") == "unknown"
+    assert any("unknown veracity" in r.getMessage() for r in caplog.records), (
+        "handler should log a warning when clamping a bad veracity label"
+    )
+
+    # 'random_garbage' — not in allowlist, must clamp to 'unknown'.
+    beam.remember.reset_mock()
+    provider._handle_remember({"content": "z", "veracity": "random_garbage"})
+    assert beam.remember.call_args.kwargs.get("veracity") == "unknown"
+
+
+def test_handle_remember_response_echoes_metadata(monkeypatch):
+    """[C12.b — adversarial review] The response JSON echoes extract /
+    extract_entities / veracity already; metadata should be in the same
+    surface for symmetry so callers can confirm what got applied."""
+    from hermes_memory_provider import MnemosyneMemoryProvider
+
+    provider = MnemosyneMemoryProvider()
+    beam = MagicMock()
+    beam.remember.return_value = "mem-meta"
+    provider._beam = beam
+
+    payload = {"content": "x", "metadata": {"source_doc": "deck.pdf", "page": 7}}
+    response = provider._handle_remember(payload)
+    parsed = json.loads(response)
+    assert parsed.get("metadata") == {"source_doc": "deck.pdf", "page": 7}, (
+        f"response missing metadata echo: {parsed!r}"
+    )
