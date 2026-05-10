@@ -65,7 +65,7 @@ REMEMBER_SCHEMA = {
 
 RECALL_SCHEMA = {
     "name": "mnemosyne_recall",
-    "description": "Search memories in Mnemosyne. Uses hybrid vector + full-text search across working and episodic memory. Supports temporal weighting to boost recent memories.",
+    "description": "Search memories in Mnemosyne. Uses hybrid vector + full-text search across working and episodic memory. Supports temporal weighting to boost recent memories and per-query scoring weight overrides.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -92,6 +92,18 @@ RECALL_SCHEMA = {
                 "type": "number",
                 "description": "Hours until temporal boost decays by half. Default 24. Lower = faster decay.",
                 "default": 24,
+            },
+            "vec_weight": {
+                "type": "number",
+                "description": "Vector similarity weight in hybrid scoring. Omit (or pass null) to use MNEMOSYNE_VEC_WEIGHT env var or built-in default 0.5."
+            },
+            "fts_weight": {
+                "type": "number",
+                "description": "Full-text search weight in hybrid scoring. Omit (or pass null) to use MNEMOSYNE_FTS_WEIGHT env var or built-in default 0.3."
+            },
+            "importance_weight": {
+                "type": "number",
+                "description": "Importance score weight in hybrid scoring. Omit (or pass null) to use MNEMOSYNE_IMPORTANCE_WEIGHT env var or built-in default 0.2."
             },
             "author_id": {
                 "type": "string",
@@ -384,13 +396,23 @@ def mnemosyne_recall(args: dict, **kwargs) -> str:
         if not query:
             return json.dumps({"error": "Query is required"})
 
+        # Forward configurable scoring weights ONLY when caller supplied them.
+        # mem.recall treats None as "fall back to env var or default" via
+        # _normalize_weights; passing 0.0 / 0.5 / etc. when the caller didn't
+        # ask for tuning would override that resolution and break
+        # MNEMOSYNE_*_WEIGHT env-var deployments. See issue #45.
+        recall_kwargs = {
+            "top_k": top_k,
+            "temporal_weight": temporal_weight,
+            "query_time": query_time,
+            "temporal_halflife": temporal_halflife_hours,
+        }
+        for weight_key in ("vec_weight", "fts_weight", "importance_weight"):
+            if weight_key in args:
+                recall_kwargs[weight_key] = args[weight_key]
+
         mem = _get_memory()
-        results = mem.recall(
-            query, top_k=top_k,
-            temporal_weight=temporal_weight,
-            query_time=query_time,
-            temporal_halflife=temporal_halflife_hours
-        )
+        results = mem.recall(query, **recall_kwargs)
 
         return json.dumps({
             "query": query,
