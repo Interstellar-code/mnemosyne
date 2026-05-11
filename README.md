@@ -320,6 +320,10 @@ hermes mnemosyne import --input mnemosyne_backup.json
 mnemosyne import-hindsight hindsight-export.json hermes
 mnemosyne import-hindsight http://localhost:8888 hermes
 
+# The same timestamp-preserving Hindsight importer is available inside Hermes
+hermes mnemosyne import --from hindsight --file hindsight-export.json --bank hermes
+hermes mnemosyne import --from hindsight --base-url http://localhost:8888 --bank hermes
+
 # Clear scratchpad
 hermes mnemosyne clear
 ```
@@ -542,7 +546,7 @@ hermes mnemosyne import --input mnemosyne_backup.json
 
 ### Migrate from other memory providers
 
-Import directly from 7 supported providers into Mnemosyne:
+Import directly from supported providers into Mnemosyne:
 
 ```bash
 # List all supported providers
@@ -560,6 +564,10 @@ hermes mnemosyne import --from zep --api-key sk-xxx
 # Hindsight → Mnemosyne (JSON export or live API)
 mnemosyne import-hindsight hindsight-export.json hermes
 mnemosyne import-hindsight http://localhost:8888 hermes
+
+# Hindsight → Mnemosyne via Hermes CLI
+hermes mnemosyne import --from hindsight --file hindsight-export.json --bank hermes
+hermes mnemosyne import --from hindsight --base-url http://localhost:8888 --bank hermes
 
 # Generate a migration script for any provider
 hermes mnemosyne import --from mem0 --generate-script --output-script migrate.py

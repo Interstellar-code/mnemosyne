@@ -9,8 +9,8 @@ When deployed, Mnemosyne gets the **same integration tier** as Honcho, mem0, and
 - **System prompt injection** — `# Mnemosyne Memory` header in every prompt
 - **Pre-turn prefetch** — Relevant memories injected via `<memory-context>` fence before each API call
 - **Post-turn sync** — User and assistant messages automatically stored to episodic memory
-- **Tool dispatch** — 7 memory tools auto-injected into the model's tool surface
-- **CLI commands** — `hermes mnemosyne {stats|sleep|inspect|clear}`
+- **Tool dispatch** — 15 memory tools auto-injected into the model's tool surface
+- **CLI commands** — `hermes mnemosyne {stats|sleep|version|inspect|clear|export|import}`
 - **Setup wizard** — Listed in `hermes memory setup`
 
 **All of this without touching Hermes core.** Deployed purely through the plugin directory.
@@ -65,11 +65,19 @@ User plugins take precedence over bundled plugins on name collision.
 |------|---------|
 | `mnemosyne_remember` | Store durable memory with importance, scope, expiry |
 | `mnemosyne_recall` | Hybrid search (50% vector + 30% FTS + 20% importance) |
-| `mnemosyne_sleep` | Consolidate working → episodic memory |
 | `mnemosyne_stats` | Show working + episodic counts |
+| `mnemosyne_triple_add` | Add temporal facts to the knowledge graph |
+| `mnemosyne_triple_query` | Query temporal knowledge graph facts |
+| `mnemosyne_sleep` | Consolidate working → episodic memory |
+| `mnemosyne_scratchpad_write` | Write short-lived scratchpad context |
+| `mnemosyne_scratchpad_read` | Read scratchpad context |
+| `mnemosyne_scratchpad_clear` | Clear scratchpad context |
 | `mnemosyne_invalidate` | Mark memory as expired/superseded |
-| `mnemosyne_triple_add` | Add temporal fact to knowledge graph |
-| `mnemosyne_triple_query` | Query knowledge graph |
+| `mnemosyne_export` | Export memories for backup or migration |
+| `mnemosyne_import` | Import memories from backup files or providers |
+| `mnemosyne_update` | Update an existing memory |
+| `mnemosyne_forget` | Delete a memory |
+| `mnemosyne_diagnose` | Run diagnostics on the memory store |
 
 ## Undeploy
 
