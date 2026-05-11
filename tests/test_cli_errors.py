@@ -83,3 +83,42 @@ def test_import_malformed_json_reports_error_without_traceback(tmp_path):
     assert result.returncode != 0
     assert "Invalid JSON" in result.stderr
     assert "Traceback" not in result.stderr
+
+
+def test_bank_cli_list_create_delete_uses_configured_data_dir(tmp_path):
+    result = run_cli(["bank", "list"], tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert "default" in result.stdout
+    assert "Traceback" not in result.stderr
+
+    result = run_cli(["bank", "create", "project_a"], tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert "Created bank: project_a" in result.stdout
+    assert "Traceback" not in result.stderr
+
+    result = run_cli(["bank", "list"], tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert "project_a" in result.stdout
+
+    result = run_cli(["bank", "delete", "project_a"], tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert "Deleted bank: project_a" in result.stdout
+    assert "Traceback" not in result.stderr
+
+
+def test_bank_cli_validation_errors_are_user_facing(tmp_path):
+    cases = [
+        (["bank", "create", "bad/name"], "Invalid bank name", 2),
+        (["bank", "create"], "Usage: mnemosyne bank create <name>", 2),
+        (["bank", "delete"], "Usage: mnemosyne bank delete <name>", 2),
+        (["bank", "nope"], "Unknown bank command: nope", 2),
+        (["bank", "delete", "missing_bank"], "Bank not found: missing_bank", 1),
+    ]
+
+    for args, expected_error, expected_returncode in cases:
+        result = run_cli(args, tmp_path)
+
+        assert result.returncode == expected_returncode, args
+        assert result.stdout == ""
+        assert expected_error in result.stderr
+        assert "Traceback" not in result.stderr
