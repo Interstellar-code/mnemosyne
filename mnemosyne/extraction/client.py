@@ -5,9 +5,12 @@ Reuses the same patterns as tools/evaluate_beam_end_to_end.py LLMClient.
 """
 
 import json as _json
+import logging
 import os
 import time
 import urllib.request
+
+logger = logging.getLogger(__name__)
 
 # ── Defaults ──────────────────────────────────────────────────────────────
 DEFAULT_EXTRACTION_MODEL = os.environ.get(
@@ -48,21 +51,37 @@ class ExtractionClient:
         """Send chat completion with fallback and retry.
 
         Returns the response text, or empty string on total failure.
+
+        [C13.b] Records to ExtractionDiagnostics under the `cloud`
+        tier so operators can see when API key issues, rate-limit
+        cascades, or model outages are silently breaking extraction.
         """
+        from .diagnostics import get_diagnostics
+        diag = get_diagnostics()
+        diag.record_attempt("cloud")
+
         models_to_try = [self.model] + [
             m for m in FALLBACK_MODELS if m != self.model
         ]
-        last_error = None
+        last_exc = None
 
         for model in models_to_try:
             for attempt in range(3):
                 try:
-                    return self._call_api(
+                    result = self._call_api(
                         model, messages, temperature, max_tokens
                     )
+                    if result:
+                        diag.record_success("cloud")
+                    else:
+                        # API returned empty content — distinguish
+                        # from exception path.
+                        diag.record_no_output("cloud")
+                    return result
                 except Exception as e:
-                    last_error = str(e)
-                    if "429" in last_error or "rate" in last_error.lower():
+                    last_exc = e
+                    msg = str(e)
+                    if "429" in msg or "rate" in msg.lower():
                         wait = 2 ** attempt
                         time.sleep(wait)
                         continue
@@ -72,6 +91,14 @@ class ExtractionClient:
             time.sleep(1)
 
         # All models failed
+        diag.record_failure(
+            "cloud", exc=last_exc, reason="all_models_failed"
+        )
+        if last_exc is not None:
+            logger.warning(
+                "ExtractionClient.chat: all models failed; last error: %r",
+                last_exc,
+            )
         return ""
 
     def _call_api(
@@ -135,9 +162,12 @@ class ExtractionClient:
         response = self.chat(chat_messages, temperature=0.0, max_tokens=4096)
 
         if not response:
+            # chat() already recorded the failure / no_output;
+            # extract_facts() just sees the empty signal.
             return []
 
         # Parse JSON from response
+        from .diagnostics import get_diagnostics
         try:
             json_start = response.find("[")
             json_end = response.rfind("]") + 1
@@ -145,7 +175,18 @@ class ExtractionClient:
                 facts = _json.loads(response[json_start:json_end])
                 if isinstance(facts, list):
                     return facts
-        except (_json.JSONDecodeError, ValueError):
-            pass
+        except (_json.JSONDecodeError, ValueError) as e:
+            # [C13.b] Operator-visible signal: model returned text
+            # but couldn't be parsed as a fact list. Distinguishes
+            # "model has nothing to say" (success returns []) from
+            # "model returned malformed JSON" (this branch).
+            get_diagnostics().record_failure(
+                "cloud", exc=e, reason="json_parse_failed"
+            )
+            logger.warning(
+                "ExtractionClient.extract_facts: JSON parse failed on "
+                "model response; %d chars returned",
+                len(response),
+            )
 
         return []

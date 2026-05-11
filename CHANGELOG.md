@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Simple Versioning](https://github.com/AxDSan/mnemosyne) (MAJOR.MINOR).
 
+## [Unreleased]
+
+### Added
+
+**C13.b — Fact-extraction failure diagnostics**
+- New `mnemosyne.extraction.diagnostics` module exposes a process-global `ExtractionDiagnostics` instance. Pre-C13.b fact extraction had five silent-failure layers (cloud HTTP errors → `""`, JSON parse failures → `[]`, local LLM exceptions → `pass`, no-LLM-available fallback → `[]`, outer `extract_facts_safe` wrapper → `[]`). Operators got zero signal that fact-recall and the graph voice were running blind.
+- The diagnostics record each extraction attempt's outcome at every tier (`host` / `remote` / `local` / `cloud`). Counters per tier: `attempts`, `successes`, `no_output`, `failures`, plus bounded recent error samples. Bird's-eye totals: `calls`, `successes`, `failures`, `empty`, `success_rate`.
+- `mnemosyne/core/extraction.py::extract_facts` instruments every tier transition (host attempted vs. succeeded, host fallback to local, remote LLM no-output, local LLM raised, model not loaded, etc.). Each branch records to the diagnostics so operators can see exactly what's being swallowed.
+- `mnemosyne/extraction/client.py::ExtractionClient.chat` records `cloud` tier attempts, successes (non-empty response), `no_output` (empty response), and failures with the last exception. `extract_facts()` adds JSON-parse-failure recording so malformed model responses are distinguishable from "model had nothing to say."
+- New module-level helpers: `get_extraction_stats()` returns a JSON-serializable snapshot; `reset_extraction_stats()` zeroes the counters (useful for tests + operators starting a fresh measurement window).
+- WARNING-level log lines fire on the most actionable failure paths (`ExtractionClient.chat` all-models-failed, `extract_facts` local LLM raised, JSON parse failed, etc.). Diagnostics are the primary signal; logs are the secondary signal for log-tailing operators.
+
+### Notes for callers
+
+- Diagnostics are **read-only signal** — they never alter extraction behavior. Failures are still swallowed at the call site (`extract_facts_safe`, the outer `try/except: pass` in `beam.py::_extract_and_store_facts`); diagnostics surface what's being swallowed.
+- Thread-safe: a single `threading.Lock` gates all mutations. Concurrent extraction calls from different threads accumulate correctly.
+- The error-sample queue is bounded to 10 per tier; a chronically failing tier doesn't accumulate unbounded memory.
+- Long error messages are truncated to 200 chars in the captured sample to bound log volume and prevent content leakage from upstream LLM errors that include the full prompt.
+- API: `from mnemosyne.extraction import get_extraction_stats, reset_extraction_stats, get_diagnostics, ExtractionDiagnostics`.
+
 ## [2.5] — 2026-05-10
 
 ### Added

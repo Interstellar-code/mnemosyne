@@ -9,6 +9,12 @@ Cloud users get managed extraction through the Mnemosyne Cloud service.
 from dataclasses import dataclass
 
 from .client import ExtractionClient
+from .diagnostics import (
+    ExtractionDiagnostics,
+    get_diagnostics,
+    get_extraction_stats,
+    reset_extraction_stats,
+)
 from .prompts import EXTRACTION_SYSTEM_PROMPT, EXTRACTION_USER_TEMPLATE
 
 
@@ -25,6 +31,10 @@ class ExtractionConfig:
 __all__ = [
     "ExtractionClient",
     "ExtractionConfig",
+    "ExtractionDiagnostics",
     "EXTRACTION_SYSTEM_PROMPT",
     "EXTRACTION_USER_TEMPLATE",
+    "get_diagnostics",
+    "get_extraction_stats",
+    "reset_extraction_stats",
 ]
