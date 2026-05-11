@@ -32,24 +32,6 @@ def temp_db():
 
 def _content_to_vec(text: str, dim: int = 384) -> np.ndarray:
     """Deterministic content-encoding 'embedding'. Different content
-<<<<<<< HEAD
-    produces different vectors. Spreads signal across many dimensions
-    so binarization (sign-based) and other compression schemes can
-    detect content changes.
-
-    Uses a seeded RNG so different texts produce observably different
-    vectors while identical texts remain identical."""
-    rng = np.random.RandomState(hash(text) & 0x7FFFFFFF)
-    # Base signal: spread text-derived hash across full dimension range
-    v = rng.randn(dim).astype(np.float32) * 0.1
-    # Anchor dimensions with stronger content-specific signal
-    if text:
-        v[0] = float(len(text)) * 0.01
-        v[1] = float(ord(text[0])) * 0.01
-        h = hash(text) & 0xFFFF
-        v[2] = float(h % 256) * 0.01
-        v[3] = float((h >> 8) % 256) * 0.01
-=======
     produces different vectors AND different sign patterns, so the
     sign-bit binarizer in binary_vectors.py also produces different
     bytes. Without sign-pattern variation, two distinct strings would
@@ -72,7 +54,6 @@ def _content_to_vec(text: str, dim: int = 384) -> np.ndarray:
     # signal layered on top of the hash-driven sign pattern.
     v[32] = float(len(text))
     v[33] = float(ord(text[0]))
->>>>>>> pr70
     return v
 
 
