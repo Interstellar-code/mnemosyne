@@ -26,6 +26,8 @@ Usage:
 --resume: skip already-evaluated questions from results file
 """
 
+from __future__ import annotations  # PEP 563: defer annotation eval so PEP 604 (X|None) and PEP 585 (list[str]) work on Python 3.9
+
 import argparse
 import ast
 import gc
@@ -36,7 +38,7 @@ import sys
 import tempfile
 import time
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from functools import partial
 from pathlib import Path
 
@@ -477,7 +479,7 @@ def ingest_conversation(beam: BeamMemory, messages: list[dict]) -> dict:
         if not batch_items:
             continue
 
-        beam.remember_batch(batch_items)
+        batch_ids = beam.remember_batch(batch_items)
         stats["wm_count"] += len(batch_items)
 
         # Cloud fact extraction: extract facts from batch if enabled
@@ -514,42 +516,91 @@ def ingest_conversation(beam: BeamMemory, messages: list[dict]) -> dict:
             except Exception:
                 pass  # Best-effort; don't fail ingestion
 
-        # Episodic consolidation per batch
+        # [E1] Additive consolidation per batch via beam.sleep().
+        #
+        # Pre-E1 this block built a synthetic summary
+        # ("Batch N: first_3_msg_contents[:100]") + DELETEd all source
+        # working_memory rows. ~99% of message content was discarded
+        # before recall could see it — the entire BEAM benchmark
+        # corpus was destroyed at ingest.
+        #
+        # Post-E1 (option b, depends on E3 additive sleep): backdate
+        # ONLY the batch's just-inserted rows past sleep's TTL/2
+        # cutoff and let beam.sleep() produce real LLM-generated (or
+        # AAAK-fallback) summaries on top of preserved originals.
+        # The scoped UPDATE prevents cross-batch timestamp
+        # contamination — without the `id IN (...)` filter, a
+        # mid-sleep failure on batch N would let batch N+1's UPDATE
+        # walk every still-unconsolidated row in the session and
+        # rewrite their timestamps, corrupting per-row temporal
+        # ordering. See E1 adversarial review F1/F3.
         try:
             cursor = beam.conn.cursor()
-            # Get ALL working memory items for this session (oldest first)
-            cursor.execute("""
-                SELECT id, content FROM working_memory
-                WHERE session_id = ?
-                ORDER BY timestamp ASC
-                LIMIT 1000
-            """, (beam.session_id,))
-            wm_rows = cursor.fetchall()
-
-            if wm_rows:
-                wm_ids = [row["id"] for row in wm_rows]
-                recent_texts = [row["content"][:100] for row in wm_rows[:5]]
-                summary = f"Batch {batch_start // BATCH_SIZE}: " + " | ".join(recent_texts[:3])
-                if len(summary) > 500:
-                    summary = summary[:497] + "..."
-
-                beam.consolidate_to_episodic(
-                    summary=summary,
-                    source_wm_ids=wm_ids,
-                    source="beam_consolidation",
-                    importance=0.4,
-                    scope="global",
+            # Backdate is derived from WORKING_MEMORY_TTL_HOURS so it
+            # survives operator config changes via env var. sleep()'s
+            # cutoff is TTL/2, _trim's cutoff is TTL — backdating by
+            # TTL+1 ensures the row is on the consolidatable side of
+            # sleep's cutoff while staying outside the trim window's
+            # safety margin (consolidated_at exempts from trim post-E3
+            # anyway, so the trim concern only applies pre-sleep). See
+            # E1 adversarial review F6.
+            from mnemosyne.core.beam import WORKING_MEMORY_TTL_HOURS as _WM_TTL
+            backdate_iso = (
+                datetime.now() - timedelta(hours=_WM_TTL + 1)
+            ).isoformat()
+            if batch_ids:
+                placeholders = ",".join("?" * len(batch_ids))
+                cursor.execute(
+                    f"UPDATE working_memory SET timestamp = ? "
+                    f"WHERE id IN ({placeholders}) "
+                    f"AND consolidated_at IS NULL",
+                    (backdate_iso, *batch_ids),
                 )
-                stats["ep_count"] += 1
-                
-                # Delete consolidated items from working memory to prevent bloat
-                placeholders = ",".join("?" * len(wm_ids))
-                cursor.execute(f"DELETE FROM working_memory WHERE id IN ({placeholders})", wm_ids)
-                stats["wm_count"] -= len(wm_ids)
-                
                 beam.conn.commit()
-        except Exception:
-            pass
+
+                # Drain the entire backdated batch. sleep() processes
+                # up to SLEEP_BATCH_SIZE rows per call (default 5000,
+                # well above the benchmark's BATCH_SIZE=500). But
+                # MNEMOSYNE_SLEEP_BATCH can be configured below
+                # BATCH_SIZE, in which case a single sleep() call
+                # leaves some backdated rows un-consolidated. Those
+                # rows then carry a TTL-old timestamp AND
+                # consolidated_at IS NULL — exactly the predicate
+                # _trim_working_memory uses to DELETE them on the
+                # next remember_batch call. Loop until sleep returns
+                # no_op (or errors) so the contract holds regardless
+                # of env config. See Codex /review on PR #75 (P2).
+                max_iters = 50  # safety bound; one batch should
+                                # never need more than a few cycles
+                while max_iters > 0:
+                    result = beam.sleep(dry_run=False)
+                    max_iters -= 1
+                    if result.get("status") == "consolidated":
+                        stats["ep_count"] += int(
+                            result.get("summaries_created", 0) or 0
+                        )
+                        # If sleep drained fewer than SLEEP_BATCH_SIZE
+                        # rows, the eligible set is empty and the
+                        # next call would be no_op — break early.
+                        items = int(result.get("items_consolidated", 0) or 0)
+                        if items == 0:
+                            break
+                        # Otherwise keep draining.
+                        continue
+                    # no_op or any other status: drain complete.
+                    break
+                # E3 contract: originals stay, so stats["wm_count"]
+                # does NOT decrement. Pre-E1 we did stats["wm_count"]
+                # -= ... which produced wm_count=0 always; post-E1 it
+                # grows monotonically with input message count, which
+                # is what the experiment actually wants to measure.
+        except Exception as e:
+            # Log the failure to stats so the operator sees it. Pre-E1
+            # the equivalent block also swallowed silently, but the
+            # consolidation IS the point of the experiment — a silent
+            # benchmark that "succeeds" with 0 episodic rows is the
+            # exact failure mode the test suite is supposed to catch.
+            stats.setdefault("sleep_errors", []).append(repr(e))
 
     stats["ingest_time_ms"] = (time.perf_counter() - start_time) * 1000
     return stats
