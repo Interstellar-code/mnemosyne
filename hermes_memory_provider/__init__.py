@@ -255,21 +255,79 @@ class MnemosyneMemoryProvider(MemoryProvider):
         except Exception:
             return False
 
+    def _apply_provider_config(self, kwargs: Dict[str, Any]) -> None:
+        """Apply provider-specific config from Hermes kwargs or config.yaml.
+
+        Precedence: kwargs > config.yaml > env var > hardcoded defaults.
+        """
+        # auto_sleep: prefer kwargs, then config.yaml, then env var
+        auto_sleep = kwargs.get("auto_sleep")
+        if auto_sleep is None:
+            auto_sleep = self._read_config_key("auto_sleep")
+        if auto_sleep is not None:
+            self._auto_sleep_enabled = bool(auto_sleep)
+        # env var is already applied in __init__, so it is the base default
+
+        # sleep_threshold: prefer kwargs, then config.yaml, then default 50
+        sleep_threshold = kwargs.get("sleep_threshold")
+        if sleep_threshold is None:
+            sleep_threshold = self._read_config_key("sleep_threshold")
+        if sleep_threshold is not None:
+            try:
+                self._auto_sleep_threshold = int(sleep_threshold)
+            except (TypeError, ValueError):
+                logger.warning("Mnemosyne: invalid sleep_threshold=%r, keeping %d",
+                               sleep_threshold, self._auto_sleep_threshold)
+
+        # vector_type: pass through to BeamMemory if supported, log if not yet wired
+        vector_type = kwargs.get("vector_type") or self._read_config_key("vector_type")
+        if vector_type and vector_type not in ("float32", "int8", "bit"):
+            logger.warning("Mnemosyne: unknown vector_type=%r, ignoring", vector_type)
+
+    def _read_config_key(self, key: str) -> Any:
+        """Read a single key from memory.mnemosyne in config.yaml."""
+        try:
+            import yaml, os
+            config_path = os.path.join(self._hermes_home, "config.yaml") if self._hermes_home else ""
+            if not config_path or not os.path.exists(config_path):
+                return None
+            with open(config_path, "r") as f:
+                config = yaml.safe_load(f) or {}
+            return config.get("memory", {}).get("mnemosyne", {}).get(key)
+        except Exception:
+            return None
+
     def get_config_schema(self) -> List[Dict[str, Any]]:
         return [
-            {"key": "auto_sleep", "description": "Auto-run sleep() when working memory exceeds threshold (default: false — set MNEMOSYNE_AUTO_SLEEP_ENABLED=true to enable)", "default": False},
+            {"key": "auto_sleep", "description": "Auto-run sleep() when working memory exceeds threshold. Set true to enable. Backward-compatible with MNEMOSYNE_AUTO_SLEEP_ENABLED env var.", "default": False},
             {"key": "sleep_threshold", "description": "Working memory count before auto-sleep triggers", "default": 50},
-            {"key": "vector_type", "description": "Vector storage type", "choices": ["float32", "int8", "bit"], "default": "int8"},
+            {"key": "vector_type", "description": "Vector storage type (note: not yet wired to BeamMemory at runtime; reserved for future use)", "choices": ["float32", "int8", "bit"], "default": "int8"},
         ]
 
     def save_config(self, values: Dict[str, Any], hermes_home: str) -> None:
-        pass
+        """Persist provider-specific config values."""
+        try:
+            import yaml, os
+            config_path = os.path.join(hermes_home, "config.yaml") if hermes_home else ""
+            if not config_path or not os.path.exists(config_path):
+                return
+            with open(config_path, "r") as f:
+                config = yaml.safe_load(f) or {}
+            memory_cfg = config.setdefault("memory", {}).setdefault("mnemosyne", {})
+            memory_cfg.update(values)
+            with open(config_path, "w") as f:
+                yaml.safe_dump(config, f, default_flow_style=False, allow_unicode=True)
+        except Exception:
+            logger.debug("Mnemosyne: could not persist config values", exc_info=True)
 
     def initialize(self, session_id: str, **kwargs) -> None:
         """Initialize Mnemosyne beam for this session."""
         self._agent_context = kwargs.get("agent_context", "primary")
         self._platform = kwargs.get("platform", "cli")
         self._hermes_home = kwargs.get("hermes_home", "")
+
+        # Apply provider-specific config from kwargs (Hermes-passed) or config.yaml fallback
+        self._apply_provider_config(kwargs)
 
         if self._agent_context in ("cron", "flush", "subagent"):
             logger.debug("Mnemosyne skipped: non-primary context=%s", self._agent_context)
