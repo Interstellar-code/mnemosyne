@@ -140,9 +140,6 @@ class Mnemosyne:
 
         self.conn = _get_connection(self.db_path)
         init_db(self.db_path)
-        self.beam = BeamMemory(session_id=session_id, db_path=self.db_path,
-                               author_id=author_id, author_type=author_type,
-                               channel_id=channel_id)
 
         # Phase 8: Streaming + Patterns + Plugins (lazy init)
         self._stream = None
@@ -150,6 +147,12 @@ class Mnemosyne:
         self._pattern_detector = None
         self._delta_sync = None
         self._plugin_manager = None
+
+        # Create beam with streaming emitter wired
+        self.beam = BeamMemory(session_id=session_id, db_path=self.db_path,
+                               author_id=author_id, author_type=author_type,
+                               channel_id=channel_id,
+                               event_emitter=self._stream_emit)
 
     # ─── Phase 8: Streaming ─────────────────────────────────────────
 
@@ -162,9 +165,21 @@ class Mnemosyne:
         return self._stream
 
     def enable_streaming(self) -> "Mnemosyne":
-        """Enable event streaming for this memory instance."""
+        """Enable event streaming for this memory instance.
+
+        Wires the stream into BeamMemory so all write operations emit events.
+        Call once after construction to activate the streaming subsystem.
+        """
         _ = self.stream  # Force init
+        # Retroactively wire emitter into existing beam (handles lazy init case)
+        if self.beam._event_emitter is None:
+            self.beam._event_emitter = self._stream_emit
         return self
+
+    def _stream_emit(self, event) -> None:
+        """Callback passed to BeamMemory; routes events to the lazy-init stream."""
+        if self._stream is not None:
+            self._stream.emit(event)
 
     # ─── Phase 8: Compression ───────────────────────────────────────
 
@@ -363,6 +378,22 @@ class Mnemosyne:
                                 fts_weight=fts_weight,
                                 importance_weight=importance_weight)
 
+    def _emit_wrapper(self, event_type: str, memory_id: str, **kwargs) -> None:
+        """Emit a streaming event through the Mnemosyne wrapper layer."""
+        if self._stream is not None:
+            try:
+                from mnemosyne.core.streaming import MemoryEvent, EventType
+                evt = EventType[event_type]
+                event = MemoryEvent(
+                    event_type=evt,
+                    memory_id=memory_id,
+                    session_id=self.session_id,
+                    **kwargs,
+                )
+                self._stream.emit(event)
+            except Exception:
+                pass
+
     def get_context(self, limit: int = 10) -> List[Dict]:
         """
         Get recent memories from current session for context injection.
@@ -435,8 +466,9 @@ class Mnemosyne:
         cursor.execute("DELETE FROM memories WHERE id = ? AND session_id = ?",
                       (memory_id, self.session_id))
         self.conn.commit()
-        self.beam.forget_working(memory_id)
-        return cursor.rowcount > 0
+        result = self.beam.forget_working(memory_id)
+        self._emit_wrapper("MEMORY_INVALIDATED", memory_id)
+        return result
 
     def update(self, memory_id: str, content: str = None,
                importance: float = None) -> bool:
@@ -467,11 +499,14 @@ class Mnemosyne:
         # Sync BEAM working_memory
         self.beam.update_working(memory_id, content=content, importance=importance)
 
+        self._emit_wrapper("MEMORY_UPDATED", memory_id, content=content, importance=importance)
         return cursor.rowcount > 0
 
     def invalidate(self, memory_id: str, replacement_id: str = None) -> bool:
         """Mark a memory as expired or superseded. Delegates to BEAM."""
-        return self.beam.invalidate(memory_id, replacement_id=replacement_id)
+        result = self.beam.invalidate(memory_id, replacement_id=replacement_id)
+        self._emit_wrapper("MEMORY_INVALIDATED", memory_id, replacement_id=replacement_id)
+        return result
 
     # ------------------------------------------------------------------
     # BEAM-specific public methods

@@ -976,7 +976,8 @@ class BeamMemory:
 
     def __init__(self, session_id: str = "default", db_path: Path = None,
                  author_id: str = None, author_type: str = None,
-                 channel_id: str = None, use_cloud: bool = False):
+                 channel_id: str = None, use_cloud: bool = False,
+                 event_emitter: "Optional[Callable[[Any], None]]" = None):
         self.session_id = session_id
         self.author_id = author_id
         self.author_type = author_type
@@ -985,6 +986,7 @@ class BeamMemory:
         self.use_cloud = use_cloud  # Enable LLM fact extraction during remember()
         self._extraction_client = None  # Lazy-loaded ExtractionClient
         self._extraction_buffer = []  # Buffer for batch extraction
+        self._event_emitter = event_emitter  # Streaming event callback
         self.conn = _get_connection(self.db_path)
         init_beam(self.db_path)
 
@@ -1018,6 +1020,29 @@ class BeamMemory:
         """, (self.session_id, content))
         row = cursor.fetchone()
         return row["id"] if row else None
+
+    def _emit_event(self, event_type, memory_id: str, content: str = None,
+                    source: str = None, importance: float = None,
+                    metadata: Dict = None, delta: Dict = None) -> None:
+        """Fire a streaming event if an emitter is registered."""
+        if self._event_emitter is None:
+            return
+        try:
+            from mnemosyne.core.streaming import MemoryEvent, EventType
+            evt_type = EventType[event_type] if isinstance(event_type, str) else event_type
+            event = MemoryEvent(
+                event_type=evt_type,
+                memory_id=memory_id,
+                session_id=self.session_id,
+                content=content,
+                source=source,
+                importance=importance,
+                metadata=metadata,
+                delta=delta,
+            )
+            self._event_emitter(event)
+        except Exception:
+            pass  # Streaming failures must never block memory operations
 
     def remember(self, content: str, source: str = "conversation",
                  importance: float = 0.5, metadata: Dict = None,
@@ -1087,6 +1112,8 @@ class BeamMemory:
                 _extract_and_store_facts(self, existing_id, content, source)
             # Phase 3-4: Extract graph and consolidate veracity for dedup update
             self._ingest_graph_and_veracity(existing_id, content, source, veracity)
+            self._emit_event("MEMORY_UPDATED", existing_id, content=content,
+                             source=source, importance=importance, metadata=metadata)
             return existing_id
 
         memory_id = memory_id or _generate_id(content)
@@ -1117,6 +1144,8 @@ class BeamMemory:
         # Phase 3-4: Extract graph and consolidate veracity for new memory
         self._ingest_graph_and_veracity(memory_id, content, source, veracity)
 
+        self._emit_event("MEMORY_ADDED", memory_id, content=content,
+                         source=source, importance=importance, metadata=metadata)
         return memory_id
 
     def remember_batch(self, items: List[Dict]) -> List[str]:
@@ -1424,6 +1453,9 @@ class BeamMemory:
         # Phase 3-4: Graph + veracity for consolidated episodic memory
         self._ingest_graph_and_veracity(memory_id, summary, source, veracity="inferred")
 
+        self._emit_event("MEMORY_CONSOLIDATED", memory_id, content=summary,
+                         source=source, importance=importance,
+                         metadata={"summary_of": source_wm_ids, **(metadata or {})})
         return memory_id
 
     def recall(self, query: str, top_k: int = 40, *,
