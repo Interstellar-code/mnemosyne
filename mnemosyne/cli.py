@@ -26,6 +26,12 @@ def _fail(message: str, exit_code: int = 2) -> NoReturn:
     raise SystemExit(exit_code)
 
 
+def _usage(message: str, exit_code: int = 2) -> NoReturn:
+    """Print command usage for invalid invocations and exit."""
+    print(message, file=sys.stderr)
+    raise SystemExit(exit_code)
+
+
 def _parse_float(value: str, name: str) -> float:
     """Parse a float argument or exit with a user-facing CLI error."""
     try:
@@ -51,8 +57,7 @@ def _get_memory():
 def cmd_store(args):
     """Store a new memory."""
     if not args:
-        print("Usage: mnemosyne store <content> [source] [importance]")
-        return
+        _usage("Usage: mnemosyne store <content> [source] [importance]")
     content = args[0]
     source = args[1] if len(args) > 1 else "cli"
     importance = _parse_float(args[2], "importance") if len(args) > 2 else 0.5
@@ -70,8 +75,7 @@ def cmd_store(args):
 def cmd_recall(args):
     """Search memories."""
     if not args:
-        print("Usage: mnemosyne recall <query> [top_k]")
-        return
+        _usage("Usage: mnemosyne recall <query> [top_k]")
     query = args[0]
     top_k = _parse_int(args[1], "top_k") if len(args) > 1 else 5
 
@@ -92,8 +96,7 @@ def cmd_recall(args):
 def cmd_update(args):
     """Update an existing memory."""
     if len(args) < 2:
-        print("Usage: mnemosyne update <memory_id> <new_content> [importance]")
-        return
+        _usage("Usage: mnemosyne update <memory_id> <new_content> [importance]")
     memory_id = args[0]
     content = args[1]
     importance = _parse_float(args[2], "importance") if len(args) > 2 else None
@@ -103,14 +106,13 @@ def cmd_update(args):
     if success:
         print(f"Updated: {memory_id}")
     else:
-        print(f"Memory not found: {memory_id}")
+        _fail(f"Memory not found: {memory_id}", exit_code=1)
 
 
 def cmd_delete(args):
     """Delete a memory."""
     if not args:
-        print("Usage: mnemosyne delete <memory_id>")
-        return
+        _usage("Usage: mnemosyne delete <memory_id>")
     memory_id = args[0]
 
     mem = _get_memory()
@@ -118,22 +120,25 @@ def cmd_delete(args):
     if success:
         print(f"Deleted: {memory_id}")
     else:
-        print(f"Memory not found: {memory_id}")
+        _fail(f"Memory not found: {memory_id}", exit_code=1)
 
 
 def cmd_stats(args):
     """Show memory system statistics."""
     mem = _get_memory()
     stats = mem.get_stats()
+    beam = stats.get("beam", {})
+    wm = beam.get("working_memory", {})
+    ep = beam.get("episodic_memory", {})
+    triples = beam.get("triples", {})
     print("\nMnemosyne Stats\n")
     print(f"  Total memories: {stats.get('total_memories', 0)}")
-    print(f"  Working memory: {stats.get('working_count', 0)}")
-    print(f"  Episodic memory: {stats.get('episodic_count', 0)}")
-    if stats.get("triple_count"):
-        print(f"  Knowledge triples: {stats['triple_count']}")
+    print(f"  Working memory: {wm.get('total', 0)}")
+    print(f"  Episodic memory: {ep.get('total', 0)}")
+    print(f"  Knowledge triples: {triples.get('total', 0)}")
     if stats.get("banks"):
         print(f"\n  Banks: {', '.join(stats['banks'])}")
-    print(f"  DB path: {stats.get('db_path', 'N/A')}")
+    print(f"  DB path: {stats.get('database', 'N/A')}")
 
 
 def cmd_sleep(args):
@@ -168,14 +173,20 @@ def cmd_export(args):
     output_path = args[0] if args else os.path.join(DATA_DIR, "mnemosyne_export.json")
     mem = _get_memory()
     result = mem.export_to_file(output_path)
-    print(f"Exported {result.get('count', 0)} memories to {output_path}")
+    print(
+        "Exported "
+        f"{result.get('working_memory_count', 0)} working, "
+        f"{result.get('episodic_memory_count', 0)} episodic, "
+        f"{result.get('legacy_memories_count', 0)} legacy, "
+        f"{result.get('triples_count', 0)} triples "
+        f"to {output_path}"
+    )
 
 
 def cmd_import(args):
     """Import memories from JSON."""
     if not args:
-        print("Usage: mnemosyne import <file.json>")
-        return
+        _usage("Usage: mnemosyne import <file.json>")
     mem = _get_memory()
     try:
         result = mem.import_from_file(args[0])
@@ -185,14 +196,21 @@ def cmd_import(args):
         _fail(f"Invalid JSON in import file {args[0]}: {e}")
     except ValueError as e:
         _fail(str(e))
-    print(f"Imported {result.get('count', 0)} memories from {args[0]}")
+    beam_stats = result.get("beam", {})
+    print(
+        "Imported "
+        f"{beam_stats.get('working_memory', {}).get('inserted', 0)} working, "
+        f"{beam_stats.get('episodic_memory', {}).get('inserted', 0)} episodic, "
+        f"{result.get('legacy', {}).get('inserted', 0)} legacy, "
+        f"{result.get('triples', {}).get('inserted', 0)} triples "
+        f"from {args[0]}"
+    )
 
 
 def cmd_import_hindsight(args):
     """Import memories from a Hindsight JSON export or API."""
     if not args:
-        print("Usage: mnemosyne import-hindsight <file.json|base_url> [bank]")
-        return
+        _usage("Usage: mnemosyne import-hindsight <file.json|base_url> [bank]")
     target = args[0]
     bank = args[1] if len(args) > 1 else "hermes"
     mem = _get_memory()
@@ -202,13 +220,15 @@ def cmd_import_hindsight(args):
     else:
         result = import_from_hindsight(mem, file_path=target, bank=bank)
     print(result.to_json())
+    if result.errors:
+        raise SystemExit(1)
 
 
 def cmd_mcp(args):
     """Start MCP server."""
     try:
         from mnemosyne.mcp_server import main as mcp_main
-        mcp_main()
+        mcp_main(args)
     except ImportError:
         print("MCP not available. Install with: pip install mnemosyne-memory[mcp]")
         sys.exit(1)
@@ -217,32 +237,34 @@ def cmd_mcp(args):
 def cmd_bank(args):
     """Manage memory banks."""
     if not args:
-        print("Usage: mnemosyne bank <list|create|delete> [name]")
-        return
+        _usage("Usage: mnemosyne bank <list|create|delete> [name]")
 
     from mnemosyne.core.banks import BankManager
-    bm = BankManager(db_path=os.path.join(DATA_DIR, "mnemosyne.db"))
+    bm = BankManager(Path(DATA_DIR))
 
     subcmd = args[0]
-    if subcmd == "list":
-        banks = bm.list_banks()
-        print("\nMemory Banks:\n")
-        for b in banks:
-            print(f"  - {b}")
-    elif subcmd == "create":
-        if len(args) < 2:
-            print("Usage: mnemosyne bank create <name>")
-            return
-        bm.create_bank(args[1])
-        print(f"Created bank: {args[1]}")
-    elif subcmd == "delete":
-        if len(args) < 2:
-            print("Usage: mnemosyne bank delete <name>")
-            return
-        bm.delete_bank(args[1])
-        print(f"Deleted bank: {args[1]}")
-    else:
-        print(f"Unknown bank command: {subcmd}")
+    try:
+        if subcmd == "list":
+            banks = bm.list_banks()
+            print("\nMemory Banks:\n")
+            for b in banks:
+                print(f"  - {b}")
+        elif subcmd == "create":
+            if len(args) < 2:
+                _fail("Usage: mnemosyne bank create <name>")
+            bm.create_bank(args[1])
+            print(f"Created bank: {args[1]}")
+        elif subcmd == "delete":
+            if len(args) < 2:
+                _fail("Usage: mnemosyne bank delete <name>")
+            if bm.delete_bank(args[1]):
+                print(f"Deleted bank: {args[1]}")
+            else:
+                _fail(f"Bank not found: {args[1]}", exit_code=1)
+        else:
+            _fail(f"Unknown bank command: {subcmd}")
+    except ValueError as e:
+        _fail(str(e))
 
 
 COMMANDS = {
@@ -292,8 +314,9 @@ def run_cli():
     if handler:
         handler(sys.argv[2:])
     else:
-        print(f"Unknown command: {command}")
-        print("Run 'mnemosyne --help' for usage.")
+        print(f"Unknown command: {command}", file=sys.stderr)
+        print("Run 'mnemosyne --help' for usage.", file=sys.stderr)
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":

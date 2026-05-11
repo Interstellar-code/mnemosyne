@@ -60,7 +60,7 @@ def mnemosyne_command(args):
     """Dispatch ``hermes mnemosyne <subcommand>``."""
     cmd = getattr(args, "mnemosyne_cmd", None)
     if not cmd:
-        print("Usage: hermes mnemosyne {stats|sleep|inspect|clear}")
+        print("Usage: hermes mnemosyne {stats|sleep|version|inspect|clear|export|import}")
         return 1
 
     try:

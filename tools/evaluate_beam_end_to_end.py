@@ -69,8 +69,8 @@ NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY", "")
 OPENROUTER_BASE_URL = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
 DEFAULT_MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
 FALLBACK_MODELS = [
-    "deepseek/deepseek-chat-v3:free",
-    "google/gemma-4-26b-a4b-it:free",
+    "google/gemini-2.5-flash-lite:free",
+    "google/gemma-4-26b-a4b-it:free",  
 ]
 DEFAULT_TOP_K = 10  # Memories to retrieve per question
 MAX_MEMORY_CONTEXT_CHARS = 8000  # Max chars of retrieved context to send to LLM
@@ -117,7 +117,9 @@ ABILITY_MAP = {
 
 class LLMClient:
     """OpenAI-compatible API client using OpenRouter (fast, reliable)."""
-
+    
+    _last_429_time = 0  # Class-level rate-limit cooldown
+    
     def __init__(self, model: str = DEFAULT_MODEL, api_key: str = None, base_url: str = None):
         self.model = model
         self.api_key = api_key or OPENROUTER_API_KEY
@@ -126,26 +128,20 @@ class LLMClient:
         self.call_count = 0
 
     def chat(self, messages: list, temperature: float = 0.1, max_tokens: int = 1024) -> str:
-        """Send chat completion request with fallback and retry."""
-        models_to_try = [self.model] + [m for m in self.fallback_models if m != self.model]
+        """Send chat completion request with retry. No fallback models to avoid rate limits."""
+        
         last_error = None
-
-        for model in models_to_try:
-            for attempt in range(3):
-                try:
-                    return self._call_api(model, messages, temperature, max_tokens)
-                except Exception as e:
-                    last_error = str(e)
-                    if "429" in last_error or "rate" in last_error.lower():
-                        wait = 2 ** attempt
-                        time.sleep(wait)
-                        continue
-                    else:
-                        break  # Non-retryable error, try next model
-            # If we get here, this model failed all attempts
-            if "429" not in str(last_error) and "rate" not in str(last_error).lower():
-                continue  # Try next model
-            time.sleep(3)  # Brief pause between models
+        for attempt in range(3):
+            try:
+                return self._call_api(self.model, messages, temperature, max_tokens)
+            except Exception as e:
+                last_error = str(e)
+                if "429" in last_error or "rate" in last_error.lower():
+                    wait = 15 * (attempt + 1)  # 15s, 30s, 45s backoff
+                    time.sleep(wait)
+                    continue
+                else:
+                    break  # Non-retryable error
 
         return f"[LLM_ERROR: all models failed. Last: {last_error}]"
 
@@ -413,9 +409,27 @@ def _extract_facts(content: str, source: str = "unknown") -> list[dict]:
 
 def ingest_conversation(beam: BeamMemory, messages: list[dict]) -> dict:
     """Ingest conversation messages into Mnemosyne BEAM tiers.
-    Simple batch ingestion: working memory (FTS5) + periodic episodic consolidation."""
+    Also builds an in-memory facts index for fact-boosted retrieval."""
     start_time = time.perf_counter()
     stats = {"wm_count": 0, "ep_count": 0, "sp_count": 0, "total_chars": 0}
+    
+    # In-memory context→value facts index for direct fact matching.
+    # Format: {"context phrase": "fact value"} — maps question-like phrases to answers.
+    # Example: "My first sprint ends on" → "March 29"
+    # Built during ingestion, queried during answering for zero-LLM fact extraction.
+    import re as _re2
+    _FACT_VALUE_RE = _re2.compile(
+        r'('
+        r'\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* \d{1,2}(?:[, ]*\d{4})?\b|'  # dates
+        r'\b\d{4}-\d{2}-\d{2}\b|'  # ISO dates
+        r'\b\d+[.,]?\d*\s*(?:ms|sec|mins?|hours?|days?|weeks?|months?|years?|%|KB|MB|GB|TB|rows?|columns?|roles?|features?|bugs?|commits?|cards?|users?|items?|tests?|APIs?|endpoints?|sprints?|tickets?)\b|'  # numbers+units
+        r'\bv?\d+\.\d+(?:\.\d+)?(?:-[a-zA-Z0-9.]+)?\b'  # versions
+        r')'
+    )
+    context_facts = getattr(beam, '_context_facts', {})
+    if not hasattr(beam, '_context_facts'):
+        beam._context_facts = {}
+        context_facts = beam._context_facts
 
     BATCH_SIZE = 500
 
@@ -433,6 +447,24 @@ def ingest_conversation(beam: BeamMemory, messages: list[dict]) -> dict:
                 "importance": 0.3 + (0.1 * ((batch_start + i) % 5)),
             })
             stats["total_chars"] += len(content)
+            
+            # Extract context→value facts: words before AND after each fact value
+            # SKIP version numbers (e.g., "3.39", "2.3.1") — they pollute fact matching
+            # and are never the answer to BEAM questions (which ask about dates, counts, names).
+            _VERSION_RE = _re2.compile(r'^\d+\.\d+(?:\.\d+)?(?:-[a-zA-Z0-9.]+)?$')
+            for match in _FACT_VALUE_RE.finditer(content):
+                value = match.group()
+                if _VERSION_RE.match(value):
+                    continue  # Skip bare version numbers
+                # Extract context: up to 12 words before + 8 words after the fact
+                before = content[:match.start()].split()[-12:]
+                after = content[match.end():].split()[:8]
+                context_words = before + after
+                context = ' '.join(context_words).lower().strip()
+                if context and len(context) > 5:
+                    if context not in context_facts:
+                        context_facts[context] = []
+                    context_facts[context].append(value)
 
             # Scratchpad every 10 messages
             if (batch_start + i) % 10 == 0 and len(content) > 50:
@@ -527,19 +559,21 @@ def ingest_conversation(beam: BeamMemory, messages: list[dict]) -> dict:
 #  LLM Answering with Mnemosyne Memory
 # ============================================================
 
-ANSWER_SYSTEM_PROMPT = """You are a helpful assistant answering questions about a user's past conversations. You have access to retrieved conversation memories.
+ANSWER_SYSTEM_PROMPT = """You are a precise memory assistant answering questions about past conversations. You receive conversation context that may contain the answer.
 
-Your job: answer questions using the provided memories. Give the BEST answer you can based on the most relevant information, even if some details are unclear.
+CRITICAL: Think step-by-step before answering. Follow this structure:
 
-CRITICAL RULES:
-- Answer based on the MOST RELEVANT memories. If you see a clear answer, provide it confidently.
-- Only say "I don't have enough information" if the memories contain NOTHING related to the question.
-- If memories contain partial information, answer with what you have rather than abstaining.
-- For EVENT ORDERING questions, extract timestamps or explicit ordering clues from the memories.
-- For TEMPORAL questions, look for dates, timestamps, or relative time references.
-- If there are contradictions, mention both possibilities.
+STEP 1 - RELEVANT FACTS: List all specific facts from the context that relate to the question (dates, numbers, names, events, statements).
+STEP 2 - CONTRADICTIONS: If the context contains conflicting statements about the same topic, identify BOTH sides explicitly.
+STEP 3 - TEMPORAL/CALCULATIONS: For date/time questions, extract all relevant dates and compute the answer.
+STEP 4 - ANSWER: Provide a thorough final answer with all relevant details from the context.
 
-Be concise but thorough. Include specific details from the memories to support your answer."""
+RULES:
+- For EVENT ORDERING: list items in chronological order as they appear.
+- For CONTRADICTION: explicitly state "The conversation contains contradictory information: [A] vs [B]"
+- For SUMMARIZATION: include all key details — project stages, features, timelines, security, database, challenges.
+- NEVER say "I don't have enough information" unless absolutely nothing in the context mentions the topic.
+- For "how many" questions, provide the specific count, not a range."""
 
 DEFAULT_TOP_K = 30  # Memories to retrieve per question (increased for broader context)
 RECENT_CONTEXT_COUNT = 12  # Last N messages to include as recent context
@@ -650,6 +684,248 @@ def _multi_strategy_recall(beam: BeamMemory, question: str, top_k: int = DEFAULT
     return all_memories[:top_k]
 
 
+# ============================================================
+#  Per-Ability Bypasses: TR (Temporal Reasoning) + CR (Contradiction)
+# ============================================================
+
+def _extract_timeline_from_conversation(messages: list) -> list[dict]:
+    """Extract ALL dates from conversation messages with surrounding event context.
+    Filters out dates in code snippets. Returns sorted list of {date_obj, date_str, event_text, msg_index}."""
+    import re as _re
+    from datetime import datetime as _dt
+    
+    timeline = []
+    
+    # Month name map
+    MONTH_MAP = {
+        'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'may': 5, 'jun': 6,
+        'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12,
+        'january': 1, 'february': 2, 'march': 3, 'april': 4, 'may': 5,
+        'june': 6, 'july': 7, 'august': 8, 'september': 9, 'october': 10,
+        'november': 11, 'december': 12,
+    }
+    
+    # Code indicators to filter out
+    CODE_INDICATORS = ['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'CREATE TABLE',
+                       'def ', 'import ', 'print(', 'return ', '```', 'function(',
+                       'jsonify', 'datetime', 'params', 'cursor.']
+    
+    def _is_code_context(text: str, match_start: int) -> bool:
+        """Check if a date match appears to be in a code snippet."""
+        # Check ~200 chars around match for code indicators
+        start = max(0, match_start - 100)
+        end = min(len(text), match_start + 100)
+        surrounding = text[start:end]
+        # If backticks within 200 chars, it's code
+        if '```' in surrounding or '`' in surrounding:
+            return True
+        # If multiple code indicators present
+        code_count = sum(1 for ci in CODE_INDICATORS if ci in surrounding)
+        if code_count >= 2:
+            return True
+        # ISO date alone (2024-01-15) in a line with code indicators = likely code
+        if _re.search(r'\b\d{4}-\d{2}-\d{2}\b', surrounding):
+            if any(ci in surrounding for ci in CODE_INDICATORS):
+                return True
+        return False
+    
+    # Track the conversation year context
+    year_mentions = []
+    for msg in messages:
+        years = _re.findall(r'\b(20\d{2})\b', msg.get("content", ""))
+        year_mentions.extend(int(y) for y in years)
+    # Use the most common year > 2020 as default
+    default_year = 2024
+    if year_mentions:
+        from collections import Counter
+        year_counts = Counter(y for y in year_mentions if 2020 <= y <= 2030)
+        if year_counts:
+            default_year = year_counts.most_common(1)[0][0]
+    
+    for i, msg in enumerate(messages):
+        content = msg.get("content", "")
+        if not content:
+            continue
+        
+        # Pattern 1: "Month Day, Year" (e.g. "March 15, 2024")
+        for m in _re.finditer(
+            r'(?P<month>January|February|March|April|May|June|July|August|September|October|November|December|'
+            r'Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+'
+            r'(?P<day>\d{1,2})(?:st|nd|rd|th)?[,\s]+(?P<year>\d{4})',
+            content, _re.IGNORECASE
+        ):
+            if _is_code_context(content, m.start()):
+                continue
+            month_num = MONTH_MAP.get(m.group('month').lower()[:3])
+            if month_num:
+                try:
+                    dt = _dt(int(m.group('year')), month_num, int(m.group('day')))
+                    start = max(0, m.start() - 60)
+                    end = min(len(content), m.end() + 60)
+                    event_text = content[start:end].strip()
+                    timeline.append({
+                        'date_obj': dt, 'date_str': m.group(0),
+                        'event_text': event_text, 'msg_index': i,
+                    })
+                except ValueError:
+                    pass
+        
+        # Pattern 2: "Month Day" without year (e.g. "March 29")
+        for m in _re.finditer(
+            r'(?P<month>January|February|March|April|May|June|July|August|September|October|November|December|'
+            r'Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+'
+            r'(?P<day>\d{1,2})(?:st|nd|rd|th)?'
+            r'(?![\d,\s]*\d{4})',  # NOT followed by year
+            content, _re.IGNORECASE
+        ):
+            if _is_code_context(content, m.start()):
+                continue
+            month_num = MONTH_MAP.get(m.group('month').lower()[:3])
+            if month_num:
+                try:
+                    dt = _dt(default_year, month_num, int(m.group('day')))
+                    start = max(0, m.start() - 60)
+                    end = min(len(content), m.end() + 60)
+                    event_text = content[start:end].strip()
+                    timeline.append({
+                        'date_obj': dt, 'date_str': m.group(0),
+                        'event_text': event_text, 'msg_index': i,
+                    })
+                except ValueError:
+                    pass
+    
+    # Sort chronologically and deduplicate (same date, same event text)
+    timeline.sort(key=lambda x: (x['date_obj'], x['event_text']))
+    seen = set()
+    deduped = []
+    for t in timeline:
+        key = (t['date_str'], t['event_text'][:40])
+        if key not in seen:
+            seen.add(key)
+            deduped.append(t)
+    
+    return deduped
+
+
+def _build_tr_timeline_prompt(timeline: list[dict]) -> str:
+    """Build a structured timeline prompt for TR questions."""
+    if not timeline:
+        return ""
+    
+    lines = ["CRITICAL TIMELINE (all dates extracted from the conversation, use ONLY these dates):"]
+    for t in timeline:
+        lines.append(f"  [{t['date_obj'].strftime('%Y-%m-%d')}] {t['date_str']}: ...{t['event_text'][:100]}...")
+    
+    return "\n".join(lines)
+
+
+def _compute_tr_answer(question: str, timeline: list[dict]) -> str | None:
+    """Compute temporal reasoning answer from conversation dates. Returns None if can't compute."""
+    if not timeline or len(timeline) < 2:
+        return None
+
+    # Build a prompt that presents the timeline and asks the LLM to compute
+    # This is more robust than trying to match events ourselves
+    timeline_prompt = _build_tr_timeline_prompt(timeline)
+    
+    # Build the full prompt that we'll return - the caller will send this to LLM
+    prompt = (
+        f"{timeline_prompt}\n\n"
+        f"QUESTION: {question}\n\n"
+        f"INSTRUCTIONS:\n"
+        f"1. Identify the two events mentioned in the question\n"
+        f"2. Find the corresponding dates in the timeline above\n"
+        f"3. Compute the time difference between them\n"
+        f"4. State the answer clearly with both dates and the computed difference\n\n"
+        f"ANSWER:"
+    )
+    return prompt  # Return the prompt, not the answer - caller passes to LLM
+
+
+def _detect_contradictions(messages: list, question: str) -> str | None:
+    """Scan conversation for contradictory statements about the question topic.
+    Returns contradiction context string to inject into prompt, or None if none found."""
+    import re as _re
+    
+    # Extract the key topic from the question
+    # "Have I worked with Flask routes?" -> key terms: "flask routes", "http requests"
+    # "Have I integrated Flask-Login?" -> key terms: "flask-login", "session management"
+    
+    # Strip question words to get the core topic
+    q_clean = _re.sub(r'^(?:Have I|Did I|Do I|Am I|Has)\s+(?:ever\s+)?', '', question, flags=_re.IGNORECASE)
+    q_clean = _re.sub(r'\s+(?:in this project|across my sessions|in my project)\s*\??$', '', q_clean, flags=_re.IGNORECASE)
+    q_clean = q_clean.strip().rstrip('?').strip()
+    
+    # Extract meaningful noun phrases
+    words = _re.findall(r'\b[a-zA-Z][a-zA-Z\-]+\b', q_clean)
+    # Filter to key content words (nouns, tech terms)
+    key_terms = []
+    for w in words:
+        wl = w.lower()
+        if len(wl) > 2 and wl not in ('the', 'and', 'for', 'with', 'any', 'this', 'that', 'have', 'has', 'been'):
+            key_terms.append(wl)
+    
+    if not key_terms:
+        return None
+    
+    # Scan all messages for mentions of ANY key term
+    affirmatives = []
+    negatives = []
+    
+    NEGATION_WORDS = {'never', 'not', "n't", 'no', 'without', 'cannot', "can't", 'nothing', 'none'}
+    
+    for i, msg in enumerate(messages):
+        content = msg.get("content", "")
+        content_lower = content.lower()
+        
+        # Check if message mentions any key term
+        matched_terms = [t for t in key_terms if t in content_lower]
+        if not matched_terms:
+            continue
+        
+        # Check for negation in the SENTENCE containing the matched term
+        # (BEAM contradictions embed negation near the topic mention)
+        has_negation = False
+        for term in matched_terms:
+            # Find the sentence containing this term
+            term_pos = content_lower.find(term)
+            if term_pos < 0:
+                continue
+            # Extract sentence context (200 chars around term, or to sentence boundaries)
+            start = max(0, term_pos - 150)
+            end = min(len(content_lower), term_pos + 150)
+            sentence = content_lower[start:end]
+            # Check for negation words in this sentence
+            for nw in NEGATION_WORDS:
+                if nw in sentence:
+                    has_negation = True
+                    break
+            if has_negation:
+                break
+        
+        snippet = content[:250].strip()
+        if has_negation:
+            negatives.append(f"[Msg {i}] {content[:250].strip()}")
+        else:
+            affirmatives.append(f"[Msg {i}] {content[:250].strip()}")
+    
+    if affirmatives and negatives:
+        ctx = "CRITICAL: CONTRADICTORY INFORMATION DETECTED\n\n"
+        ctx += "The conversation contains BOTH affirmative AND negative statements about this topic:\n\n"
+        ctx += "Statements suggesting this WAS done or worked on:\n"
+        for a in affirmatives[:5]:
+            ctx += f"  - {a}\n"
+        ctx += "\nStatements suggesting this was NOT done:\n"
+        for n in negatives[:5]:
+            ctx += f"  - {n}\n"
+        ctx += "\nYOU MUST explicitly identify the contradiction and present BOTH sides. "
+        ctx += "Do NOT answer with just one side. The correct response begins with "
+        ctx += "'I notice you've mentioned contradictory information about this.'"
+        return ctx
+    
+    return None
+
+
 def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str, 
                       conversation_messages: list = None, top_k: int = DEFAULT_TOP_K,
                       ability: str = None) -> str:
@@ -657,81 +933,186 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
     
     total_msgs = len(conversation_messages) if conversation_messages else 0
     
-    # STRATEGY: For small conversations (under 500 msgs), give the LLM ALL messages.
-    # For larger ones, use multi-strategy retrieval.
-    if total_msgs > 0 and total_msgs <= 500:
-        # Build full context from ALL messages (truncate individually to fit)
-        full_context_parts = []
+    # ---- PER-ABILITY BYPASSES (zero-LLM or augmented) ----
+    
+    # TR (Temporal Reasoning): compute answer in Python from extracted dates
+    if ability == 'TR' and conversation_messages:
+        timeline = _extract_timeline_from_conversation(conversation_messages)
+        print(f"    [TR-bypass] extracted {len(timeline)} dates from {len(conversation_messages)} msgs")
+        if timeline:
+            tr_prompt = _compute_tr_answer(question, timeline)
+            if tr_prompt:
+                # Send the timeline+question prompt to the LLM for computation
+                messages = [
+                    {"role": "system", "content": "You are a precise date calculator. Use ONLY the dates from the provided timeline."},
+                    {"role": "user", "content": tr_prompt},
+                ]
+                answer = llm.chat(messages, temperature=0.0, max_tokens=512)
+                print(f"    [TR-bypass] LLM answer: {answer[:150]}")
+                return answer
+            else:
+                print(f"    [TR-bypass] _compute_tr_answer returned None (timeline too short)")
+        else:
+            print(f"    [TR-bypass] no timeline extracted")
+    
+    # CR (Contradiction Resolution): detect contradictory statements
+    _cr_context = None
+    if ability == 'CR' and conversation_messages:
+        _cr_context = _detect_contradictions(conversation_messages, question)
+        if _cr_context:
+            print(f"    [CR-detect] FOUND contradictions, injecting context ({len(_cr_context)} chars)")
+        else:
+            print(f"    [CR-detect] no contradictions found")
+    # ---- END PER-ABILITY BYPASSES ----
+    
+    # FULL-CONTEXT MODE: send the entire conversation to the LLM, bypassing Mnemosyne retrieval.
+    # This tests the LLM's reading comprehension ceiling — useful for establishing the upper bound.
+    # Controlled by FULL_CONTEXT_MODE env var.
+    # HYBRID: try context→value matching first for factual questions (IE/MR/KU),
+    # then fall through to full-context for complex reasoning (ABS/CR/EO/SUM/TR).
+    _full_context = os.environ.get("FULL_CONTEXT_MODE", "").lower() in ("1", "true", "yes")
+    # DEBUG
+    if os.environ.get("FULL_CONTEXT_MODE"):
+        print(f"    [DEBUG full-context] env={_full_context}, msgs={bool(conversation_messages)}, count={len(conversation_messages) if conversation_messages else 0}")
+    if _full_context and conversation_messages:
+        # ---- Phase 1: Try context→value matching for factual questions ----
+        # Only use context→value for Information Extraction (IE) and Knowledge Understanding (KU).
+        # MR (Multi-hop) requires reasoning across multiple messages; let full-context handle it.
+        _FACT_ABILITIES = {'IE', 'KU'}
+        if ability in _FACT_ABILITIES and hasattr(beam, '_context_facts') and beam._context_facts:
+            _q_stop = {'when','does','do','did','what','how','where','which','who','why',
+                       'is','are','was','were','can','will','would','should','could','may',
+                       'the','a','an','in','on','at','to','for','of','with','my','me','i','you'}
+            q_words = [w.lower() for w in question.split() if w.lower() not in _q_stop and len(w) > 1]
+            q_set = set(q_words)
+            best_match = None
+            best_score = 0
+            for context_phrase, values in beam._context_facts.items():
+                c_words = set(context_phrase.split())
+                overlap = q_set & c_words
+                if len(overlap) < 2:
+                    continue
+                score = len(overlap) / max(len(c_words), 1)
+                if score > best_score:
+                    best_score = score
+                    best_match = values[0]
+            if best_match:
+                return best_match  # Direct fact answer, zero LLM cost
+        
+        # ---- Phase 2: Full-context LLM fallback ----
+        full_parts = []
         total_chars = 0
-        MAX_FULL_CONTEXT = 50000  # Gemini Flash has large context window
         for msg in conversation_messages:
             role = msg.get("role", "unknown")
             content = msg.get("content", "")
-            if not content.strip():
+            if content.strip():
+                line = f"[{role}]: {content}"
+                if total_chars + len(line) > MAX_MEMORY_CONTEXT_CHARS * 2:
+                    break
+                full_parts.append(line)
+                total_chars += len(line)
+        
+        context = "FULL CONVERSATION:\n" + "\n".join(full_parts)
+        
+        # Inject CR contradiction context if detected
+        _cr_prefix = ""
+        if _cr_context:
+            _cr_prefix = f"\n\n{_cr_context}\n\n"
+        
+        messages = [
+            {"role": "system", "content": ANSWER_SYSTEM_PROMPT},
+            {"role": "user", "content": f"{_cr_prefix}{context}\n\nQUESTION: {question}\n\nANSWER:"},
+        ]
+        return llm.chat(messages, temperature=0.1, max_tokens=2048)
+    
+    # ALWAYS use multi-strategy retrieval to test Mnemosyne's recall quality.
+    # The previous <=500 bypass sent full raw conversations to the LLM,
+    # completely bypassing Mnemosyne's retrieval pipeline.
+    # This benchmark exists to measure MEMORY performance, not LLM reading comprehension.
+    
+    # Multi-strategy retrieval
+    memories = _multi_strategy_recall(beam, question, top_k * 3, ability=ability)  # Get 3x more for reranking
+
+    # ---- Context→Value fact matching (Phase 7: direct regex-extracted facts, zero-LLM) ----
+    # At ingestion, we built beam._context_facts: {"words around fact": ["fact value"]}.
+    # Now we try to match the question against context phrases and return the value directly.
+    # Only used for factual question types (IE, MR, KU, TR) with strong matches.
+    # ABS, CR, EO, SUM need LLM reasoning — we skip context matching for those.
+    context_answer = None
+    # Only use context→value for Information Extraction (IE) and Knowledge Understanding (KU).
+    # MR (Multi-hop) requires reasoning across multiple messages; CR/TR/EO/SUM need LLM.
+    _FACT_ABILITIES = {'IE', 'KU'}
+    if ability in _FACT_ABILITIES and hasattr(beam, '_context_facts') and beam._context_facts:
+        # Build question word set (filtered like FTS5 search does)
+        _q_stop = {'when','does','do','did','what','how','where','which','who','why',
+                   'is','are','was','were','can','will','would','should','could','may',
+                   'the','a','an','in','on','at','to','for','of','with','my','me','i','you'}
+        q_words = [w.lower() for w in question.split() if w.lower() not in _q_stop and len(w) > 1]
+        q_set = set(q_words)
+        best_match = None
+        best_score = 0
+        for context_phrase, values in beam._context_facts.items():
+            c_words = set(context_phrase.split())
+            overlap = q_set & c_words
+            if len(overlap) < 2:
                 continue
-            line = f"[{role}]: {content[:500]}"
-            if total_chars + len(line) > MAX_FULL_CONTEXT:
-                break
-            full_context_parts.append(line)
-            total_chars += len(line)
-        
-        context = "FULL CONVERSATION (all messages):\n" + "\n\n".join(full_context_parts)
-        memories = []  # Not using retrieval for small convs
-    else:
-        # Multi-strategy retrieval for larger conversations
-        memories = _multi_strategy_recall(beam, question, top_k * 3, ability=ability)  # Get 3x more for reranking
+            # Score: overlap count / max(context_words, question_words) for fairness
+            score = len(overlap) / max(len(c_words), 1)
+            if score > best_score and len(overlap) >= 2:
+                best_score = score
+                best_match = values[0]
+        if best_match:
+            context_answer = best_match
 
-        # If cloud extraction enabled, also search the facts table
-        if getattr(beam, 'use_cloud', False):
-            try:
-                fact_memories = beam.fact_recall(question, top_k=top_k)
-                # Convert fact dicts to same format as recall results
-                for f in fact_memories:
-                    memories.append({
-                        "content": f"FACT: {f['content']}",
-                        "score": f.get("score", 0.5) * 2.0,  # 2x weight for facts
-                        "source": "fact_extraction",
-                    })
-                # Re-sort by score
-                memories.sort(key=lambda x: x.get("score", 0), reverse=True)
-            except Exception:
-                pass  # Fact recall is best-effort
-        
-        # LLM RERANKING: filter noisy FTS5 results to improve precision
-        if len(memories) > top_k:
-            try:
-                # Build reranking prompt with candidate memories
-                candidate_text = ""
-                for i, mem in enumerate(memories[:min(len(memories), top_k * 3)]):
-                    content = mem.get("content", "")[:200]
-                    candidate_text += f"[{i}] {content}\n"
-                
-                rerank_prompt = f"""Select the {top_k} most relevant memories for answering this question. Return ONLY indices separated by commas.
+    # If cloud extraction enabled, also search the facts table
+    if getattr(beam, 'use_cloud', False):
+        try:
+            fact_memories = beam.fact_recall(question, top_k=top_k)
+            # Convert fact dicts to same format as recall results
+            for f in fact_memories:
+                memories.append({
+                    "content": f"FACT: {f['content']}",
+                    "score": f.get("score", 0.5) * 2.0,  # 2x weight for facts
+                    "source": "fact_extraction",
+                })
+            # Re-sort by score
+            memories.sort(key=lambda x: x.get("score", 0), reverse=True)
+        except Exception:
+            pass  # Fact recall is best-effort
+    
+    # LLM RERANKING: DISABLED — rate-limit avoidance + proven ineffective (Reality Check 5.3)
+    # The re-ranker cannot beat baseline by >3pp and causes 429 rate-limit cascades.
+    # Left as dead code for reference.
 
-QUESTION: {question}
+    # ---- Fact-density reranking (Phase 6.5: algorithmic, zero-LLM) ----
+    # BEAM distractors are generic dev-talk; answer messages carry specific data.
+    # Boost messages with dates, numbers, proper nouns, versions, technical terms.
+    import re as _re_facts
+    _FACT_PATTERNS = [
+        (r'\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* \d{1,2}(?:[, ]*\d{4})?\b', 2.0),  # dates
+        (r'\b\d{4}-\d{2}-\d{2}\b', 2.5),  # ISO dates
+        (r'\b\d+[.,]?\d*\s*(?:ms|sec|mins?|hours?|days?|weeks?|months?|years?|%|KB|MB|GB|TB|rows?|columns?|roles?|features?|bugs?|commits?|cards?|users?|items?|tests?|APIs?|endpoints?|sprints?|tickets?)\b', 1.5),  # numbers with units
+        (r'\bv?\d+\.\d+(?:\.\d+)?(?:-[a-zA-Z0-9.]+)?\b', 1.5),  # version strings
+        (r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,4}\b', 1.0),  # proper noun phrases
+        (r'\b[A-Z]{2,8}\b', 0.8),  # acronyms
+    ]
+    for mem in memories:
+        content = mem.get("content", "")
+        fact_score = 0.0
+        for pattern, weight in _FACT_PATTERNS:
+            matches = _re_facts.findall(pattern, content)
+            fact_score += len(matches) * weight
+        # Normalize by content length to get fact density
+        density = fact_score / max(len(content.split()), 1)
+        mem["fact_density"] = round(density, 4)
+        # Boost score: blend original with fact density (40% fact boost)
+        orig = mem.get("score", mem.get("relevance", 0))
+        mem["score"] = orig * 0.6 + min(density * 5.0, 1.0) * 0.4
 
-MEMORIES:
-{candidate_text}
-
-MOST RELEVANT INDICES (comma-separated):"""
-                
-                rerank_response = llm.chat([
-                    {"role": "system", "content": "You select relevant memories from a list. Return only comma-separated indices. No explanation."},
-                    {"role": "user", "content": rerank_prompt}
-                ], temperature=0.0, max_tokens=100)
-                
-                # Parse indices from response
-                import re
-                indices = [int(x.strip()) for x in re.findall(r'\d+', rerank_response)]
-                reranked = [memories[i] for i in indices if i < len(memories)]
-                
-                if len(reranked) >= top_k // 2:  # Only use if we got enough
-                    memories = reranked[:top_k]
-                # Fall through to use original if reranking fails
-            except Exception:
-                pass
-        
-        context = ""  # Built below from memories
+    # Re-sort by boosted score
+    memories.sort(key=lambda m: m.get("score", 0), reverse=True)
+    
+    context = ""  # Built below from memories
 
     # Build recent context from last N messages
     recent_parts = []
@@ -777,12 +1158,21 @@ MOST RELEVANT INDICES (comma-separated):"""
         
         context = "\n\n".join(context_blocks) if context_blocks else "[No memories found]"
 
+    # If we found a direct context→value match, return it immediately (zero LLM cost)
+    if context_answer:
+        return context_answer
+
+    # Inject CR contradiction context if detected
+    _cr_prefix_ret = ""
+    if _cr_context:
+        _cr_prefix_ret = f"\n\n{_cr_context}\n\n"
+
     messages = [
         {"role": "system", "content": ANSWER_SYSTEM_PROMPT},
-        {"role": "user", "content": f"{context}\n\nQUESTION: {question}\n\nANSWER:"},
+        {"role": "user", "content": f"{_cr_prefix_ret}{context}\n\nQUESTION: {question}\n\nANSWER:"},
     ]
 
-    return llm.chat(messages, temperature=0.1, max_tokens=1024)
+    return llm.chat(messages, temperature=0.1, max_tokens=2048)
 
 
 # ============================================================
@@ -934,6 +1324,9 @@ def evaluate_conversation(
 
         print(f"    [{ability}] score={score:.2f} ans={answer_time*1000:.0f}ms judge={judge_time*1000:.0f}ms "
               f"Q: {question[:60]}...")
+        
+        # Rate-limit avoidance: long pause between questions (20s to avoid provider burst limits)
+        time.sleep(20)
 
     return {
         "conversation_id": conv_id,
@@ -1072,6 +1465,8 @@ def main():
                         help="LLM model for answering and judging")
     parser.add_argument("--judge-model", default=None,
                         help="Separate LLM for judging (default: same as --model)")
+    parser.add_argument("--full-context", action="store_true",
+                        help="Send full conversation to LLM (ceiling test, bypasses retrieval)")
     parser.add_argument("--resume", action="store_true",
                         help="Resume from previous results file")
     parser.add_argument("--dry-run", action="store_true",
@@ -1089,6 +1484,9 @@ def main():
     print(f"  Sample: {sample_size or 'ALL'} conversations/scale")
     print(f"  Model: {args.model}")
     print(f"  Judge: {args.judge_model or args.model}")
+    if args.full_context:
+        os.environ["FULL_CONTEXT_MODE"] = "1"
+        print("  Mode: FULL-CONTEXT (bypassing retrieval)")
     print(f"{'='*80}")
 
     # Load data

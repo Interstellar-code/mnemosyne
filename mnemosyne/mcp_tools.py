@@ -261,6 +261,11 @@ def _create_instance(session_id: str = None, author_id: str = None,
     )
 
 
+def _resolve_bank(arguments: Dict[str, Any]) -> str:
+    """Resolve per-call bank, falling back to MCP server default bank."""
+    return arguments.get("bank") or os.environ.get("MNEMOSYNE_MCP_BANK") or "default"
+
+
 # ---------------------------------------------------------------------------
 # Tool Handlers
 # ---------------------------------------------------------------------------
@@ -273,7 +278,7 @@ def _handle_remember(arguments: Dict[str, Any]) -> Dict[str, Any]:
     metadata = arguments.get("metadata", {})
     extract_entities = arguments.get("extract_entities", False)
     extract = arguments.get("extract", False)
-    bank = arguments.get("bank", "default")
+    bank = _resolve_bank(arguments)
 
     mem = _create_instance(author_id=arguments.get("author_id"), author_type=arguments.get("author_type"), channel_id=arguments.get("channel_id"), bank=bank)
     memory_id = mem.remember(
@@ -296,7 +301,7 @@ def _handle_recall(arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Handle mnemosyne_recall tool call."""
     query = arguments["query"]
     top_k = arguments.get("top_k", 5)
-    bank = arguments.get("bank", "default")
+    bank = _resolve_bank(arguments)
     temporal_weight = arguments.get("temporal_weight", 0.0)
     query_time = arguments.get("query_time")
 
@@ -331,7 +336,7 @@ def _handle_sleep(arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Handle mnemosyne_sleep tool call."""
     dry_run = arguments.get("dry_run", False)
     all_sessions = arguments.get("all_sessions", False)
-    bank = arguments.get("bank", "default")
+    bank = _resolve_bank(arguments)
 
     mem = _create_instance(author_id=arguments.get("author_id"), author_type=arguments.get("author_type"), channel_id=arguments.get("channel_id"), bank=bank)
     if all_sessions and hasattr(mem, "sleep_all_sessions"):
@@ -350,7 +355,7 @@ def _handle_sleep(arguments: Dict[str, Any]) -> Dict[str, Any]:
 
 def _handle_scratchpad_read(arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Handle mnemosyne_scratchpad_read tool call."""
-    bank = arguments.get("bank", "default")
+    bank = _resolve_bank(arguments)
 
     mem = _create_instance(author_id=arguments.get("author_id"), author_type=arguments.get("author_type"), channel_id=arguments.get("channel_id"), bank=bank)
     entries = mem.scratchpad_read()
@@ -366,7 +371,7 @@ def _handle_scratchpad_read(arguments: Dict[str, Any]) -> Dict[str, Any]:
 def _handle_scratchpad_write(arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Handle mnemosyne_scratchpad_write tool call."""
     content = arguments["content"]
-    bank = arguments.get("bank", "default")
+    bank = _resolve_bank(arguments)
 
     mem = _create_instance(author_id=arguments.get("author_id"), author_type=arguments.get("author_type"), channel_id=arguments.get("channel_id"), bank=bank)
     entry_id = mem.scratchpad_write(content)
@@ -380,7 +385,7 @@ def _handle_scratchpad_write(arguments: Dict[str, Any]) -> Dict[str, Any]:
 
 def _handle_get_stats(arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Handle mnemosyne_get_stats tool call."""
-    bank = arguments.get("bank", "default")
+    bank = _resolve_bank(arguments)
 
     mem = _create_instance(author_id=arguments.get("author_id"), author_type=arguments.get("author_type"), channel_id=arguments.get("channel_id"), bank=bank)
     stats = mem.get_stats()

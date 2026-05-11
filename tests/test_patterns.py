@@ -240,3 +240,72 @@ class TestPatternDetector:
         patterns = detector.detect_content(memories)
         # With high confidence threshold, should find nothing
         assert len(patterns) == 0
+
+
+# ─── Mnemosyne wrapper integration (C26) ────────────────────────────
+
+class TestMnemosynePatternMethods:
+    """Regression tests for [C26]: Mnemosyne.detect_patterns() and
+    summarize_patterns() called self.get_all_memories() which did not exist,
+    raising AttributeError on first invocation when no memories arg was passed.
+    """
+
+    def test_detect_patterns_no_args_does_not_raise(self, tmp_path):
+        from mnemosyne.core.memory import Mnemosyne
+        mem = Mnemosyne(session_id="c26", db_path=tmp_path / "c26.db")
+        mem.remember("Morning standup notes", source="meeting", importance=0.6)
+        mem.remember("User likes Python over Java", source="user", importance=0.7)
+        result = mem.detect_patterns()
+        assert isinstance(result, list)
+
+    def test_summarize_patterns_no_args_does_not_raise(self, tmp_path):
+        from mnemosyne.core.memory import Mnemosyne
+        mem = Mnemosyne(session_id="c26", db_path=tmp_path / "c26.db")
+        mem.remember("Morning standup notes", source="meeting", importance=0.6)
+        mem.remember("Afternoon review", source="meeting", importance=0.6)
+        summary = mem.summarize_patterns()
+        assert isinstance(summary, dict)
+        assert "total_memories" in summary
+        assert summary["total_memories"] >= 2
+
+    def test_get_all_memories_returns_working_and_episodic(self, tmp_path):
+        """get_all_memories must combine working_memory and episodic_memory rows.
+
+        Drives the episodic insert through the public consolidate_to_episodic
+        API instead of raw SQL, so the test does not break the next time the
+        episodic_memory schema gains a NOT NULL column.
+        """
+        from mnemosyne.core.memory import Mnemosyne
+        mem = Mnemosyne(session_id="c26", db_path=tmp_path / "c26.db")
+        wm_id_one = mem.remember("Working item one", source="user", importance=0.5)
+        mem.remember("Working item two", source="agent", importance=0.5)
+        mem.beam.consolidate_to_episodic(
+            summary="Episodic summary one",
+            source_wm_ids=[wm_id_one],
+            source="consolidation",
+            importance=0.6,
+        )
+
+        rows = mem.get_all_memories()
+        assert isinstance(rows, list)
+        contents = [r["content"] for r in rows]
+        assert "Working item one" in contents
+        assert "Working item two" in contents
+        assert "Episodic summary one" in contents
+        # PatternDetector relies on these fields:
+        for r in rows:
+            assert "content" in r
+            assert "timestamp" in r
+            assert "source" in r
+
+    def test_get_all_memories_excludes_invalidated(self, tmp_path):
+        """Invalidated memories must not surface in pattern analysis."""
+        from mnemosyne.core.memory import Mnemosyne
+        mem = Mnemosyne(session_id="c26", db_path=tmp_path / "c26.db")
+        mem.remember("Keep me visible", source="user", importance=0.5)
+        drop_id = mem.remember("Forget about this rule", source="user", importance=0.5)
+        mem.invalidate(drop_id)
+
+        contents = [r["content"] for r in mem.get_all_memories()]
+        assert "Keep me visible" in contents
+        assert "Forget about this rule" not in contents

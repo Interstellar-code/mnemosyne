@@ -34,14 +34,13 @@ setup(
         "Topic :: Scientific/Engineering :: Artificial Intelligence",
         "License :: OSI Approved :: MIT License",
         "Programming Language :: Python :: 3",
-        "Programming Language :: Python :: 3.8",
         "Programming Language :: Python :: 3.9",
         "Programming Language :: Python :: 3.10",
         "Programming Language :: Python :: 3.11",
         "Programming Language :: Python :: 3.12",
         "Operating System :: OS Independent",
     ],
-    python_requires=">=3.8",
+    python_requires=">=3.9",
     keywords=[
         "ai",
         "memory",
@@ -57,13 +56,14 @@ setup(
     project_urls={
         "Bug Reports": "https://github.com/AxDSan/mnemosyne/issues",
         "Source": "https://github.com/AxDSan/mnemosyne",
-        "Documentation": "https://github.com/AxDSan/mnemosyne/blob/main/README.md",
+        "Documentation": "https://github.com/AxDSan/mnemosyne/blob/main/docs/README.md",
     },
     extras_require={
-        "llm": ["ctransformers>=0.2.27", "huggingface-hub>=0.20"],
+        "llm": ["ctransformers>=0.2.27", "llama-cpp-python>=0.2.0", "huggingface-hub>=0.20"],
         "embeddings": ["fastembed>=0.3.0"],
         "mcp": ["mcp>=1.0.0; python_version >= '3.10'", "anyio>=4.0; python_version >= '3.10'"],
-        "all": ["ctransformers>=0.2.27", "huggingface-hub>=0.20", "fastembed>=0.3.0", "mcp>=1.0.0; python_version >= '3.10'", "anyio>=4.0; python_version >= '3.10'"],
+        "all": ["ctransformers>=0.2.27", "llama-cpp-python>=0.2.0", "huggingface-hub>=0.20", "fastembed>=0.3.0", "mcp>=1.0.0; python_version >= '3.10'", "anyio>=4.0; python_version >= '3.10'"],
+        "dev": ["pytest>=7.0", "build", "twine"],
     },
     entry_points={
         "console_scripts": [

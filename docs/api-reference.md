@@ -575,7 +575,7 @@ When `MNEMOSYNE_HOST_LLM_ENABLED=false` or unset:
 
 **Module:** `mnemosyne.core.importers`
 
-Mnemosyne can import memories from 7 external providers. All importers preserve metadata, timestamps, and identity.
+Mnemosyne can import memories from supported external providers. All importers preserve metadata, timestamps, and identity.
 
 ### Supported Providers
 

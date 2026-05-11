@@ -132,7 +132,7 @@ def run_mcp_server(transport: str = "stdio", port: int = 8080, bank: Optional[st
         raise ValueError(f"Unknown transport: {transport}. Use 'stdio' or 'sse'.")
 
 
-def main() -> None:
+def main(argv: Optional[list[str]] = None) -> None:
     """CLI entry point for `mnemosyne mcp`."""
     import argparse
 
@@ -155,7 +155,7 @@ def main() -> None:
         default=None,
         help="Default memory bank"
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     run_mcp_server(transport=args.transport, port=args.port, bank=args.bank)
 

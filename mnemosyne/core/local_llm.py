@@ -466,34 +466,53 @@ def summarize_memories(memories: List[str], source: str = "") -> Optional[str]:
     if not memories:
         return None
 
-    prompt = _build_prompt(memories, source=source)
+    # Chunk large memory lists to stay within context window limits.
+    # chunk_memories_by_budget() respects LLM_N_CTX and safety margins.
+    chunks = chunk_memories_by_budget(memories, source=source)
 
-    # 0. Host backend.
-    host_prompt = _build_host_prompt(memories, source=source)
-    attempted, text = _try_host_llm(host_prompt, max_tokens=LLM_MAX_TOKENS, temperature=0.3)
-    if attempted:
-        if text:
-            return text
-        # Host attempted but produced nothing. Skip remote per A3; try local.
+    def _summarize_chunk(chunk_memories: List[str], chunk_source: str = "") -> Optional[str]:
+        """Summarize a single chunk of memories via the fallback chain."""
+        host_prompt = _build_host_prompt(chunk_memories, source=chunk_source)
+        prompt = _build_prompt(chunk_memories, source=chunk_source)
+
+        # 0. Host backend.
+        attempted, text = _try_host_llm(host_prompt, max_tokens=LLM_MAX_TOKENS, temperature=0.3)
+        if attempted:
+            if text:
+                return text
+            raw = _call_local_llm(prompt)
+            if raw:
+                cleaned = _clean_output(raw)
+                return cleaned if cleaned else None
+            return None
+
+        # 1. Remote API (skip if MNEMOSYNE_FORCE_LOCAL=1 or remote call fails).
+        if LLM_ENABLED and LLM_BASE_URL and not os.environ.get("MNEMOSYNE_FORCE_LOCAL", "").lower() in ("1", "true", "yes"):
+            raw = _call_remote_llm(prompt)
+            if raw:
+                cleaned = _clean_output(raw)
+                return cleaned if cleaned else None
+
+        # 2. Local LLM (llama-cpp-python or ctransformers fallback).
         raw = _call_local_llm(prompt)
         if raw:
             cleaned = _clean_output(raw)
             return cleaned if cleaned else None
         return None
 
-    # 1. Remote API (skip if MNEMOSYNE_FORCE_LOCAL=1 or remote call fails).
-    # When remote fails, fall through to local LLM instead of returning None.
-    if LLM_ENABLED and LLM_BASE_URL and not os.environ.get("MNEMOSYNE_FORCE_LOCAL", "").lower() in ("1", "true", "yes"):
-        raw = _call_remote_llm(prompt)
-        if raw:
-            cleaned = _clean_output(raw)
-            return cleaned if cleaned else None
-        # Remote failed — fall through to local LLM
+    # Summarize each chunk individually.
+    chunk_summaries = []
+    for chunk in chunks:
+        summary = _summarize_chunk(chunk, source=source)
+        if summary:
+            chunk_summaries.append(summary)
 
-    # 2. Local LLM (llama-cpp-python or ctransformers fallback).
-    raw = _call_local_llm(prompt)
-    if raw:
-        cleaned = _clean_output(raw)
-        return cleaned if cleaned else None
+    if not chunk_summaries:
+        return None
 
-    return None
+    # If multiple chunks, do a second-pass summary to consolidate chunk summaries.
+    if len(chunk_summaries) > 1:
+        final = _summarize_chunk(chunk_summaries, source=f"{source} [chunked {len(chunks)} parts]")
+        return final if final else chunk_summaries[0]
+
+    return chunk_summaries[0]

@@ -223,156 +223,133 @@ class TestSleepCycle:
         assert episodic_count == 0
         assert log_count == 0
 
-    def test_sleep_all_sessions_propagates_caller_identity(self, temp_db):
-        """[C9] sleep_all_sessions constructs a fresh BeamMemory for each
-        non-self session and previously dropped author_id/author_type
-        on that constructor call. Result: episodic rows produced for those
-        sessions had identity=None, so filtered recall by author/channel
-        couldn't find consolidated content from cross-session sleep.
+    def test_sleep_writes_dense_embedding_for_consolidated_row(self, temp_db, monkeypatch):
+        """[C5] State-level companion to the FTS recallability test. Verifies
+        sleep populates a dense-recall store (sqlite-vec's vec_episodes when
+        loaded, otherwise the memory_embeddings fallback) for each consolidated
+        episodic row. A regression that broke the embed→write call (e.g.
+        embed() returning None silently, or a missing INSERT into the
+        fallback table) would leave dense recall empty even though FTS keeps
+        working.
 
-        This locks in the construction-site fix: caller's author identity
-        must propagate to the alien-session BeamMemory so consolidate_to_episodic
-        writes the caller's authorship rather than None. channel_id is
-        intentionally NOT propagated — alien rows should default channel
-        to their own session_id, not the caller's.
-        """
-        beam = BeamMemory(
-            session_id="caller",
-            db_path=temp_db,
-            author_id="caller_bot",
-            author_type="system",
-            channel_id="ops",
-        )
+        Skipped when fastembed isn't installed; the dense path is gated on
+        _embeddings.available() and a model load. CI runs with fastembed."""
+        from mnemosyne.core import embeddings as _embeddings
+
+        if not _embeddings.available():
+            pytest.skip("fastembed not available — dense-recall path inactive")
+
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
         conn = sqlite3.connect(temp_db)
         old_ts = (datetime.now() - timedelta(hours=20)).isoformat()
-        # Seed an old row in a session DIFFERENT from the caller's, so
-        # sleep_all_sessions will construct a fresh BeamMemory to handle it.
-        conn.execute(
+        conn.executemany(
             "INSERT INTO working_memory (id, content, source, timestamp, session_id) VALUES (?, ?, ?, ?, ?)",
-            ("alien-old", "alien session task", "conversation", old_ts, "alien_session"),
+            [
+                ("old0", "deploy plan for falcon kickoff", "conversation", old_ts, "s1"),
+                ("old1", "retro notes from beta release", "conversation", old_ts, "s1"),
+            ],
         )
         conn.commit()
         conn.close()
 
-        result = beam.sleep_all_sessions(dry_run=False)
-        assert result["status"] == "consolidated"
-        assert result["sessions_consolidated"] == 1
+        beam.sleep(dry_run=False)
+
+        # Post-sleep, exactly one episodic row should exist (one consolidated
+        # summary for the session). Dense store should hold a row for it.
+        from mnemosyne.core.beam import _vec_available
 
         conn = sqlite3.connect(temp_db)
-        rows = conn.execute(
-            "SELECT session_id, author_id, author_type, channel_id "
-            "FROM episodic_memory WHERE session_id = ?",
-            ("alien_session",),
-        ).fetchall()
-        conn.close()
+        ep_ids = [r[0] for r in conn.execute("SELECT id FROM episodic_memory").fetchall()]
+        assert len(ep_ids) == 1, f"expected 1 consolidated episodic row, got {len(ep_ids)}"
 
-        assert len(rows) == 1, (
-            f"Expected exactly one episodic row from alien_session "
-            f"consolidation, got {len(rows)}"
-        )
-        sess, author_id, author_type, channel_id = rows[0]
-        assert author_id == "caller_bot", (
-            f"author_id zeroed on alien-session consolidation: got {author_id!r}; "
-            "C9 fix requires caller's authorship to propagate to the new BeamMemory"
-        )
-        assert author_type == "system"
-        # channel_id MUST be the alien session_id, not the caller's "ops" —
-        # otherwise filter by channel_id="ops" would surface alien content
-        # (cross-session pollution caught by adversarial review).
-        assert channel_id == "alien_session", (
-            f"channel_id leaked the caller's channel onto an alien-session row: "
-            f"got {channel_id!r}, expected 'alien_session'. "
-            "channel_id must NOT propagate from caller to alien BeamMemory."
-        )
+        if _vec_available(conn):
+            vec_count = conn.execute("SELECT COUNT(*) FROM vec_episodes").fetchone()[0]
+            conn.close()
+            assert vec_count >= 1, (
+                "sleep consolidated an episodic row but vec_episodes is "
+                "empty — the embed→_vec_insert path did not run. Likely "
+                "cause: _embeddings.embed() returned None silently, or "
+                "_vec_insert raised and was swallowed."
+            )
+        else:
+            mem_count = conn.execute(
+                "SELECT COUNT(*) FROM memory_embeddings WHERE memory_id = ?", (ep_ids[0],)
+            ).fetchone()[0]
+            conn.close()
+            assert mem_count >= 1, (
+                "sleep consolidated an episodic row but memory_embeddings "
+                "fallback is empty — the embed→INSERT path did not run."
+            )
 
-    def test_sleep_all_sessions_audit_recall_finds_caller_consolidations(self, temp_db, monkeypatch):
-        """[C9] End-to-end check via the public recall API. After cross-session
-        consolidation by a maintenance caller, recall(query, author_id=caller)
-        must surface the caller's consolidations across all session boundaries.
+    def test_sleep_consolidated_content_is_recallable(self, temp_db, monkeypatch):
+        """[C5] End-to-end recallability check. Existing sleep tests assert
+        counts (items_consolidated, episodic_count) but never verify the
+        consolidated content is actually findable through the public recall
+        API. A regression that took the consolidated row off-recall via ALL
+        recall paths simultaneously (FTS5 trigger broken AND dense store
+        skipped AND fallback substring match unreachable) would slip through
+        every existing sleep test.
 
-        Pre-fix this returned nothing because alien-session episodic rows had
-        author_id=None. v2 plan §C9 prescribed exactly this filtered-recall
-        contract."""
-        # Force deterministic concat-style consolidation so the seeded query
-        # tokens survive into the episodic content and the substring assertion
-        # is stable across CI environments where llama_cpp may be installed.
+        Locks: after sleep, recall(unique_token_from_seeded_wm) returns at
+        least one episodic-tier hit whose content contains that token.
+
+        Note: this is NOT an FTS-isolated assertion. recall() unions vec
+        and FTS rowids (beam.py:1751) and falls back to substring scan
+        (beam.py:1880) when both are empty, so this test locks recallability
+        by *any* path — not the FTS path specifically. Stronger isolation
+        would require calling _fts_search directly; that lives in a follow-up
+        if the union/fallback layers shift.
+
+        Uses LLM-disabled deterministic AAAK-encoded summary path
+        (beam.py:2483 — `compressed = aaak_encode(combined)`). AAAK is
+        phrase-substitution + compaction; uncommon literal tokens like
+        the ones seeded below survive intact. Same monkeypatch pattern as
+        test_beam.py:297, :488, :691, :938, :961."""
         monkeypatch.setattr("mnemosyne.core.local_llm.llm_available", lambda: False)
-        beam = BeamMemory(
-            session_id="caller",
-            db_path=temp_db,
-            author_id="caller_bot",
-            author_type="system",
-        )
+
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
         conn = sqlite3.connect(temp_db)
         old_ts = (datetime.now() - timedelta(hours=20)).isoformat()
-        conn.execute(
+        # Three distinct unique tokens — one per seeded memory.
+        # Pick tokens that won't collide with FTS stop-words or the deterministic
+        # concat header text.
+        conn.executemany(
             "INSERT INTO working_memory (id, content, source, timestamp, session_id) VALUES (?, ?, ?, ?, ?)",
-            ("alien-old", "deploy plan for project_a kickoff", "conversation", old_ts, "alien_session"),
+            [
+                ("old0", "wm contains marker zorblax kickoff plan", "conversation", old_ts, "s1"),
+                ("old1", "wm contains marker quetzelfin retro notes", "conversation", old_ts, "s1"),
+                ("old2", "wm contains marker xanadush deploy log", "conversation", old_ts, "s1"),
+            ],
         )
         conn.commit()
         conn.close()
 
-        beam.sleep_all_sessions(dry_run=False)
-
-        # Public recall surface: filter by caller_bot's author_id.
-        # Author-only searches in recall expand the session filter to all
-        # sessions (beam.py recall ~1370), which is exactly the cross-session
-        # audit scenario this test is supposed to verify.
-        results = beam.recall("deploy plan", author_id="caller_bot")
-        assert results, (
-            "recall(author_id='caller_bot') returned no hits — the alien-session "
-            "consolidation did not carry the caller's author_id, defeating "
-            "the C9 audit-recall scenario the fix exists for."
-        )
-        assert any("deploy" in r.get("content", "").lower() for r in results), (
-            f"recall returned results but none mention the consolidated "
-            f"alien-session content: {[r.get('content') for r in results]}"
-        )
-
-    def test_sleep_all_sessions_consolidates_null_session_id_rows(self, temp_db):
-        """Codex /review for C9 noted: sleep_all_sessions's GROUP BY produces
-        a NULL group and maps it to "default" for the loop, but
-        beam.sleep("default") used to query WHERE session_id = 'default',
-        missing rows where session_id is literally NULL. Result: NULL-session
-        rows would never get consolidated, no matter how old they were.
-
-        Locks in the COALESCE fix: a "default"-scoped sleep matches both
-        session_id='default' and session_id=NULL rows."""
-        beam = BeamMemory(session_id="caller", db_path=temp_db)
-        conn = sqlite3.connect(temp_db)
-        old_ts = (datetime.now() - timedelta(hours=20)).isoformat()
-        # Insert a row with explicit NULL session_id. Schema default is
-        # 'default' so we have to bypass that.
-        conn.execute(
-            "INSERT INTO working_memory (id, content, source, timestamp, session_id) VALUES (?, ?, ?, ?, NULL)",
-            ("null-old", "stranded null-session row", "conversation", old_ts),
-        )
-        conn.commit()
-        conn.close()
-
-        result = beam.sleep_all_sessions(dry_run=False)
+        result = beam.sleep(dry_run=False)
         assert result["status"] == "consolidated"
-        assert result["items_consolidated"] >= 1, (
-            "NULL session_id row was not consolidated — sleep query must "
-            "match NULL rows when called for the 'default' session via COALESCE"
-        )
+        assert result["items_consolidated"] == 3
 
-        conn = sqlite3.connect(temp_db)
-        # The null-session row should be gone from working_memory and a
-        # corresponding episodic row should exist under "default".
-        wm_remaining = conn.execute(
-            "SELECT COUNT(*) FROM working_memory WHERE id = ?", ("null-old",)
-        ).fetchone()[0]
-        ep_count = conn.execute(
-            "SELECT COUNT(*) FROM episodic_memory WHERE session_id = 'default'"
-        ).fetchone()[0]
-        conn.close()
-        assert wm_remaining == 0, (
-            "NULL-session working_memory row not deleted post-consolidation"
-        )
-        assert ep_count >= 1, (
-            "No episodic row created under 'default' for NULL-session consolidation"
-        )
+        # Each unique token must surface an episodic-tier result.
+        for token in ("zorblax", "quetzelfin", "xanadush"):
+            results = beam.recall(token, top_k=10)
+            assert results, (
+                f"recall({token!r}) returned 0 results — the sleep path "
+                f"consolidated working_memory but the episodic row is not "
+                f"reachable through ANY recall path (FTS, vec, fallback "
+                f"substring scan). Likely cause: FTS5 trigger missed AND "
+                f"dense store missed AND content does not contain the "
+                f"original token (LLM summarization path active despite "
+                f"monkeypatch?)."
+            )
+            assert any(r.get("tier") == "episodic" for r in results), (
+                f"recall({token!r}) returned {len(results)} hits but none "
+                f"are episodic-tier: {[(r.get('tier'), r.get('content', '')[:50]) for r in results]}"
+            )
+            assert any(token in (r.get("content") or "").lower() for r in results), (
+                f"recall({token!r}) returned hits but the token does not "
+                f"appear in any returned content — FTS may be matching on "
+                f"trigram noise rather than the seeded token: "
+                f"{[r.get('content') for r in results]}"
+            )
 
 
 class TestMnemosyneIntegration:

@@ -4,16 +4,59 @@ Time-aware knowledge graph on top of SQLite.
 Tracks when facts were true, enabling contradiction detection and historical queries.
 """
 
+import os
 import sqlite3
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Optional
 
-DEFAULT_DB = Path.home() / ".hermes" / "mnemosyne" / "data" / "triples.db"
+LEGACY_DATA_DIR = Path.home() / ".hermes" / "mnemosyne" / "data"
+DEFAULT_DATA_DIR = Path(os.environ.get("MNEMOSYNE_DATA_DIR", LEGACY_DATA_DIR))
+DEFAULT_DB = DEFAULT_DATA_DIR / "triples.db"
+LEGACY_DB = LEGACY_DATA_DIR / "triples.db"
+
+
+def _copy_legacy_db(source: Path, destination: Path) -> None:
+    """Copy a SQLite DB using SQLite's backup API for a consistent snapshot."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        prefix=f".{destination.name}.",
+        suffix=".tmp",
+        dir=destination.parent,
+        delete=False,
+    ) as temp_file:
+        temp_path = Path(temp_file.name)
+
+    try:
+        source_conn = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
+        try:
+            dest_conn = sqlite3.connect(str(temp_path))
+            try:
+                source_conn.backup(dest_conn)
+            finally:
+                dest_conn.close()
+        finally:
+            source_conn.close()
+
+        if not destination.exists():
+            temp_path.replace(destination)
+        else:
+            temp_path.unlink(missing_ok=True)
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
+
+
+def _resolve_default_db() -> Path:
+    """Return the default triples DB, copying legacy data into place if needed."""
+    if DEFAULT_DATA_DIR != LEGACY_DATA_DIR and not DEFAULT_DB.exists() and LEGACY_DB.exists():
+        _copy_legacy_db(LEGACY_DB, DEFAULT_DB)
+    return DEFAULT_DB
 
 
 def _get_conn(db_path = None) -> sqlite3.Connection:
-    path = Path(db_path) if db_path else DEFAULT_DB
+    path = Path(db_path) if db_path else _resolve_default_db()
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path), check_same_thread=False)
     conn.row_factory = sqlite3.Row
@@ -57,7 +100,7 @@ class TripleStore:
     """
     
     def __init__(self, db_path: Path = None):
-        self.db_path = db_path or DEFAULT_DB
+        self.db_path = Path(db_path) if db_path else _resolve_default_db()
         init_triples(self.db_path)
         self.conn = _get_conn(self.db_path)
     
