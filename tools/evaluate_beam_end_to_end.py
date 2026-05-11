@@ -36,7 +36,7 @@ import sys
 import tempfile
 import time
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from functools import partial
 from pathlib import Path
 
@@ -514,40 +514,45 @@ def ingest_conversation(beam: BeamMemory, messages: list[dict]) -> dict:
             except Exception:
                 pass  # Best-effort; don't fail ingestion
 
-        # Episodic consolidation per batch
+        # [E1] Additive consolidation per batch via beam.sleep().
+        #
+        # Pre-E1 this block built a synthetic summary
+        # ("Batch N: first_3_msg_contents[:100]") + DELETEd all source
+        # working_memory rows. ~99% of message content was discarded
+        # before recall could see it — the entire BEAM benchmark
+        # corpus was destroyed at ingest.
+        #
+        # Post-E1 (option b, depends on E3 additive sleep): backdate
+        # the batch's just-inserted rows past sleep's TTL/2 cutoff
+        # and let beam.sleep() produce real LLM-generated (or AAAK-
+        # fallback) summaries on top of preserved originals. The
+        # benchmark now exercises the real ingest pipeline.
         try:
             cursor = beam.conn.cursor()
-            # Get ALL working memory items for this session (oldest first)
-            cursor.execute("""
-                SELECT id, content FROM working_memory
-                WHERE session_id = ?
-                ORDER BY timestamp ASC
-                LIMIT 1000
-            """, (beam.session_id,))
-            wm_rows = cursor.fetchall()
+            # Backdate the batch's working_memory rows so sleep's
+            # cutoff (WORKING_MEMORY_TTL_HOURS // 2 — typically 12h)
+            # picks them up. Real users don't need this — the
+            # cutoff is what gates "old enough to consolidate."
+            # The benchmark is processing a corpus all at once, so
+            # we explicitly tell sleep "treat this batch as old."
+            backdate_iso = (
+                datetime.now() - timedelta(hours=24)
+            ).isoformat()
+            cursor.execute(
+                "UPDATE working_memory SET timestamp = ? "
+                "WHERE session_id = ? AND consolidated_at IS NULL",
+                (backdate_iso, beam.session_id),
+            )
+            beam.conn.commit()
 
-            if wm_rows:
-                wm_ids = [row["id"] for row in wm_rows]
-                recent_texts = [row["content"][:100] for row in wm_rows[:5]]
-                summary = f"Batch {batch_start // BATCH_SIZE}: " + " | ".join(recent_texts[:3])
-                if len(summary) > 500:
-                    summary = summary[:497] + "..."
-
-                beam.consolidate_to_episodic(
-                    summary=summary,
-                    source_wm_ids=wm_ids,
-                    source="beam_consolidation",
-                    importance=0.4,
-                    scope="global",
-                )
-                stats["ep_count"] += 1
-                
-                # Delete consolidated items from working memory to prevent bloat
-                placeholders = ",".join("?" * len(wm_ids))
-                cursor.execute(f"DELETE FROM working_memory WHERE id IN ({placeholders})", wm_ids)
-                stats["wm_count"] -= len(wm_ids)
-                
-                beam.conn.commit()
+            result = beam.sleep(dry_run=False)
+            if result.get("status") == "consolidated":
+                stats["ep_count"] += int(result.get("summaries_created", 0) or 0)
+            # E3 contract: originals stay, so stats["wm_count"] does
+            # NOT decrement. Pre-E1 we did stats["wm_count"] -= ...
+            # which produced wm_count=0 always; post-E1 it grows
+            # monotonically with input message count, which is what
+            # the experiment actually wants to measure.
         except Exception:
             pass
 

@@ -9,6 +9,12 @@ and this project adheres to [Simple Versioning](https://github.com/AxDSan/mnemos
 
 ### Changed
 
+**E1 — BEAM benchmark adapter uses the real ingest pipeline (additive)**
+- `tools/evaluate_beam_end_to_end.py::ingest_conversation` no longer runs a destructive `Batch N: first_3_msg[:100chars]` template summary + DELETE per batch. Per-batch the adapter now backdates the just-inserted `working_memory` rows past sleep's TTL/2 cutoff, then calls `beam.sleep()` — which (post-E3) produces real LLM-generated (or AAAK-fallback) summaries on top of preserved originals.
+- Net effect: ~99% of message content was previously discarded at ingest time, leaving every experiment arm running on a corpus of ~500 episodic rows of mostly-empty template strings instead of the actual benchmark messages. Post-E1 the corpus is preserved in `working_memory` AND consolidated summaries land in `episodic_memory` — recall reaches actual content. Unblocks every BEAM-recovery experiment arm.
+- Behavior change for benchmark stats output: `stats["wm_count"]` now grows monotonically with input message count (pre-E1 it was always 0 after each batch because the destructive consolidation deleted everything). This is the contract the experiment actually wants to measure.
+- **Stacks on E3** (PR #73): depends on additive sleep being merged first; without E3, `beam.sleep()` would still DELETE source rows and the fix would be moot.
+
 **E3 — Additive sleep (kill summarize-and-delete)**
 - `BeamMemory.sleep()` no longer DELETEs source `working_memory` rows after writing the consolidated summary to `episodic_memory`. Originals are marked with a new `consolidated_at` timestamp and remain queryable through recall.
 - Maintainer decision (2026-05-10): "Originals stay. Summaries become enrichment on top. Storage cost is fine — it's the lowest-cost tradeoff." Unblocks experiment Arm B (ADD-only ingest) of the BEAM-recovery experiment.
