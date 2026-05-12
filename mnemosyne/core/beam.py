@@ -2719,6 +2719,11 @@ class BeamMemory:
                 r["score"] *= veracity_map.get(wm_veracity, UNKNOWN_WEIGHT)
 
         results.sort(key=lambda x: x["score"], reverse=True)
+        # E3.a.3: collapse (episodic_summary, working_memory_source)
+        # duplicates before top-K truncation and recall_count attribution.
+        # Post-E3 additive sleep leaves originals alongside summaries, so
+        # a query matching both compounds recall_count twice per fact.
+        results = self._dedup_cross_tier_summary_links(results)
         final_results = results[:top_k]
 
         # --- Recall tracking: increment counts + set last_recalled ---
@@ -2786,6 +2791,88 @@ class BeamMemory:
         _recall_diag.record_call(truly_empty=_truly_empty)
 
         return final_results
+
+    def _dedup_cross_tier_summary_links(self, results: List[Dict]) -> List[Dict]:
+        """E3.a.3: drop the lower-scored side of any (episodic_summary,
+        working_memory_source) pair where both surface in the same recall.
+
+        Pre-E3, `sleep()` DELETEd source `working_memory` rows when creating
+        a summary, so dual-surface duplication couldn't happen. Post-E3
+        (additive sleep), sources survive alongside summaries by design.
+        A recall whose query matches both raw and summary text ranks them
+        side-by-side AND compounds `recall_count` twice for the same
+        logical fact — the row's history boost double-counts on every call.
+
+        Dedup rule: for each (ep, wm) pair where `ep.summary_of` contains
+        `wm.id` AND both rows appear in `results`, drop the lower-scored
+        one. Ties keep the episodic side (later-stage representation;
+        matches polyphonic engine's diversity-rerank posture). The
+        comparison runs on the post-multiplier `score` field, so the
+        dedup decision reflects the rank the user would have seen.
+
+        Preserves input order on retained rows. Returns the input list
+        unchanged if no episodic rows are present or no summary_of
+        linkage exists.
+
+        Called from both the linear path (before top-K truncation /
+        recall_count attribution) and the polyphonic path (after RRF
+        composition / multiplier application, before truncation).
+        Applying it identically on both arms keeps experiment
+        comparisons apples-to-apples — the polyphonic engine's diversity
+        rerank no longer carries the implicit summary↔source dedup
+        responsibility.
+        """
+        ep_ids = [r["id"] for r in results if r.get("tier") == "episodic"]
+        if not ep_ids:
+            return results
+
+        placeholders = ",".join("?" * len(ep_ids))
+        cursor = self.conn.cursor()
+        cursor.execute(
+            f"SELECT id, summary_of FROM episodic_memory WHERE id IN ({placeholders})",
+            tuple(ep_ids),
+        )
+        summary_map: Dict[str, set] = {}
+        for row in cursor.fetchall():
+            raw = row["summary_of"] or ""
+            wm_ids = {s.strip() for s in raw.split(",") if s.strip()}
+            if wm_ids:
+                summary_map[row["id"]] = wm_ids
+
+        if not summary_map:
+            return results
+
+        # Per-tier score lookups disambiguate cross-tier id collisions
+        # (theoretically possible since `id TEXT PRIMARY KEY` is per-table).
+        wm_scores = {r["id"]: r.get("score", 0.0) for r in results
+                     if r.get("tier") == "working"}
+        ep_scores = {r["id"]: r.get("score", 0.0) for r in results
+                     if r.get("tier") == "episodic"}
+        drop_wm_ids = set()
+        drop_ep_ids = set()
+
+        for ep_id, covered_wm_ids in summary_map.items():
+            if ep_id not in ep_scores:
+                continue
+            ep_score = ep_scores[ep_id]
+            for wm_id in covered_wm_ids:
+                if wm_id not in wm_scores:
+                    continue
+                if wm_scores[wm_id] > ep_score:
+                    drop_ep_ids.add(ep_id)
+                else:
+                    drop_wm_ids.add(wm_id)
+
+        if not (drop_wm_ids or drop_ep_ids):
+            return results
+
+        return [
+            r for r in results
+            if not (
+                (r.get("tier") == "working" and r["id"] in drop_wm_ids)
+                or (r.get("tier") == "episodic" and r["id"] in drop_ep_ids)
+            )
+        ]
 
     # ── Phase NAI-0: Context Formatting ────────────────────────────
 
@@ -2927,8 +3014,6 @@ class BeamMemory:
         tier_weight_map = {1: TIER1_WEIGHT, 2: TIER2_WEIGHT, 3: TIER3_WEIGHT}
 
         final = []
-        recalled_episodic_ids = []
-        recalled_working_ids = []
         cursor = self.conn.cursor()
         now_iso = datetime.now().isoformat()
 
@@ -2960,19 +3045,29 @@ class BeamMemory:
             if row_dict.get("tier") == "episodic":
                 ep_tier = row_dict.get("degradation_tier") or 1
                 score *= tier_weight_map.get(ep_tier, 1.0)
-                recalled_episodic_ids.append(memory_id)
-            else:
-                recalled_working_ids.append(memory_id)
 
             row_dict["score"] = score
             row_dict["voice_scores"] = dict(r.voice_scores)
             final.append(row_dict)
-            if len(final) >= top_k:
-                break
+            # No early-break: dedup needs to see all candidates before
+            # truncation, otherwise a wm row dropped from top-K by an
+            # earlier-arriving ep summary can't be re-promoted when the
+            # ep summary itself gets deduped away. The engine already
+            # caps results at top_k * 2 (line ~2917), bounding the loop.
 
         # Re-sort post-multiplier composition so the final order reflects
         # both RRF and the veracity/tier weights.
         final.sort(key=lambda x: x["score"], reverse=True)
+        # E3.a.3: apply identical cross-tier dedup as the linear path —
+        # keeps experiment Arm A vs Arm B comparison apples-to-apples
+        # rather than relying on the diversity rerank to handle
+        # summary↔source duplicates implicitly.
+        final = self._dedup_cross_tier_summary_links(final)
+        final = final[:top_k]
+        # Rebuild recall_count attribution lists from the deduped final
+        # so dropped duplicates aren't credited with a recall.
+        recalled_episodic_ids = [r["id"] for r in final if r.get("tier") == "episodic"]
+        recalled_working_ids = [r["id"] for r in final if r.get("tier") == "working"]
 
         # Update recall_count / last_recalled for engine results too —
         # the linear path updates them and downstream features (decay
