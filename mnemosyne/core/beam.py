@@ -64,9 +64,21 @@ try:
         clamp_veracity,
         aggregate_veracity,
     )
+    # Alias used below to construct STATED_WEIGHT et al. — same dict as
+    # the canonical VERACITY_WEIGHTS so changes propagate.
+    _VW_DEFAULTS = VERACITY_WEIGHTS
 except ImportError:
     VeracityConsolidator = None
     VERACITY_WEIGHTS = {}
+    # Hardcoded backstop so degraded-import mode doesn't crash module
+    # load when constructing STATED_WEIGHT et al. (C1 review fix).
+    _VW_DEFAULTS = {
+        "stated": 1.0,
+        "inferred": 0.7,
+        "tool": 0.5,
+        "imported": 0.6,
+        "unknown": 0.8,
+    }
 
     # Surface degraded mode at import time so operators see ONE signal
     # in startup logs that the canonical helper isn't available. Without
@@ -168,14 +180,14 @@ DEGRADE_BATCH_SIZE = int(os.environ.get("MNEMOSYNE_DEGRADE_BATCH", "100"))
 SMART_COMPRESS = os.environ.get("MNEMOSYNE_SMART_COMPRESS", "1") not in ("0", "false", "no")
 TIER3_MAX_CHARS = int(os.environ.get("MNEMOSYNE_TIER3_MAX_CHARS", "300"))
 
-# Veracity weighting (memory confidence). C29: defaults come from the
-# canonical VERACITY_WEIGHTS dict in veracity_consolidation.py so the
-# consolidator's Bayesian compounding and recall's veracity multiplier
-# share a single source of truth. Env-var overrides remain so operators
-# can tune ranking, but the drift risk is documented: if an operator
-# sets a *_WEIGHT env var, recall scoring diverges from consolidation
-# confidence math (consolidator doesn't honor env overrides).
-from mnemosyne.core.veracity_consolidation import VERACITY_WEIGHTS as _VW_DEFAULTS
+# Veracity weighting (memory confidence). C29: defaults come from
+# `_VW_DEFAULTS` which mirrors `veracity_consolidation.VERACITY_WEIGHTS`
+# in normal mode and falls back to a hardcoded literal in degraded-import
+# mode (the import block above sets it). Single source of truth for the
+# consolidator's Bayesian compounding and recall's veracity multiplier.
+# Env-var overrides remain so operators can tune ranking; documented
+# drift risk: if `MNEMOSYNE_*_WEIGHT` is set, recall scoring diverges
+# from consolidation confidence math (consolidator doesn't honor env).
 STATED_WEIGHT = float(os.environ.get("MNEMOSYNE_STATED_WEIGHT", str(_VW_DEFAULTS["stated"])))
 INFERRED_WEIGHT = float(os.environ.get("MNEMOSYNE_INFERRED_WEIGHT", str(_VW_DEFAULTS["inferred"])))
 TOOL_WEIGHT = float(os.environ.get("MNEMOSYNE_TOOL_WEIGHT", str(_VW_DEFAULTS["tool"])))
@@ -1368,6 +1380,14 @@ class BeamMemory:
             # a fresh summary. Pre-E3 this scenario didn't exist because
             # consolidated rows were deleted; the additive design has to
             # opt back in.
+            # E4.a.1 review fix (P1): refresh veracity on dedup-update too.
+            # Without this, a row first stored as 'unknown' and later
+            # re-remembered as 'stated' kept the stale 'unknown' label,
+            # which E4.a.1's sleep-time aggregator then propagates into
+            # the episodic summary — defeating the trust-signal refresh.
+            # Conservative policy: only upgrade if the new call passes a
+            # non-'unknown' veracity (preserves per-row trust on
+            # backfills that don't carry a meaningful veracity arg).
             cursor.execute("""
                 UPDATE working_memory
                 SET importance = MAX(importance, ?), timestamp = ?, source = ?,
@@ -1377,12 +1397,14 @@ class BeamMemory:
                     author_type = COALESCE(?, author_type),
                     channel_id = COALESCE(?, channel_id),
                     memory_type = COALESCE(?, memory_type),
+                    veracity = CASE WHEN ? != 'unknown' THEN ? ELSE veracity END,
                     consolidated_at = NULL
                 WHERE id = ? AND session_id = ?
             """, (importance, datetime.now().isoformat(), source,
                   valid_until, scope,
                   self.author_id, self.author_type, self.channel_id,
                   memory_type,
+                  veracity, veracity,
                   existing_id, self.session_id))
             self.conn.commit()
             # Run the same entity/fact extraction the new-row path runs, so
@@ -1575,10 +1597,13 @@ class BeamMemory:
                             (memory_id, emb_json, model)
                         )
             except Exception as exc:
+                # M3 review fix: include exception type name so operators
+                # can distinguish sqlite3.OperationalError from RuntimeError
+                # etc. without parsing the message string.
                 logger.warning(
                     "remember_batch: embedding storage failed for batch of "
-                    "%d items (vector voice will miss these rows): %s",
-                    len(items), exc,
+                    "%d items (vector voice will miss these rows) (%s): %s",
+                    len(items), type(exc).__name__, exc,
                 )
         
         self._trim_working_memory()
@@ -1886,7 +1911,14 @@ class BeamMemory:
         self.conn.commit()
 
         # Phase 3-4: Graph + veracity for consolidated episodic memory
-        self._ingest_graph_and_veracity(memory_id, summary, source, veracity="inferred")
+        # E4.a.1 review fix (H2): thread the aggregated row_veracity into
+        # graph + fact extraction so Bayesian compounding on consolidated
+        # facts uses the source-aggregated signal, not a hardcoded
+        # 'inferred'. Pre-fix this line passed 'inferred' regardless, which
+        # the consolidator's `consolidate_fact` then used as the veracity
+        # weight in its confidence update — undermining the very signal
+        # we just preserved in the episodic INSERT.
+        self._ingest_graph_and_veracity(memory_id, summary, source, veracity=row_veracity)
 
         self._emit_event("MEMORY_CONSOLIDATED", memory_id, content=summary,
                          source=source, importance=importance,

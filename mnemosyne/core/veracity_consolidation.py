@@ -105,17 +105,26 @@ def aggregate_veracity(source_veracities) -> str:
     even when every source row was 'stated' (1.0). That destroys the
     trust signal `remember_batch` had populated per-row.
 
-    Aggregation rule (mode + conservative tie-breaking):
+    Aggregation rule:
         - Empty / no-valid-labels input → 'unknown' (matches schema default)
-        - Single distinct label → that label
-        - Clear majority → the majority label
-        - Multi-way tie → the label with the LOWEST weight (most conservative)
+        - 'unknown' is treated as low-priority: only counted when NO
+          non-'unknown' canonical labels are present in the source set.
+          Rationale: the column default is 'unknown', so legacy rows that
+          never had veracity explicitly set store the literal 'unknown'
+          string. The aggregator can't distinguish "operator marked unknown"
+          from "nobody set it" — letting 'unknown' dilute confident
+          signals systematically deflates summaries from mixed-vintage
+          sessions (review H1, 2026-05-11).
+        - Within the candidates (non-'unknown' if any, else all-'unknown'):
+            * Single distinct label → that label
+            * Clear majority → the majority label
+            * Multi-way tie → the label with the LOWEST weight (most
+              conservative; e.g. {stated, tool} ties resolve to 'tool')
 
-    Rationale: a summary inherits the confidence of its sources collectively.
-    Homogeneous-stated sources should produce a stated summary (don't
-    overclaim by inflating, don't underclaim by deflating). Mixed sources
-    should produce a label that reflects the most-common signal. Tied
-    multi-way sources resolve toward caution rather than overclaiming.
+    Rationale: a summary inherits confidence of its sources collectively.
+    Homogeneous-stated sources should produce stated summaries (don't
+    deflate). Mixed sources reflect the most-common signal. Tied multi-way
+    sources resolve toward caution rather than overclaiming.
 
     Non-canonical labels in input (e.g., raw LLM output bleeding through
     a caller's clamp) are silently dropped from the count — operators
@@ -135,9 +144,13 @@ def aggregate_veracity(source_veracities) -> str:
     valid = [v for v in source_veracities if v in VERACITY_ALLOWED]
     if not valid:
         return "unknown"
-    # Mode (most-frequent label).
+    # H1 review fix: 'unknown' is the schema default — treat as
+    # low-priority so legacy rows don't dilute confident signals.
+    non_unknown = [v for v in valid if v != "unknown"]
+    candidates = non_unknown if non_unknown else valid
+    # Mode (most-frequent label) among candidates.
     counts: Dict[str, int] = {}
-    for v in valid:
+    for v in candidates:
         counts[v] = counts.get(v, 0) + 1
     max_count = max(counts.values())
     most_common = [v for v, c in counts.items() if c == max_count]
