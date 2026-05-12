@@ -344,21 +344,44 @@ class TestSleepCycle:
         assert result["status"] == "consolidated"
         assert result["items_consolidated"] == 3
 
-        # Each unique token must surface an episodic-tier result.
+        # E3.a.3 note: pre-fix this test asserted an episodic-tier hit
+        # would surface for each token. Post-E3 sleep is additive (the
+        # original working_memory row survives alongside the episodic
+        # summary), and post-E3.a.3 recall dedups (summary, source)
+        # pairs to the higher-scored side. For an exact-token match the
+        # source wm row usually wins, leaving the episodic side dropped
+        # from recall results — that's correct dedup behavior, not a
+        # consolidation regression. So we split the lock into two parts:
+        #   (1) the episodic row exists in the DB after sleep (the
+        #       consolidation pipeline wired episodic_memory through
+        #       correctly)
+        #   (2) recall surfaces the consolidated content via SOME tier
+        #       (matches the test's stated "locks recallability by *any*
+        #       path" intent)
+        conn = sqlite3.connect(temp_db)
+        try:
+            ep_rows = conn.execute(
+                "SELECT id, content FROM episodic_memory"
+            ).fetchall()
+        finally:
+            conn.close()
+        assert ep_rows, (
+            "sleep() reported items_consolidated=3 but no episodic_memory "
+            "rows exist — the consolidation pipeline silently dropped them "
+            "before commit."
+        )
+
+        # Each unique token must be reachable via recall by some tier.
         for token in ("zorblax", "quetzelfin", "xanadush"):
             results = beam.recall(token, top_k=10)
             assert results, (
-                f"recall({token!r}) returned 0 results — the sleep path "
-                f"consolidated working_memory but the episodic row is not "
-                f"reachable through ANY recall path (FTS, vec, fallback "
-                f"substring scan). Likely cause: FTS5 trigger missed AND "
-                f"dense store missed AND content does not contain the "
-                f"original token (LLM summarization path active despite "
-                f"monkeypatch?)."
-            )
-            assert any(r.get("tier") == "episodic" for r in results), (
-                f"recall({token!r}) returned {len(results)} hits but none "
-                f"are episodic-tier: {[(r.get('tier'), r.get('content', '')[:50]) for r in results]}"
+                f"recall({token!r}) returned 0 results — neither the "
+                f"surviving working_memory source nor the episodic summary "
+                f"was reachable through ANY recall path (FTS, vec, "
+                f"fallback substring scan). Likely cause: FTS5 trigger "
+                f"missed AND dense store missed AND content does not "
+                f"contain the original token (LLM summarization path "
+                f"active despite monkeypatch?)."
             )
             assert any(token in (r.get("content") or "").lower() for r in results), (
                 f"recall({token!r}) returned hits but the token does not "
