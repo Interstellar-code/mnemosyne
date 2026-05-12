@@ -1659,10 +1659,63 @@ def main():
                         help="Download data and print stats, don't evaluate")
     parser.add_argument("--use-cloud", action="store_true",
                         help="Enable LLM fact extraction (cloud tier). Requires OPENROUTER_API_KEY.")
+    parser.add_argument("--allow-harness-oracles", action="store_true",
+                        help="Opt out of the pure-recall safety check that requires "
+                             "MNEMOSYNE_BENCHMARK_PURE_RECALL=1 (or --pure-recall). The "
+                             "harness's TR/CR/IE/KU bypasses and RECENT CONVERSATION raw-"
+                             "message injection produce answers without going through "
+                             "BeamMemory.recall(), which contaminates arm-vs-arm "
+                             "comparisons. Set this flag only for ceiling-test or legacy-"
+                             "reproduction runs where you explicitly want the bypasses.")
     args = parser.parse_args()
 
     scales = [s.strip() for s in args.scales.split(",")]
     sample_size = args.sample if args.sample > 0 else None
+
+    # ---- Preflight: refuse to run with harness oracles unless explicitly opted in.
+    # The TR/CR/IE/KU bypasses and the always-included RECENT CONVERSATION block
+    # produce answers WITHOUT going through BeamMemory.recall(), contaminating any
+    # arm-vs-arm comparison. Pure-recall mode disables all four. See
+    # docs/benchmarking.md for the full rationale.
+    _pr_active = args.pure_recall or _env_truthy("MNEMOSYNE_BENCHMARK_PURE_RECALL")
+    if not _pr_active and not args.allow_harness_oracles:
+        print(
+            "ERROR: harness oracles are active by default but contaminate arm-vs-arm "
+            "comparisons. Pass --pure-recall (recommended) or set "
+            "MNEMOSYNE_BENCHMARK_PURE_RECALL=1 to disable them. If you genuinely want "
+            "the legacy bypass behavior (e.g., for a ceiling test or reproducing pre-"
+            "fix results), pass --allow-harness-oracles explicitly.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    # Snapshot the full benchmark-relevant env-var surface so results JSON captures
+    # exactly which configuration the run executed under. A toggle the operator
+    # forgot to set is a silent confound otherwise.
+    _benchmark_env_snapshot = {
+        k: v for k, v in os.environ.items()
+        if k.startswith("MNEMOSYNE_") or k in ("FULL_CONTEXT_MODE", "OPENROUTER_BASE_URL")
+    }
+    print(f"\n  Env snapshot ({len(_benchmark_env_snapshot)} vars):")
+    for k in sorted(_benchmark_env_snapshot):
+        # Don't echo API keys even if they accidentally got the MNEMOSYNE_ prefix.
+        v = _benchmark_env_snapshot[k]
+        if "KEY" in k or "TOKEN" in k or "SECRET" in k:
+            v = "***redacted***"
+        print(f"    {k}={v}")
+
+    # Reset recall + extraction diagnostics so per-run counters are clean. The
+    # snapshots are captured at the end of main() and written into results JSON.
+    try:
+        from mnemosyne.core.recall_diagnostics import reset_recall_diagnostics
+        reset_recall_diagnostics()
+    except ImportError:
+        pass  # Diagnostics module is optional; older checkouts may lack it.
+    try:
+        from mnemosyne.extraction.diagnostics import reset_extraction_stats
+        reset_extraction_stats()
+    except ImportError:
+        pass
 
     print(f"{'='*80}")
     print(f"  BEAM End-to-End Evaluation Pipeline")
@@ -1755,8 +1808,23 @@ def main():
                 all_results.append(conv_result)
                 beam.conn.close()
 
-            # Save progress after each conversation
+            # Save progress after each conversation. Includes the env-var
+            # snapshot + diagnostic snapshots so post-hoc analysis can attribute
+            # score deltas to specific configurations without re-running.
             os.makedirs(RESULTS_FILE.parent, exist_ok=True)
+            _recall_diag = None
+            _extraction_diag = None
+            try:
+                from mnemosyne.core.recall_diagnostics import get_recall_diagnostics
+                _recall_diag = get_recall_diagnostics()
+            except ImportError:
+                pass
+            try:
+                from mnemosyne.extraction.diagnostics import get_extraction_stats
+                _extraction_diag = get_extraction_stats()
+            except ImportError:
+                pass
+
             metadata = {
                 "date": datetime.now(timezone.utc).isoformat(),
                 "model": args.model,
@@ -1765,6 +1833,17 @@ def main():
                 "sample_size": sample_size or "ALL",
                 "scales": scales,
                 "total_conversations": len(all_results),
+                "config": {
+                    "env": _benchmark_env_snapshot,
+                    "pure_recall": _pr_active,
+                    "allow_harness_oracles": args.allow_harness_oracles,
+                    "full_context": args.full_context,
+                    "use_cloud": args.use_cloud,
+                },
+                "diagnostics": {
+                    "recall": _recall_diag,
+                    "extraction": _extraction_diag,
+                },
             }
             with open(RESULTS_FILE, "w") as f:
                 json.dump({"metadata": metadata, "results": all_results}, f, indent=2)

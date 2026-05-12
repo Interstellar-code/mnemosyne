@@ -525,8 +525,14 @@ class VeracityConsolidator:
 
                 conflicts = cursor.fetchall()
 
-                # Insert new fact
-                fact_id = f"cf_{subject}_{predicate}_{object}".replace(" ", "_")[:100]
+                # Insert new fact. E2.a.4 (PR #83): use `compute_fact_id`
+                # (SHA-256 of NFC-normalized SPO + length-prefix framing)
+                # for collision-free deterministic IDs. The merge of
+                # PR #83 accidentally left the OLD truncating f-string
+                # pattern at this call site even though `compute_fact_id`
+                # exists at line 38; same hunk that dropped the new logic
+                # also dropped the call.
+                fact_id = compute_fact_id(subject, predicate, object)
                 base_confidence = VERACITY_WEIGHTS.get(veracity, 0.8) * 0.5
 
                 sources = [source] if source else []

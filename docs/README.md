@@ -12,6 +12,7 @@ Local-first, zero-cloud memory for AI agents. SQLite-backed. Sub-millisecond. Fu
 | [Hermes Integration](hermes-integration.md) | Using Mnemosyne as a Hermes memory backend |
 | [LLM Installation Guide](llm-installation-guide.md) | Installation instructions for AI agents/LLMs |
 | [Configuration](configuration.md) | Environment variables, data directory, vector compression |
+| [Benchmarking](benchmarking.md) | Maintainer guide: per-tool A/B benchmark env vars, diagnostics, pure-recall mode, test sequence template |
 | [Changelog](changelog.md) | Version history and release notes |
 
 ## Quick Links

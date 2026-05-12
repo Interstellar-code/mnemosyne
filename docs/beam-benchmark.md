@@ -3,6 +3,8 @@
 **Evaluated against ICLR 2026 BEAM dataset (Tavakoli et al.)**
 **Date:** 2026-05-06 | **Version:** Mnemosyne 2.5 | **Model:** Gemini 2.5 Flash via OpenRouter
 
+> **⚠ Results pre-date the May 2026 benchmark-infrastructure fixes.** Between this run and May 12, 2026, several silent-failure surfaces and harness-side oracles were corrected (see [benchmarking.md](benchmarking.md) for the full list). The numbers below were generated against a pipeline that had: cross-tier `(summary, source)` duplicate ranking under the linear scorer, veracity destroyed at consolidation, harness oracles answering TR/CR/IE/KU outside `BeamMemory.recall()`, and the last 12 raw conversation messages always prepended to every answer prompt. They are not credible evidence for any specific tool's contribution to total score. A re-run under the new infrastructure is tracked at [`experiments/2026-05-12-beam-recovery-arms-abc.md`](experiments/2026-05-12-beam-recovery-arms-abc.md).
+
 ---
 
 ## End-to-End Results (LLM-as-Judge, Rubric Scoring)
