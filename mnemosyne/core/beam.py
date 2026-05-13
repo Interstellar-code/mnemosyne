@@ -2126,13 +2126,20 @@ class BeamMemory:
 
     def update_working(self, memory_id: str, content: str = None,
                        importance: float = None) -> bool:
-        """Update a working_memory entry."""
+        """Update a working_memory entry.
+
+        After updating content, reindexes FTS5 (via wm_au trigger) and
+        recomputes the vector embedding in memory_embeddings so recall()
+        returns the corrected content instead of stale derived state.
+        """
         cursor = self.conn.cursor()
         updates = []
         params = []
+        content_changed = False
         if content is not None:
             updates.append("content = ?")
             params.append(content)
+            content_changed = True
         if importance is not None:
             updates.append("importance = ?")
             params.append(importance)
@@ -2143,8 +2150,32 @@ class BeamMemory:
             f"UPDATE working_memory SET {', '.join(updates)} WHERE id = ? AND session_id = ?",
             params
         )
+        affected = cursor.rowcount
+
+        # Refresh derived state when content changed.
+        # FTS5 is handled by the wm_au trigger (AFTER UPDATE OF content),
+        # but memory_embeddings must be recomputed explicitly.
+        if content_changed and affected > 0 and _embeddings.available():
+            try:
+                vec = _embeddings.embed([content])
+                if vec is not None and len(vec) > 0:
+                    model = _embeddings._DEFAULT_MODEL
+                    emb_json = _embeddings.serialize(vec[0])
+                    cursor.execute(
+                        "INSERT OR REPLACE INTO memory_embeddings"
+                        " (memory_id, embedding_json, model)"
+                        " VALUES (?, ?, ?)",
+                        (memory_id, emb_json, model),
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "update_working: embedding refresh failed for %s"
+                    " (%s): %s",
+                    memory_id, type(exc).__name__, exc,
+                )
+
         self.conn.commit()
-        return cursor.rowcount > 0
+        return affected > 0
 
     def forget_working(self, memory_id: str) -> bool:
         # E6.a: the cascade-delete of annotations must be authorized by the
@@ -4212,6 +4243,91 @@ class BeamMemory:
         return [dict(row) for row in cursor.fetchall()]
 
     # ------------------------------------------------------------------
+    # Consolidation Health Check
+    # ------------------------------------------------------------------
+    def health(self, stale_threshold_hours: float = 24.0) -> Dict:
+        """Return consolidation health status for monitoring/alerting.
+
+        Checks:
+        - last successful consolidation timestamp (from consolidation_log)
+        - error count in recent attempts (last 100 log entries)
+        - stale threshold alert: no consolidation in `stale_threshold_hours`
+
+        Returns a dict with keys: ``status`` (\"healthy\" | \"stale\" | \"no_data\"),
+        ``last_successful_consolidation``, ``error_count``, ``stale_hours``,
+        ``details``, and ``recommendation``.
+        """
+        cursor = self.conn.cursor()
+
+        # Last successful consolidation across ALL sessions (not just
+        # self.session_id) so a health monitor run from an active session
+        # can detect that an inactive-session's sleep_all_sessions
+        # maintenance broke silently.
+        cursor.execute("""
+            SELECT max(created_at) AS last_consolidation
+            FROM consolidation_log
+            WHERE items_consolidated > 0
+        """)
+        row = cursor.fetchone()
+        last_ts_str = row["last_consolidation"] if row and row["last_consolidation"] else None
+
+        # Error count: look at entries with zero items_consolidated but
+        # a non-empty summary_preview that suggests an attempted run.
+        # Also scan sleep_all_sessions "errors" recorded via
+        # summary_preview text patterns.
+        cursor.execute("""
+            SELECT count(*) AS err_count
+            FROM consolidation_log
+            WHERE created_at > datetime('now', '-7 days')
+              AND (
+                  items_consolidated = 0
+                  AND summary_preview LIKE '%error%'
+                  OR summary_preview LIKE '%fail%'
+              )
+        """)
+        error_count = cursor.fetchone()["err_count"]
+
+        now = datetime.now()
+
+        # Determine status
+        if last_ts_str is None:
+            status = "no_data"
+            stale_hours = None
+            recommendation = (
+                "No consolidation_log entries found with items_consolidated > 0. "
+                "Either sleep() has never run, or all runs have produced zero "
+                "summaries. Run sleep_all_sessions() or check logs."
+            )
+        else:
+            last_ts = datetime.fromisoformat(last_ts_str)
+            stale_hours = round((now - last_ts).total_seconds() / 3600.0, 2)
+            if stale_hours > stale_threshold_hours:
+                status = "stale"
+                recommendation = (
+                    f"Last successful consolidation was {stale_hours:.1f} hours ago "
+                    f"(threshold: {stale_threshold_hours:.0f}h). "
+                    "Run sleep_all_sessions() to catch up, and investigate why "
+                    "scheduled consolidation stopped (e.g. LLM unreachable, "
+                    "silent failures in summarize_memories, or cron/loop down)."
+                )
+            else:
+                status = "healthy"
+                recommendation = "Consolidation is within the healthy window."
+
+        return {
+            "status": status,
+            "last_successful_consolidation": last_ts_str,
+            "error_count": error_count,
+            "stale_hours": stale_hours,
+            "stale_threshold_hours": stale_threshold_hours,
+            "details": {
+                "stale": status == "stale",
+                "consolidation_log_entries_checked": "last 7 days",
+            },
+            "recommendation": recommendation,
+        }
+
+    # ------------------------------------------------------------------
     # Consolidation / Sleep
     # ------------------------------------------------------------------
     def sleep(self, dry_run: bool = False) -> Dict:
@@ -4371,6 +4487,11 @@ class BeamMemory:
 
             # --- Fallback to aaak encoding ---
             if summary is None:
+                logger.warning(
+                    "sleep: LLM summarization failed for source=%r (items=%d, "
+                    "llm_available=%s) — falling back to AAAK compression",
+                    source, len(items), local_llm.llm_available(),
+                )
                 combined = " | ".join(lines)
                 compressed = aaak_encode(combined)
                 summary = f"[{source}] {compressed}"
@@ -4495,6 +4616,10 @@ class BeamMemory:
                     summaries_created += int(result.get("summaries_created", 0) or 0)
                     llm_used += int(result.get("llm_used", 0) or 0)
             except Exception as exc:
+                logger.error(
+                    "sleep_all_sessions: session %r consolidation failed: %s",
+                    session_id, exc, exc_info=True,
+                )
                 errors.append({"session_id": session_id, "error": repr(exc)})
 
         # Run tiered degradation after all-sessions consolidation
