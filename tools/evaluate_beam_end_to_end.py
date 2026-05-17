@@ -1434,15 +1434,13 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
         # Trim context aggressively to prevent length truncation on the gap analysis call.
         # 2000 chars is enough to find dates; any more risks token overrun on small models.
         ctx_trimmed = pass1_ctx if len(pass1_ctx) < 2000 else pass1_ctx[:2000] + "...[truncated]"
-        # Escape any curly braces in user content so .format() doesn't choke
-        ctx_safe = ctx_trimmed.replace('{', '{{').replace('}', '}}')
-        q_safe = question.replace('{', '{{').replace('}', '}}')
-        gap_prompt = """You are a precision entity extractor. Scan the context below and extract EXACT strings needed to answer the question.
+        # Use %s formatting — immune to curly braces in user content
+        gap_prompt = ("""You are a precision entity extractor. Scan the context below and extract EXACT strings needed to answer the question.
 
-QUESTION: {question}
+QUESTION: %s
 
 RETRIEVED MEMORY CONTEXT:
-{pass1_ctx}
+%s
 
 EXTRACTION RULES:
 - For "how many days between X and Y": extract BOTH date strings as GAP lines
@@ -1457,7 +1455,7 @@ EXAMPLES:
 GAP: 2024-03-29
 GAP: 2024-04-19
 GAP: added user authentication module
-GAP: migrated to PostgreSQL""".format(question=q_safe, pass1_ctx=ctx_safe)
+GAP: migrated to PostgreSQL""" % (question, ctx_trimmed))
         
         gap_messages = [
             {"role": "system", "content": "You extract exact entity strings from text for database filtering. Output ONLY 'GAP: ...' lines or 'NO_GAPS'. No pleasantries, no explanations."},
