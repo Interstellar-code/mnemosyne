@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import urllib.parse
 import urllib.request
@@ -26,6 +27,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from mnemosyne.core.importers.base import BaseImporter, ImporterResult
+
+logger = logging.getLogger(__name__)
 
 try:  # Optional semantic-search backfill for direct episodic imports.
     from mnemosyne.core import embeddings as _embeddings
@@ -366,18 +369,23 @@ class HindsightImporter(BaseImporter):
     def _backfill_import_embedding(conn, rowid: int, content: str) -> None:
         """Best-effort vector generation for direct episodic imports."""
         if not (_embeddings and _embeddings.available()):
+            logger.debug("backfill: embeddings unavailable, skipping vector for rowid=%s", rowid)
             return
         vecs = _embeddings.embed([content])
         if vecs is None:
+            logger.debug("backfill: embed() returned None for rowid=%s, content=%.50r", rowid, content)
             return
         vec = vecs[0]
         if _vec_available and _vec_insert and _vec_available(conn):
             _vec_insert(conn, rowid, vec.tolist())
         if _mib is not None:
-            conn.execute(
-                "UPDATE episodic_memory SET binary_vector = ? WHERE rowid = ?",
-                (_mib(vec), rowid),
-            )
+            try:
+                conn.execute(
+                    "UPDATE episodic_memory SET binary_vector = ? WHERE rowid = ?",
+                    (_mib(vec), rowid),
+                )
+            except Exception as exc:
+                logger.debug("backfill: binary_vector UPDATE failed for rowid=%s: %s", rowid, exc)
 
 
 def import_from_hindsight(mnemosyne, file_path: str = None, base_url: str = None,
