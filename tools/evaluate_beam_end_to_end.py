@@ -1481,6 +1481,15 @@ GAP: migrated to PostgreSQL""" % (question, ctx_trimmed))
                     if q and len(q) > 3:
                         gap_queries.append(q)
         
+        # Fallback: if LLM gap analysis failed, use regex to extract dates from context
+        if not gap_queries:
+            import re as _re_gap
+            date_matches = _re_gap.findall(r'\b\d{4}-\d{2}-\d{2}\b', pass1_ctx)
+            for d in date_matches:
+                gap_queries.append(d)
+            if date_matches:
+                print(f"    [DEBUG-GAP-FALLBACK] regex extracted {len(date_matches)} dates from context: {date_matches}", flush=True)
+        
         # Debug: log gap analysis results
         print(f"    [DEBUG-GAP] ability={ability} gap_response={gap_response[:200] if gap_response else 'None'} queries={gap_queries}", flush=True)
         
