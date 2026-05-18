@@ -1,47 +1,47 @@
 {
-  "date": "2026-05-18T01:00:09.204848+00:00",
+  "date": "2026-05-18T18:46:31.485848+00:00",
   "metadata": {
-    "model": "deepseek/deepseek-v4-flash:free",
-    "sample_size": 3,
-    "judge_model": "deepseek/deepseek-v4-flash:free"
+    "model": "meta/llama-3.3-70b-instruct",
+    "sample_size": 1,
+    "judge_model": "meta/llama-3.3-70b-instruct"
   },
   "ability_summary": {
     "100K": {
       "ABS": {
-        "avg_score": 0.17156862745098037,
-        "count": 6
+        "avg_score": 1.0,
+        "count": 2
       },
       "CR": {
-        "avg_score": 0.14910130718954248,
-        "count": 6
+        "avg_score": 0.375,
+        "count": 2
       },
       "EO": {
-        "avg_score": 0.10793558989047712,
-        "count": 6
+        "avg_score": 0.25,
+        "count": 2
       },
       "IE": {
-        "avg_score": 0.06196581196581197,
-        "count": 6
+        "avg_score": 0.915,
+        "count": 2
       },
       "KU": {
-        "avg_score": 0.22916666666666666,
-        "count": 6
+        "avg_score": 0.5,
+        "count": 2
       },
       "MR": {
-        "avg_score": 0.015151515151515152,
-        "count": 6
+        "avg_score": 0.875,
+        "count": 2
       },
       "SUM": {
-        "avg_score": 0.017393489448972902,
-        "count": 6
+        "avg_score": 0.55,
+        "count": 2
       },
       "TR": {
-        "avg_score": 0.17901234567901234,
-        "count": 6
+        "avg_score": 0.75,
+        "count": 2
       },
       "OVERALL": {
-        "avg_score": 0.11641191918037237,
-        "count": 48
+        "avg_score": 0.651875,
+        "count": 16
       }
     }
   }

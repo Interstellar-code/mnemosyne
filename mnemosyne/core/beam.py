@@ -633,9 +633,9 @@ def init_beam(db_path: Path = None):
         END
     """)
 
-    # --- NOUS: Structured Fact Tables (Phase 1) ---
+    # --- MEMORIA: Structured Fact Tables (Phase 1) ---
     cursor.execute("""
-        CREATE TABLE IF NOT EXISTS nous_facts (
+        CREATE TABLE IF NOT EXISTS memoria_facts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id TEXT DEFAULT 'default',
             message_idx INTEGER,
@@ -644,15 +644,29 @@ def init_beam(db_path: Path = None):
             value TEXT,
             context_snippet TEXT,
             importance REAL DEFAULT 0.5,
-            timestamp TEXT
+            timestamp TEXT,
+            version_id INTEGER DEFAULT 0,
+            previous_value TEXT,
+            updated_msg_idx INTEGER,
+            valid_from_msg_idx INTEGER,
+            valid_to_msg_idx INTEGER
         )
     """)
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_facts_key ON nous_facts(key)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_facts_type ON nous_facts(fact_type)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_facts_session ON nous_facts(session_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_facts_key ON memoria_facts(key)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_facts_type ON memoria_facts(fact_type)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_facts_session ON memoria_facts(session_id)")
+    # Migration: add versioning columns to existing tables (safe re-run)
+    for col in ['version_id', 'previous_value', 'updated_msg_idx', 'valid_from_msg_idx', 'valid_to_msg_idx']:
+        _add_column_if_missing(conn, "memoria_facts", col, {
+            'version_id': 'INTEGER DEFAULT 0',
+            'previous_value': 'TEXT',
+            'updated_msg_idx': 'INTEGER',
+            'valid_from_msg_idx': 'INTEGER',
+            'valid_to_msg_idx': 'INTEGER',
+        }.get(col, 'TEXT'))
 
     cursor.execute("""
-        CREATE TABLE IF NOT EXISTS nous_timelines (
+        CREATE TABLE IF NOT EXISTS memoria_timelines (
             event_id INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id TEXT DEFAULT 'default',
             date TEXT,
@@ -661,11 +675,38 @@ def init_beam(db_path: Path = None):
             source TEXT
         )
     """)
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_timelines_date ON nous_timelines(date)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_timelines_session ON nous_timelines(session_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_timelines_date ON memoria_timelines(date)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_timelines_session ON memoria_timelines(session_id)")
 
     cursor.execute("""
-        CREATE TABLE IF NOT EXISTS nous_kg (
+        CREATE TABLE IF NOT EXISTS memoria_instructions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT DEFAULT 'default',
+            message_idx INTEGER,
+            instruction TEXT,
+            active INTEGER DEFAULT 1,
+            topic TEXT,
+            context_snippet TEXT
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_instr_session ON memoria_instructions(session_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_instr_active ON memoria_instructions(active)")
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS memoria_preferences (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT DEFAULT 'default',
+            message_idx INTEGER,
+            preference TEXT,
+            topic TEXT,
+            evolution TEXT,
+            context_snippet TEXT
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_pref_session ON memoria_preferences(session_id)")
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS memoria_kg (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id TEXT DEFAULT 'default',
             subject TEXT,
@@ -675,9 +716,9 @@ def init_beam(db_path: Path = None):
             confidence REAL DEFAULT 0.7
         )
     """)
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_kg_subject ON nous_kg(subject)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_kg_predicate ON nous_kg(predicate)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_kg_session ON nous_kg(session_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_kg_subject ON memoria_kg(subject)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_kg_predicate ON memoria_kg(predicate)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_kg_session ON memoria_kg(session_id)")
 
     # --- Consolidation Log ---
     cursor.execute("""
@@ -2407,7 +2448,7 @@ class BeamMemory:
         return memory_id
 
     # ------------------------------------------------------------------
-    # NOUS: Structured Fact Extraction (Phase 1)
+    # MEMORIA: Structured Fact Extraction (Phase 1)
     # ------------------------------------------------------------------
     def extract_and_store_facts(self, content: str, message_idx: int = 0) -> dict:
         """Extract structured facts from a message and store in facts/timelines/kg tables.
@@ -2417,22 +2458,31 @@ class BeamMemory:
         counts = {"metric": 0, "date": 0, "version": 0, "entity": 0,
                   "sequence": 0, "timeline": 0, "negation": 0, "decision": 0}
         session = self.session_id
-
-        # Metrics: numbers with units
-        _metric_re = _re.findall(
-            r'(\d+(?:[.,]\d+)?)\s*(ms|sec|seconds?|minutes?|hours?|days?|weeks?|'
-            r'months?|%|KB|MB|GB|TB|rows?|columns?|roles?|features?|bugs?|'
-            r'commits?|cards?|users?|items?|tests?|APIs?|endpoints?|sprints?|tickets?)',
-            content, _re.IGNORECASE)
-        for num, unit in _metric_re[:10]:
+        # Metrics: numbers with units — use finditer for position info
+        _metric_re_iter = list(_re.finditer(
+            r'(\d+(?:[.,]\d+)?)\s*(ms|sec|seconds?|minutes?|hours?|days?|'
+            r'weeks?|months?|%|KB|MB|GB|TB|rows?|columns?|roles?|features?|'
+            r'bugs?|commits?|cards?|users?|items?|tests?|APIs?|endpoints?|'
+            r'sprints?|tickets?)',
+            content, _re.IGNORECASE))
+        for m in _metric_re_iter[:10]:
+            num = m.group(1)
+            unit = m.group(2)
             unit_clean = unit.lower()
             # Strip plural 's' but preserve "ms" (milliseconds)
             if unit_clean.endswith('s') and not unit_clean.endswith('ms'):
                 unit_clean = unit_clean[:-1]
-            key = unit_clean
+            # Extract context words before the metric to build a specific key.
+            # "dashboard API response time of 250ms" → "response_time_ms"
+            pre_text = content[max(0, m.start()-50):m.start()]
+            ctx_words = [w.strip('.,:;!?()[]"\'') for w in pre_text.split()
+                         if len(w.strip('.,:;!?()[]"\'')) > 2
+                         and w.lower() not in ('the', 'and', 'for', 'was', 'of', 'to', 'a', 'an', 'in', 'on', 'at', 'by', 'is', 'are')][-3:]
+            prefix = '_'.join(w.lower() for w in ctx_words) if ctx_words else ''
+            key = f"{prefix}_{unit_clean}" if prefix else unit_clean
             val = f"{num}{unit}"
             self._insert_fact(session, message_idx, 'metric', key, val,
-                              self._context_snippet(content, content.find(val[:10])), 0.65)
+                              self._context_snippet(content, m.start()), 0.65)
             counts["metric"] += 1
 
         # ISO Dates
@@ -2501,27 +2551,103 @@ class BeamMemory:
                               self._context_snippet(content, m.start()), 0.6)
             counts["sequence"] += 1
 
+        # Instructions (IF support): explicit user constraints/requirements
+        for m in _re.finditer(
+            r'(?:always|never|must|must not|should(?: not)?|need to(?: not)?|required to|'
+            r'prefer(?: not)? to|want to(?: avoid| ensure| use| keep))\s+([^.,;!?\n]{10,120})',
+            content, _re.IGNORECASE):
+            instr = m.group(0).strip()
+            topic = m.group(1).strip()[:40]
+            self.conn.execute(
+                "INSERT INTO memoria_instructions (session_id, message_idx, instruction, topic, context_snippet) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (session, message_idx, instr[:200], topic, self._context_snippet(content, m.start())))
+            counts["instruction"] = counts.get("instruction", 0) + 1
+
+        # Preferences (PF support): evolving user tastes
+        for m in _re.finditer(
+            r'(?:I(?: |\')?(?:like|love|prefer|hate|dislike|enjoy|want|need|tend to|usually|would rather|'
+            r"don't like|don't want|not a fan of|use|stick with|switched to|moved to|changed to))"
+            r'\s+([^.,;!?\n]{10,120})',
+            content, _re.IGNORECASE):
+            pref = m.group(0).strip()
+            topic = m.group(1).strip()[:40]
+            # Check for evolution: did this topic already have a preference?
+            existing = self.conn.execute(
+                "SELECT preference FROM memoria_preferences "
+                "WHERE session_id = ? AND topic LIKE ? ORDER BY message_idx DESC LIMIT 1",
+                (session, f'%{topic[:30]}%')
+            ).fetchone()
+            evolution = None
+            if existing:
+                evolution = f"was: {existing[0][:80]}"
+            self.conn.execute(
+                "INSERT INTO memoria_preferences (session_id, message_idx, preference, topic, evolution, context_snippet) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (session, message_idx, pref[:200], topic, evolution, self._context_snippet(content, m.start())))
+            counts["preference"] = counts.get("preference", 0) + 1
+
         self.conn.commit()
         return counts
 
     def _insert_fact(self, session: str, msg_idx: int, ftype: str,
                      key: str, value: str, ctx: str, importance: float):
-        self.conn.execute(
-            "INSERT INTO nous_facts (session_id, message_idx, fact_type, key, value, context_snippet, importance) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (session, msg_idx, ftype, key, value, ctx, importance))
+        # Dates all share generic keys (e.g. "named_date", "iso_date").
+        # Versioning would create false evolution chains when different
+        # events happen on different dates. Skip versioning for dates.
+        if ftype == 'date':
+            self.conn.execute(
+                "INSERT INTO memoria_facts (session_id, message_idx, fact_type, key, value, "
+                "context_snippet, importance, valid_from_msg_idx) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (session, msg_idx, ftype, key, value, ctx, importance, msg_idx))
+            return
+
+        # Check if this key already has a fact with a different value
+        existing = self.conn.execute(
+            "SELECT id, value FROM memoria_facts "
+            "WHERE session_id = ? AND key = ? AND fact_type = ? AND valid_to_msg_idx IS NULL "
+            "ORDER BY version_id DESC LIMIT 1",
+            (session, key, ftype)
+        ).fetchone()
+        if existing and existing[1] != value:
+            # Mark old row as replaced
+            self.conn.execute(
+                "UPDATE memoria_facts SET valid_to_msg_idx = ?, previous_value = value "
+                "WHERE id = ?",
+                (msg_idx, existing[0])
+            )
+            # Insert new version with previous_value pointer
+            prev_version = self.conn.execute(
+                "SELECT version_id FROM memoria_facts WHERE id = ?",
+                (existing[0],)
+            ).fetchone()
+            new_version = (prev_version[0] + 1) if prev_version else 1
+            self.conn.execute(
+                "INSERT INTO memoria_facts (session_id, message_idx, fact_type, key, value, "
+                "context_snippet, importance, version_id, previous_value, updated_msg_idx, "
+                "valid_from_msg_idx) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (session, msg_idx, ftype, key, value, ctx, importance,
+                 new_version, existing[1], msg_idx, msg_idx))
+        else:
+            self.conn.execute(
+                "INSERT INTO memoria_facts (session_id, message_idx, fact_type, key, value, "
+                "context_snippet, importance, valid_from_msg_idx) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (session, msg_idx, ftype, key, value, ctx, importance, msg_idx))
 
     def _insert_timeline(self, session: str, date: str, msg_idx: int,
                          desc: str, source: str = 'extraction'):
         self.conn.execute(
-            "INSERT INTO nous_timelines (session_id, date, message_idx, description, source) "
+            "INSERT INTO memoria_timelines (session_id, date, message_idx, description, source) "
             "VALUES (?, ?, ?, ?, ?)",
             (session, date, msg_idx, desc, source))
 
     def _insert_kg(self, session: str, subject: str, predicate: str,
                    obj: str, msg_idx: int, confidence: float = 0.7):
         self.conn.execute(
-            "INSERT INTO nous_kg (session_id, subject, predicate, object, message_idx, confidence) "
+            "INSERT INTO memoria_kg (session_id, subject, predicate, object, message_idx, confidence) "
             "VALUES (?, ?, ?, ?, ?, ?)",
             (session, subject, predicate, obj, msg_idx, confidence))
 
@@ -2538,10 +2664,10 @@ class BeamMemory:
         return snippet[:200]
 
     # ------------------------------------------------------------------
-    # NOUS: Structured Fact Retrieval (Phase 2)
+    # MEMORIA: Structured Fact Retrieval (Phase 2)
     # ------------------------------------------------------------------
-    def nous_retrieve(self, query: str, ability: str = None, top_k: int = 10) -> dict:
-        """Route a query to the appropriate NOUS specialist table.
+    def memoria_retrieve(self, query: str, ability: str = None, top_k: int = 10) -> dict:
+        """Route a query to the appropriate MEMORIA specialist table.
         Returns dict with keys: context (str), facts (list), source (str).
         Falls back to {'context': '', 'facts': [], 'source': 'fallback'} when empty."""
         result = {"context": "", "facts": [], "source": "fallback"}
@@ -2551,15 +2677,19 @@ class BeamMemory:
             ability = self._classify_ability(query)
 
         if ability in ('IE', 'KU'):
-            return self._nous_fact_retrieve(query, top_k)
+            return self._memoria_fact_retrieve(query, top_k)
         elif ability == 'TR':
-            return self._nous_timeline_retrieve(query, top_k)
+            return self._memoria_timeline_retrieve(query, top_k)
         elif ability == 'CR':
-            return self._nous_negation_retrieve(query, top_k)
+            return self._memoria_negation_retrieve(query, top_k)
         elif ability == 'MR':
-            return self._nous_entity_retrieve(query, top_k)
+            return self._memoria_entity_retrieve(query, top_k)
         elif ability == 'EO':
-            return self._nous_chrono_retrieve(query, top_k)
+            return self._memoria_chrono_retrieve(query, top_k)
+        elif ability == 'IF':
+            return self._memoria_instruction_retrieve(query, top_k)
+        elif ability == 'PF':
+            return self._memoria_preference_retrieve(query, top_k)
         else:
             return result
 
@@ -2616,8 +2746,8 @@ class BeamMemory:
 
         return ''
 
-    def _nous_fact_retrieve(self, query: str, top_k: int = 10) -> dict:
-        """Query nous_facts table for exact metric/version/entity matches.
+    def _memoria_fact_retrieve(self, query: str, top_k: int = 10) -> dict:
+        """Query memoria_facts table for exact metric/version/entity matches.
         Uses multi-pass strategy:
           Pass 1: numbers from query → search fact values
           Pass 2: capitalized terms → search keys + values
@@ -2634,7 +2764,7 @@ class BeamMemory:
         numbers = _re.findall(r'\b(\d+)\b', query)
         for num in numbers[:3]:
             rows = cursor.execute(
-                "SELECT fact_type, key, value, context_snippet FROM nous_facts "
+                "SELECT fact_type, key, value, context_snippet, previous_value, updated_msg_idx, version_id FROM memoria_facts "
                 "WHERE value LIKE ? AND session_id = ? LIMIT ?",
                 (f'%{num}%', self.session_id, top_k)
             ).fetchall()
@@ -2642,7 +2772,7 @@ class BeamMemory:
                 fk = (row[1], row[2])
                 if fk not in seen:
                     seen.add(fk)
-                    facts.append(dict(zip(['type', 'key', 'value', 'context'], row)))
+                    facts.append(dict(zip(['type', 'key', 'value', 'context', 'previous_value', 'updated_msg_idx', 'version_id'], row)))
 
         # -- Pass 2: Capitalized/key terms in query → search key + value --
         terms = _re.findall(r'\b[A-Z][a-z]+(?:[-][A-Z][a-z]+)*\b', query)
@@ -2653,7 +2783,7 @@ class BeamMemory:
         terms = [t for t in terms if t not in stop_words]
         for term in terms[:5]:
             rows = cursor.execute(
-                "SELECT fact_type, key, value, context_snippet FROM nous_facts "
+                "SELECT fact_type, key, value, context_snippet, previous_value, updated_msg_idx, version_id FROM memoria_facts "
                 "WHERE (key LIKE ? OR value LIKE ?) AND session_id = ? LIMIT ?",
                 (f'%{term}%', f'%{term}%', self.session_id, top_k)
             ).fetchall()
@@ -2661,7 +2791,7 @@ class BeamMemory:
                 fk = (row[1], row[2])
                 if fk not in seen:
                     seen.add(fk)
-                    facts.append(dict(zip(['type', 'key', 'value', 'context'], row)))
+                    facts.append(dict(zip(['type', 'key', 'value', 'context', 'previous_value', 'updated_msg_idx', 'version_id'], row)))
 
         # -- Pass 3: Synonym/keyword mapping --
         # Maps common question words to (fact_type, [unit_hints]).
@@ -2687,13 +2817,13 @@ class BeamMemory:
                     if unit_hints:
                         for unit in unit_hints:
                             rows = cursor.execute(
-                                "SELECT fact_type, key, value, context_snippet FROM nous_facts "
+                                "SELECT fact_type, key, value, context_snippet, previous_value, updated_msg_idx, version_id FROM memoria_facts "
                                 "WHERE fact_type = ? AND key LIKE ? AND session_id = ? LIMIT ?",
                                 (ftype, f'%{unit}%', self.session_id, top_k)
                             ).fetchall()
                     else:
                         rows = cursor.execute(
-                            "SELECT fact_type, key, value, context_snippet FROM nous_facts "
+                            "SELECT fact_type, key, value, context_snippet, previous_value, updated_msg_idx, version_id FROM memoria_facts "
                             "WHERE fact_type = ? AND session_id = ? LIMIT ?",
                             (ftype, self.session_id, top_k)
                         ).fetchall()
@@ -2701,7 +2831,7 @@ class BeamMemory:
                         fk = (row[1], row[2])
                         if fk not in seen:
                             seen.add(fk)
-                            facts.append(dict(zip(['type', 'key', 'value', 'context'], row)))
+                            facts.append(dict(zip(['type', 'key', 'value', 'context', 'previous_value', 'updated_msg_idx', 'version_id'], row)))
                     if facts:
                         break
 
@@ -2721,7 +2851,7 @@ class BeamMemory:
                        if w not in q_stop]
             for word in q_words[:5]:
                 rows = cursor.execute(
-                    "SELECT fact_type, key, value, context_snippet FROM nous_facts "
+                    "SELECT fact_type, key, value, context_snippet, previous_value, updated_msg_idx, version_id FROM memoria_facts "
                     "WHERE context_snippet LIKE ? AND session_id = ? LIMIT ?",
                     (f'%{word}%', self.session_id, top_k)
                 ).fetchall()
@@ -2729,23 +2859,47 @@ class BeamMemory:
                     fk = (row[1], row[2])
                     if fk not in seen:
                         seen.add(fk)
-                        facts.append(dict(zip(['type', 'key', 'value', 'context'], row)))
+                        facts.append(dict(zip(['type', 'key', 'value', 'context', 'previous_value', 'updated_msg_idx', 'version_id'], row)))
                 if facts:
                     break
 
         if facts:
+            # Group by key, keep only the latest (highest version_id) per key.
+            # Multiple versions of the same key confuse the LLM: it sees
+            # contradictory values without knowing which is current.
+            from collections import defaultdict
+            by_key: dict = defaultdict(list)
+            for f in facts:
+                by_key[f['key']].append(f)
+            latest: list = []
+            for key, versions in by_key.items():
+                versions.sort(key=lambda x: x.get('version_id', 0), reverse=True)
+                newest = versions[0]
+                if len(versions) > 1:
+                    # Build a compact evolution chain
+                    prevs = [v['value'] for v in versions[1:]]
+                    newest['evolution'] = ' -> '.join(reversed(prevs)) + f" -> {newest['value']}"
+                latest.append(newest)
+            # Sort by version_id descending so recently-updated facts are prominent
+            latest.sort(key=lambda x: x.get('version_id', 0), reverse=True)
+
             ctx_lines = []
-            for f in facts[:top_k]:
-                ctx_lines.append(f"[Fact {f['type']}] {f['key']}: {f['value']}")
+            for f in latest[:top_k]:
+                line = f"[Fact {f['type']}] {f['key']}: {f['value']}"
+                if f.get('evolution'):
+                    line += f" (evolved: {f['evolution']})"
+                elif f.get('previous_value') and f.get('version_id', 0) > 0:
+                    line += f" (was: {f['previous_value']}, updated at msg_idx {f.get('updated_msg_idx', '?')})"
+                ctx_lines.append(line)
             return {
                 "context": "\n".join(ctx_lines),
-                "facts": facts[:top_k],
-                "source": "nous_facts"
+                "facts": latest[:top_k],
+                "source": "memoria_facts"
             }
         return {"context": "", "facts": [], "source": "fallback"}
 
-    def _nous_timeline_retrieve(self, query: str, top_k: int = 10) -> dict:
-        """Query nous_timelines for chronological events matching query terms."""
+    def _memoria_timeline_retrieve(self, query: str, top_k: int = 10) -> dict:
+        """Query memoria_timelines for chronological events matching query terms."""
         import re as _re
         cursor = self.conn
 
@@ -2757,21 +2911,21 @@ class BeamMemory:
 
         if date_terms:
             rows = cursor.execute(
-                "SELECT date, description, message_idx FROM nous_timelines "
+                "SELECT date, description, message_idx FROM memoria_timelines "
                 "WHERE date LIKE ? AND session_id = ? ORDER BY date LIMIT ?",
                 (f'%{date_terms[0]}%', self.session_id, top_k)
             ).fetchall()
         elif months_in_query:
             month = months_in_query[0][:3]
             rows = cursor.execute(
-                "SELECT date, description, message_idx FROM nous_timelines "
+                "SELECT date, description, message_idx FROM memoria_timelines "
                 "WHERE date LIKE ? AND session_id = ? ORDER BY date LIMIT ?",
                 (f'{month}%', self.session_id, top_k)
             ).fetchall()
         else:
             # Recent timeline events
             rows = cursor.execute(
-                "SELECT date, description, message_idx FROM nous_timelines "
+                "SELECT date, description, message_idx FROM memoria_timelines "
                 "WHERE session_id = ? ORDER BY date DESC LIMIT ?",
                 (self.session_id, top_k)
             ).fetchall()
@@ -2779,11 +2933,11 @@ class BeamMemory:
         if rows:
             facts = [dict(zip(['date', 'description', 'msg_idx'], r)) for r in rows]
             ctx_lines = [f"[{r[0]}] {r[1][:120]}" for r in rows]
-            return {"context": "\n".join(ctx_lines), "facts": facts, "source": "nous_timelines"}
+            return {"context": "\n".join(ctx_lines), "facts": facts, "source": "memoria_timelines"}
         return {"context": "", "facts": [], "source": "fallback"}
 
-    def _nous_negation_retrieve(self, query: str, top_k: int = 10) -> dict:
-        """Query nous_kg for negation predicates matching query terms."""
+    def _memoria_negation_retrieve(self, query: str, top_k: int = 10) -> dict:
+        """Query memoria_kg for negation predicates matching query terms."""
         import re as _re
         cursor = self.conn
 
@@ -2796,7 +2950,7 @@ class BeamMemory:
 
         for term in terms:
             rows = cursor.execute(
-                "SELECT subject, object, message_idx FROM nous_kg "
+                "SELECT subject, object, message_idx FROM memoria_kg "
                 "WHERE predicate='negation' AND (subject LIKE ? OR object LIKE ?) "
                 "AND session_id = ? LIMIT ?",
                 (f'%{term}%', f'%{term}%', self.session_id, top_k)
@@ -2804,12 +2958,12 @@ class BeamMemory:
             if rows:
                 facts = [dict(zip(['subject', 'object', 'msg_idx'], r)) for r in rows]
                 ctx_lines = [f"[Negation] user said never/not: {r[1]}" for r in rows]
-                return {"context": "\n".join(ctx_lines), "facts": facts, "source": "nous_kg_negation"}
+                return {"context": "\n".join(ctx_lines), "facts": facts, "source": "memoria_kg_negation"}
 
         return {"context": "", "facts": [], "source": "fallback"}
 
-    def _nous_entity_retrieve(self, query: str, top_k: int = 10) -> dict:
-        """Query nous_kg for entity-action pairs (predicates: requires, decision)."""
+    def _memoria_entity_retrieve(self, query: str, top_k: int = 10) -> dict:
+        """Query memoria_kg for entity-action pairs (predicates: requires, decision)."""
         import re as _re
         cursor = self.conn
 
@@ -2822,7 +2976,7 @@ class BeamMemory:
         if entities:
             for entity in entities[:3]:
                 rows = cursor.execute(
-                    "SELECT subject, predicate, object, message_idx FROM nous_kg "
+                    "SELECT subject, predicate, object, message_idx FROM memoria_kg "
                     "WHERE (subject LIKE ? OR object LIKE ?) AND session_id = ? LIMIT ?",
                     (f'%{entity}%', f'%{entity}%', self.session_id, top_k)
                 ).fetchall()
@@ -2831,7 +2985,7 @@ class BeamMemory:
 
         if not rows:
             rows = cursor.execute(
-                "SELECT subject, predicate, object, message_idx FROM nous_kg "
+                "SELECT subject, predicate, object, message_idx FROM memoria_kg "
                 "WHERE session_id = ? ORDER BY message_idx LIMIT ?",
                 (self.session_id, top_k)
             ).fetchall()
@@ -2839,14 +2993,14 @@ class BeamMemory:
         if rows:
             facts = [dict(zip(['subject', 'predicate', 'object', 'msg_idx'], r)) for r in rows]
             ctx_lines = [f"[{r[1]}] {r[0]} -> {r[2]}" for r in rows]
-            return {"context": "\n".join(ctx_lines), "facts": facts, "source": "nous_kg"}
+            return {"context": "\n".join(ctx_lines), "facts": facts, "source": "memoria_kg"}
         return {"context": "", "facts": [], "source": "fallback"}
 
-    def _nous_chrono_retrieve(self, query: str, top_k: int = 10) -> dict:
-        """Query nous_facts for sequence markers, ordered by message_idx."""
+    def _memoria_chrono_retrieve(self, query: str, top_k: int = 10) -> dict:
+        """Query memoria_facts for sequence markers, ordered by message_idx."""
         cursor = self.conn
         rows = cursor.execute(
-            "SELECT value, message_idx FROM nous_facts "
+            "SELECT value, message_idx FROM memoria_facts "
             "WHERE fact_type='sequence' AND session_id = ? "
             "ORDER BY message_idx ASC LIMIT ?",
             (self.session_id, top_k)
@@ -2854,7 +3008,95 @@ class BeamMemory:
         if rows:
             facts = [dict(zip(['sequence', 'msg_idx'], r)) for r in rows]
             ctx_lines = [f"[{i+1}] {r[0]}" for i, r in enumerate(rows)]
-            return {"context": "\n".join(ctx_lines), "facts": facts, "source": "nous_sequences"}
+            return {"context": "\n".join(ctx_lines), "facts": facts, "source": "memoria_sequences"}
+        return {"context": "", "facts": [], "source": "fallback"}
+
+    def _memoria_instruction_retrieve(self, query: str, top_k: int = 10) -> dict:
+        """Query memoria_instructions for user constraints matching query terms."""
+        import re as _re
+        cursor = self.conn
+        q_lower = query.lower()
+
+        # Extract topic words from query
+        stop_words = {'what', 'when', 'where', 'which', 'who', 'how', 'why',
+                      'is', 'are', 'was', 'were', 'do', 'does', 'did',
+                      'can', 'will', 'would', 'should', 'could', 'may',
+                      'the', 'a', 'an', 'in', 'on', 'at', 'to', 'for',
+                      'of', 'with', 'my', 'me', 'i', 'you', 'it', 'its',
+                      'this', 'that', 'these', 'those', 'tell', 'list',
+                      'describe', 'explain', 'have', 'has', 'had', 'am'}
+        q_words = [w for w in _re.findall(r'\b[a-zA-Z]{3,}\b', q_lower)
+                   if w not in stop_words]
+
+        rows = []
+        if q_words:
+            for word in q_words[:5]:
+                rows = cursor.execute(
+                    "SELECT instruction, topic, message_idx, context_snippet FROM memoria_instructions "
+                    "WHERE (instruction LIKE ? OR topic LIKE ?) AND session_id = ? AND active = 1 LIMIT ?",
+                    (f'%{word}%', f'%{word}%', self.session_id, top_k)
+                ).fetchall()
+                if rows:
+                    break
+
+        if not rows:
+            # Fallback: return all active instructions
+            rows = cursor.execute(
+                "SELECT instruction, topic, message_idx, context_snippet FROM memoria_instructions "
+                "WHERE session_id = ? AND active = 1 ORDER BY message_idx DESC LIMIT ?",
+                (self.session_id, top_k)
+            ).fetchall()
+
+        if rows:
+            facts = [dict(zip(['instruction', 'topic', 'msg_idx', 'context'], r)) for r in rows]
+            ctx_lines = [f"[Instruction] {r[0][:120]}" for r in rows]
+            return {"context": "\n".join(ctx_lines), "facts": facts, "source": "memoria_instructions"}
+        return {"context": "", "facts": [], "source": "fallback"}
+
+    def _memoria_preference_retrieve(self, query: str, top_k: int = 10) -> dict:
+        """Query memoria_preferences for evolving user tastes matching query terms."""
+        import re as _re
+        cursor = self.conn
+        q_lower = query.lower()
+
+        stop_words = {'what', 'when', 'where', 'which', 'who', 'how', 'why',
+                      'is', 'are', 'was', 'were', 'do', 'does', 'did',
+                      'can', 'will', 'would', 'should', 'could', 'may',
+                      'the', 'a', 'an', 'in', 'on', 'at', 'to', 'for',
+                      'of', 'with', 'my', 'me', 'i', 'you', 'it', 'its',
+                      'this', 'that', 'these', 'those', 'tell', 'list',
+                      'describe', 'explain', 'have', 'has', 'had', 'am'}
+        q_words = [w for w in _re.findall(r'\b[a-zA-Z]{3,}\b', q_lower)
+                   if w not in stop_words]
+
+        rows = []
+        if q_words:
+            for word in q_words[:5]:
+                rows = cursor.execute(
+                    "SELECT preference, topic, message_idx, evolution, context_snippet FROM memoria_preferences "
+                    "WHERE (preference LIKE ? OR topic LIKE ?) AND session_id = ? LIMIT ?",
+                    (f'%{word}%', f'%{word}%', self.session_id, top_k)
+                ).fetchall()
+                if rows:
+                    break
+
+        if not rows:
+            # Fallback: return all preferences
+            rows = cursor.execute(
+                "SELECT preference, topic, message_idx, evolution, context_snippet FROM memoria_preferences "
+                "WHERE session_id = ? ORDER BY message_idx DESC LIMIT ?",
+                (self.session_id, top_k)
+            ).fetchall()
+
+        if rows:
+            facts = [dict(zip(['preference', 'topic', 'msg_idx', 'evolution', 'context'], r)) for r in rows]
+            ctx_lines = []
+            for r in rows:
+                line = f"[Preference] {r[0][:120]}"
+                if r[3]:
+                    line += f" ({r[3]})"
+                ctx_lines.append(line)
+            return {"context": "\n".join(ctx_lines), "facts": facts, "source": "memoria_preferences"}
         return {"context": "", "facts": [], "source": "fallback"}
 
     def recall(self, query: str, top_k: int = 40, *,

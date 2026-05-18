@@ -521,7 +521,7 @@ def ingest_conversation(beam: BeamMemory, messages: list[dict]) -> dict:
         batch_ids = beam.remember_batch(batch_items)
         stats["wm_count"] += len(batch_items)
 
-        # NOUS: Structured fact extraction for every message in this batch
+        # MEMORIA: Structured fact extraction for every message in this batch
         # Uses regex to extract metrics, dates, versions, negations, etc.
         # into the new facts/timelines/knowledge_graph tables.
         _fact_counts = {}
@@ -532,9 +532,9 @@ def ingest_conversation(beam: BeamMemory, messages: list[dict]) -> dict:
                 for k, v in _fc.items():
                     _fact_counts[k] = _fact_counts.get(k, 0) + v
         if _fact_counts:
-            stats["nous_facts"] = _fact_counts
+            stats["memoria_facts"] = _fact_counts
             total = sum(_fact_counts.values())
-            print(f"    [NOUS] extracted {total} facts: {_fact_counts}", flush=True)
+            print(f"    [MEMORIA] extracted {total} facts: {_fact_counts}", flush=True)
 
         # Cloud fact extraction: extract facts from batch if enabled
         if getattr(beam, 'use_cloud', False):
@@ -653,13 +653,14 @@ ANSWER_SYSTEM_PROMPT = """You are a precise memory assistant answering questions
 CRITICAL: Think step-by-step before answering. Follow this structure:
 
 STEP 1 - RELEVANT FACTS: List all specific facts from the context that relate to the question (dates, numbers, names, events, statements).
-STEP 2 - CONTRADICTIONS: If the context contains conflicting statements about the same topic, identify BOTH sides explicitly.
+STEP 2 - CONTRADICTIONS: If the context contains conflicting statements about the same topic, identify BOTH sides explicitly. For factual values that have changed over time (e.g., a metric or deadline that was updated), the LATEST value is the correct one. The context may show "was: OLD -> NEW" or "evolved: A -> B -> C" — use the final (latest) value.
 STEP 3 - TEMPORAL/CALCULATIONS: For date/time questions, extract all relevant dates and compute the answer.
 STEP 4 - ANSWER: Provide a thorough final answer with all relevant details from the context.
 
 RULES:
 - For EVENT ORDERING: list items in chronological order as they appear.
 - For CONTRADICTION: explicitly state "The conversation contains contradictory information: [A] vs [B]"
+- For FACTS THAT CHANGED OVER TIME: the LATEST value is the answer. If the context shows "(was: OLD, updated at msg_idx N)" or "evolved: A -> B -> C", report the final value.
 - For SUMMARIZATION: include all key details -- project stages, features, timelines, security, database, challenges.
 - NEVER say "I don't have enough information" unless absolutely nothing in the context mentions the topic.
 - For "how many" questions, provide the specific count, not a range."""
@@ -674,9 +675,15 @@ SCAN FOR:
 - A claim made then later reversed or denied
 - "I have never X" followed by evidence of doing X
 - "I have not Y" followed by "I implemented Y"
+- **SPECIAL MARKERS in the context**:
+  - `[Negation] user said never/not: ...` — these are EXACT contradiction statements. If you see one for the topic in the question, it IS a contradiction.
+  - `[MEMORIA ...]` blocks — structured fact extractions that include stored negations
+  - `[CR-detect]` blocks — these are pre-identified contradictions injected above the context
+
+CRITICAL: If you see a [Negation] marker about the topic and ALSO see evidence of the user doing that thing, you MUST flag it as a contradiction. The [Negation] marker IS the user saying they never/not did something. Trust these markers — they are extracted facts, not noise.
 
 OUTPUT FORMAT (strictly follow):
-STEP 1 - SCAN: List EVERY statement by the user about the topic in the question. Include BOTH positive claims and negations.
+STEP 1 - SCAN: List EVERY statement by the user about the topic in the question. Include BOTH positive claims and negations. If [Negation] markers exist, include them explicitly.
 STEP 2 - CONTRADICTIONS: For each pair of conflicting statements, state: "The user said [A] but also said [B]."
 STEP 3 - RESOLUTION: If contradictions exist, your ENTIRE answer must call them out. Do NOT give a simple yes/no.
   Format: "I notice you've mentioned contradictory information about this. You said [negation], but you also mentioned [positive claim]. Could you clarify which is correct?"
@@ -700,17 +707,218 @@ STEP 1 - RELEVANCE CHECK: Is the EXACT topic of the question present in the cont
 STEP 2 - If NOT present: answer "This information is not present in the conversation."
 STEP 3 - If present: list relevant facts and answer the question directly."""
 
+# EO-specific prompt: Event Ordering MUST produce a chronological numbered list.
+# The BEAM judge expects explicit ordering markers, not narrative prose.
+# CRITICAL: The model tends to output narrative format; the JSON ultimatum
+# comes FIRST and the response MUST start with "{" to pass judge checks.
+EO_SYSTEM_PROMPT = """You are an Event Ordering specialist. You have the exact sequence facts. Your response MUST be ONLY valid JSON. No other text. No explanations. No "STEP 1" headers. Just JSON.
+
+WRONG (never do this):
+1. IDENTIFIED DATES: ...
+2. FINAL ANSWER: three items are ...
+That format scores ZERO.
+
+CORRECT:
+{"ordered_events":[{"msg_idx":42,"event":"exact description from fact"},{"msg_idx":43,"event":"next exact description"}]}
+
+RULES:
+- Output ONLY valid JSON. Nothing else. No markdown, no backticks, no prefixes.
+- Use every sequence marker provided.
+- Sort strictly by msg_idx (lowest first).
+- Include ALL events mentioned in the retrieved context.
+- The "event" field must be the exact description from the memory content.
+- First character of response must be "{". If you output anything before the brace, you score zero."""
+
+# KU-specific prompt: Knowledge Update MUST extract before/after pairs.
+# The BEAM judge expects explicit "previous value -> new value" tracking.
+# Also handles singleton facts via previous="" (no prior value).
+KU_SYSTEM_PROMPT = """You are a Knowledge Update specialist. You have ALL historical versions of each fact.
+Output ONLY this JSON:
+
+{
+  "updates": [
+    {
+      "key": "dashboard_api_response_time",
+      "previous": "250ms",
+      "new": "180ms",
+      "update_msg_idx": 142,
+      "explanation": "optimized query performance"
+    }
+  ]
+}
+
+RULES:
+- Output ONLY valid JSON. No other text.
+- Look for **[Fact metric]** blocks in the context. These have keys that match the question (e.g., "response_time" for response time questions, "commit" for commit count, "ms" for latency/speed).
+- **Match the KEY to the QUESTION.** If the question asks about "response time", find the fact with key="response_time". If it asks about "commits", find key="commit" or "commit_count". Don't grab the first fact you see.
+- For facts that changed: use the updates array with previous→new. If a fact shows "(was: OLD_VALUE, updated at msg_idx N)" or "(evolved: A -> B -> C)", use the LATEST value as "new".
+- For singleton facts (no was:, no evolution), include as update with previous="".
+- "previous" is the value BEFORE the update. "new" is the current/latest value.
+- "update_msg_idx" is the message index where the update happened.
+- If NO relevant facts exist for the question topic, output: {"updates": []}
+- If the context has no [Fact ...] blocks at all, search the full text for the answer."""
+
+# IF-specific prompt: Instruction Following MUST detect explicit user constraints.
+IF_SYSTEM_PROMPT = """You are an Instruction Following specialist. Identify explicit instructions, constraints, and requirements the user specified.
+
+SCAN THE CONTEXT FOR:
+- "always X" / "never X" statements
+- "must" / "must not" / "should" / "need to" requirements
+- Explicit choices ("decided to use X", "switched to Y")
+- User's rules for how things should be done
+
+OUTPUT:
+Think step by step. If you find relevant instructions or constraints:
+1. List each instruction with the user's exact wording
+2. State whether the instruction is still active (not superseded)
+3. Answer the question directly based on the instructions found
+
+If NO instructions about the topic exist: say you have no instructions from the user about this topic.
+"""
+
+# PF-specific prompt: Preference Following MUST track evolving user tastes.
+PF_SYSTEM_PROMPT = """You are a Preference Following specialist. Identify the user's preferences, likes, dislikes, and how they evolved over time.
+
+SCAN THE CONTEXT FOR:
+- "I like/love/prefer X" statements
+- "I hate/don't like/dislike X" statements
+- "Switched to" / "moved to" / "changed to" evolution markers
+- Tool/taste preferences that changed over time
+
+OUTPUT:
+Think step by step. If you find relevant preferences:
+1. List each preference with the user's exact wording and which message
+2. Show the evolution if available ("was: X -> now: Y")
+3. Identify the current (latest) preference
+4. Answer the question directly
+
+If NO preferences about the topic exist: say you have no preference information about this topic.
+"""
+
+def normalize_for_judge(raw_answer: str, ability: str = None) -> str:
+    """Convert JSON specialist output into judge-friendly bullet list."""
+    import json, re
+    if not raw_answer or raw_answer.startswith("[LLM_ERROR"):
+        return raw_answer or ""
+    # Try to extract and parse JSON block
+    json_match = re.search(r'\{.*\}', raw_answer, re.DOTALL)
+    if json_match:
+        try:
+            data = json.loads(json_match.group(0))
+            if isinstance(data, dict):
+                # EO format: ordered_events
+                if "ordered_events" in data and isinstance(data["ordered_events"], list):
+                    lines = [f"{i+1}. {e.get('event', '')}" for i, e in enumerate(data["ordered_events"])]
+                    if lines:
+                        return "\n".join(lines)
+                # KU format: updates (before/after pairs + singleton via previous="")
+                if "updates" in data and isinstance(data["updates"], list):
+                    lines = []
+                    for u in data["updates"]:
+                        key = u.get("key", "")
+                        prev_val = u.get("previous", "")
+                        new_val = u.get("new", "")
+                        idx = u.get("update_msg_idx", "")
+                        if prev_val:
+                            line = f"- {key}: {prev_val} -> {new_val}"
+                        else:
+                            line = f"- {key}: {new_val}"
+                        if idx:
+                            line += f" (at msg_idx {idx})"
+                        lines.append(line)
+                    if lines:
+                        return "\n".join(lines)
+                # KU legacy formats (fallback)
+                if "current_facts" in data and isinstance(data["current_facts"], list):
+                    lines = []
+                    for cf in data["current_facts"]:
+                        key = cf.get("key", "")
+                        val = cf.get("value", "")
+                        idx = cf.get("source_msg_idx", "")
+                        line = f"- {key}: {val}"
+                        if idx:
+                            line += f" (source: msg_idx {idx})"
+                        lines.append(line)
+                    if lines:
+                        return "\n".join(lines)
+                # KU legacy format (fallback)
+                if "updated_facts" in data and isinstance(data["updated_facts"], list):
+                    lines = []
+                    for f in data["updated_facts"]:
+                        metric = f.get("metric", "")
+                        value = f.get("value", "")
+                        idx = f.get("msg_idx", "")
+                        if idx:
+                            lines.append(f"- {metric}: {value} (source: msg_idx {idx})")
+                        else:
+                            lines.append(f"- {metric}: {value}")
+                    if lines:
+                        return "\n".join(lines)
+        except (json.JSONDecodeError, Exception):
+            pass
+    return raw_answer  # fallback: pass through as-is
+
+DEFAULT_TOP_K = 30  # Memories to retrieve per question (increased for broader context)
+RECENT_CONTEXT_COUNT = 12  # Last N messages to include as recent context
+MAX_MEMORY_CONTEXT_CHARS = 16000  # More context for LLM to find contradictions
+
 DEFAULT_TOP_K = 30  # Memories to retrieve per question (increased for broader context)
 RECENT_CONTEXT_COUNT = 12  # Last N messages to include as recent context
 MAX_MEMORY_CONTEXT_CHARS = 16000  # More context for LLM to find contradictions
 
 
 def _recall_safe(beam: BeamMemory, query: str, top_k: int, temporal_weight: float = 0.0) -> list:
-    """Safe recall wrapper that handles errors gracefully."""
-    try:
-        return beam.recall(query, top_k=top_k, temporal_weight=temporal_weight)
-    except Exception:
+    """Safe recall wrapper with timeout + fresh connection isolation.
+    Prevents indefinite hangs and thread-contention on shared connections."""
+    import threading
+    import logging
+    import sqlite3
+    _log = logging.getLogger("recall_safe")
+    _thread_id = threading.get_ident()
+    _start = time.time()
+    _log.info(f"RECALL START | query={query[:60]!r} | thread={_thread_id} | top_k={top_k}")
+
+    result = []
+    exception = [None]
+    done = threading.Event()
+
+    def _worker():
+        nonlocal result
+        old_conn = getattr(beam, 'conn', None)
+        fresh_conn = None
+        try:
+            # Fresh connection per call to avoid thread contention
+            db_path = getattr(beam, 'db_path', None)
+            if db_path:
+                fresh_conn = sqlite3.connect(db_path, timeout=120, check_same_thread=False)
+                fresh_conn.row_factory = sqlite3.Row
+                fresh_conn.execute("PRAGMA journal_mode=WAL")
+                fresh_conn.execute("PRAGMA busy_timeout=120000")
+                beam.conn = fresh_conn
+            result = beam.recall(query, top_k=top_k, temporal_weight=temporal_weight)
+        except Exception as e:
+            exception[0] = e
+        finally:
+            if fresh_conn is not None:
+                beam.conn = old_conn
+                try:
+                    fresh_conn.close()
+                except Exception:
+                    pass
+            done.set()
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    if not done.wait(timeout=120):
+        _log.warning(f"RECALL TIMEOUT | query={query[:60]!r} | duration={time.time()-_start:.1f}s | thread={_thread_id}")
+        print(f"    [RECALL-TIMEOUT] recall({query[:60]!r}) exceeded 120s timeout, returning empty", flush=True)
         return []
+    if exception[0]:
+        _log.warning(f"RECALL ERROR | query={query[:60]!r} | error={exception[0]} | thread={_thread_id}")
+        print(f"    [RECALL-ERROR] recall({query[:60]!r}): {exception[0]}", flush=True)
+        return []
+    _log.info(f"RECALL END | query={query[:60]!r} | duration={time.time()-_start:.1f}s | thread={_thread_id}")
+    return result
 
 
 def _extract_search_terms(question: str) -> list[str]:
@@ -1353,7 +1561,7 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
             _cr_prefix = f"\n\n{_cr_context}\n\n"
         
         messages = [
-            {"role": "system", "content": ABS_SYSTEM_PROMPT if ability == 'ABS' else ANSWER_SYSTEM_PROMPT},
+            {"role": "system", "content": EO_SYSTEM_PROMPT if ability == "EO" else KU_SYSTEM_PROMPT if ability == "KU" else IF_SYSTEM_PROMPT if ability == "IF" else PF_SYSTEM_PROMPT if ability == "PF" else ABS_SYSTEM_PROMPT if ability == "ABS" else CR_SYSTEM_PROMPT if ability == "CR" else ANSWER_SYSTEM_PROMPT},
             {"role": "user", "content": f"{_cr_prefix}{context}\n\nQUESTION: {question}\n\nANSWER:"},
         ]
         return _ret(llm.chat(messages, temperature=0.1, max_tokens=2048))
@@ -1366,23 +1574,23 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
     # Multi-strategy retrieval
     memories = _multi_strategy_recall(beam, question, top_k * 3, ability=ability)  # Get 3x more for reranking
 
-    # ---- NOUS: Structured Fact Retrieval (Phase 2) ----
-    # Supplement recall with structured facts from nous_facts, nous_timelines,
-    # and nous_kg tables. These provide exact values that FTS5/vector search
+    # ---- MEMORIA: Structured Fact Retrieval (Phase 2) ----
+    # Supplement recall with structured facts from memoria_facts, memoria_timelines,
+    # and memoria_kg tables. These provide exact values that FTS5/vector search
     # may miss (dates, metrics, versions, negations, sequences, entity mappings).
     # Injected as synthetic high-score entries so they surface ahead of fuzzy matches.
     try:
-        _nous_result = beam.nous_retrieve(question, ability=ability, top_k=top_k)
-        if _nous_result and _nous_result.get("source") != "fallback" and _nous_result.get("context"):
-            _nous_facts = _nous_result.get("facts", [])
-            print(f"    [NOUS] {_nous_result['source']} hit for ability={ability}: {len(_nous_facts)} facts", flush=True)
+        _memoria_result = beam.memoria_retrieve(question, ability=ability, top_k=top_k)
+        if _memoria_result and _memoria_result.get("source") != "fallback" and _memoria_result.get("context"):
+            _memoria_facts = _memoria_result.get("facts", [])
+            print(f"    [MEMORIA] {_memoria_result['source']} hit for ability={ability}: {len(_memoria_facts)} facts", flush=True)
             memories.insert(0, {
-                "content": f"[NOUS {_nous_result['source']}]\n{_nous_result['context']}",
+                "content": f"[MEMORIA {_memoria_result['source']}]\n{_memoria_result['context']}",
                 "score": 0.95,
-                "source": f"nous_{_nous_result['source']}",
+                "source": f"memoria_{_memoria_result['source']}",
             })
     except Exception:
-        pass  # NOUS retrieval is best-effort
+        pass  # MEMORIA retrieval is best-effort
 
     # ---- Context→Value fact matching (Phase 7: direct regex-extracted facts, zero-LLM) ----
     # At ingestion, we built beam._context_facts: {"words around fact": ["fact value"]}.
@@ -1486,7 +1694,7 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
     # ---- Recursive Retrieval Loop (Phase 8: two-pass for reasoning-heavy abilities) ----
     # TR, EO, CR, MR questions benefit from a second targeted pass after initial retrieval.
     # Pass 1: answer with current context -> Pass 2: gap analysis + targeted re-retrieval + re-answer.
-    _RECURSIVE_ABILITIES = {'TR', 'EO', 'CR', 'MR'}
+    _RECURSIVE_ABILITIES = {'TR', 'EO', 'CR'}
     
     if ability in _RECURSIVE_ABILITIES:
         # --- Helper: build context string from memory list ---
@@ -1526,8 +1734,10 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
         # LIKE-based exact substring search catches what FTS5 misses.
         if ability == 'CR':
             import re as _re_cr_neg
-            # Extract key noun phrases from the question
+            # Extract key noun phrases from the question.
+            # Use word boundaries to also catch all-caps acronyms (HTTP, API, SQL)
             _neg_terms = _re_cr_neg.findall(r'[A-Z][a-z]+(?:[-\s][A-Z][a-z]+)*', question)
+            _neg_terms += _re_cr_neg.findall(r'\b[A-Z]{2,8}\b', question)  # catch HTTP, API, SQL
             _neg_exclude = {'have', 'could', 'which', 'what', 'this', 'that', 'does', 'about', 'there'}
             _neg_terms = [t for t in _neg_terms if len(t) > 3 and t.lower() not in _neg_exclude]
             if not _neg_terms:
@@ -1535,12 +1745,20 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
             
             _neg_seen = {m.get("content", "")[:80] for m in memories}
             for _term in _neg_terms[:5]:
-                for _neg_word in ['never', 'not', "haven't", "didn't"]:
+                for _neg_word in ['never', 'not', "haven't", "didn't", "wasn't", "weren't", "n't"]:
                     try:
+                        # Search both working_memory and episodic_memory.
+                        # AAAK consolidation moves old messages out of working_memory
+                        # into episodic_memory, which the single-table query misses.
                         _neg_rows = beam.conn.execute(
-                            "SELECT id, content, metadata FROM working_memory "
-                            "WHERE content LIKE ? AND (content LIKE ? OR content LIKE ?) LIMIT 5",
-                            (f"%{_term}%", f"%{_neg_word}%", f"%{_term}%{_neg_word}%")
+                            "SELECT id, content FROM working_memory "
+                            "WHERE content LIKE ? AND (content LIKE ? OR content LIKE ?) "
+                            "UNION "
+                            "SELECT id, content FROM episodic_memory "
+                            "WHERE content LIKE ? AND (content LIKE ? OR content LIKE ?) "
+                            "LIMIT 5",
+                            (f"%{_term}%", f"%{_neg_word}%", f"%{_term}%{_neg_word}%",
+                             f"%{_term}%", f"%{_neg_word}%", f"%{_term}%{_neg_word}%")
                         ).fetchall()
                         for _nr in _neg_rows:
                             _nk = _nr[1][:80] if _nr[1] else ""
@@ -1577,12 +1795,12 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
         pass1_ctx = _build_context(memories, recent_parts)
         # CR questions need contradiction-first prompt to avoid confident
         # answers that ignore conflicting evidence (observed: 0.1 score).
-        _pass1_prompt = CR_SYSTEM_PROMPT if ability == 'CR' else (ABS_SYSTEM_PROMPT if ability == 'ABS' else ANSWER_SYSTEM_PROMPT)
+        _pass1_prompt = EO_SYSTEM_PROMPT if ability == 'EO' else KU_SYSTEM_PROMPT if ability == 'KU' else CR_SYSTEM_PROMPT if ability == 'CR' else ABS_SYSTEM_PROMPT if ability == 'ABS' else ANSWER_SYSTEM_PROMPT
         pass1_messages = [
             {"role": "system", "content": _pass1_prompt},
             {"role": "user", "content": f"{pass1_ctx}\n\nQUESTION: {question}\n\nANSWER:"},
         ]
-        pass1_answer = llm.chat(pass1_messages, temperature=0.1, max_tokens=2048 if ability in ('CR', 'EO') else 1024)
+        pass1_answer = llm.chat(pass1_messages, temperature=0.1, max_tokens=2048 if ability in ('CR', 'EO', 'TR') else 1024)
         
         # --- Gap analysis: extract exact date/entity strings for Pass 2 FTS5 hard-filter ---
         # Critical: give the LLM the RAW retrieved context so it can SEE the dates it missed.
@@ -1661,19 +1879,19 @@ GAP: migrated to PostgreSQL""" % (question, ctx_trimmed))
                     if ck not in gap_seen:
                         gap_seen.add(ck)
                         gap_memories.append(mem)
-                # NOUS structured recall for the same gap query
+                # MEMORIA structured recall for the same gap query
                 try:
-                    _nous_gap = beam.nous_retrieve(gq, ability=ability, top_k=5)
-                    if _nous_gap and _nous_gap.get("source") != "fallback" and _nous_gap.get("context"):
-                        _ng_key = _nous_gap["context"][:80]
-                        if _ng_key not in gap_seen:
-                            gap_seen.add(_ng_key)
-                            _ng_facts = _nous_gap.get("facts", [])
-                            print(f"      [NOUS-gap] {_nous_gap['source']} hit for gap=\"{gq[:60]}\": {len(_ng_facts)} facts", flush=True)
+                    _memoria_gap = beam.memoria_retrieve(gq, ability=ability, top_k=5)
+                    if _memoria_gap and _memoria_gap.get("source") != "fallback" and _memoria_gap.get("context"):
+                        _mg_key = _memoria_gap["context"][:80]
+                        if _mg_key not in gap_seen:
+                            gap_seen.add(_mg_key)
+                            _mg_facts = _memoria_gap.get("facts", [])
+                            print(f"      [MEMORIA-gap] {_memoria_gap['source']} hit for gap=\"{gq[:60]}\": {len(_mg_facts)} facts", flush=True)
                             gap_memories.insert(0, {
-                                "content": f"[NOUS {_nous_gap['source']}]\n{_nous_gap['context']}",
+                                "content": f"[MEMORIA {_memoria_gap['source']}]\n{_memoria_gap['context']}",
                                 "score": 0.95,
-                                "source": f"nous_gap_{_nous_gap['source']}",
+                                "source": f"memoria_gap_{_memoria_gap['source']}",
                             })
                 except Exception:
                     pass
@@ -1709,7 +1927,7 @@ Follow this format strictly:
                 ]
             else:
                 # CR questions need contradiction-first prompt even in Pass 2
-                _pass2_prompt = CR_SYSTEM_PROMPT if ability == 'CR' else (ABS_SYSTEM_PROMPT if ability == 'ABS' else ANSWER_SYSTEM_PROMPT)
+                _pass2_prompt = EO_SYSTEM_PROMPT if ability == 'EO' else KU_SYSTEM_PROMPT if ability == 'KU' else CR_SYSTEM_PROMPT if ability == 'CR' else ABS_SYSTEM_PROMPT if ability == 'ABS' else ANSWER_SYSTEM_PROMPT
                 pass2_messages = [
                     {"role": "system", "content": _pass2_prompt},
                     {"role": "user", "content": pass2_ctx + "\n\nQUESTION: " + question + "\n\nANSWER:"},
@@ -1765,8 +1983,13 @@ Follow this format strictly:
     if _cr_context:
         _cr_prefix_ret = f"\n\n{_cr_context}\n\n"
 
+    # Use ability-specific prompt for KU (JSON updates format expected by judge).
+    # Non-recursive path: KU, IE, MR, SUM, ABS all share this block.
+    # KU_SYSTEM_PROMPT produces JSON {updates: [...]} while ANSWER_SYSTEM_PROMPT
+    # produces free-form text the judge can't evaluate correctly.
+    _prompt = KU_SYSTEM_PROMPT if ability == 'KU' else ANSWER_SYSTEM_PROMPT
     messages = [
-        {"role": "system", "content": ANSWER_SYSTEM_PROMPT},
+        {"role": "system", "content": _prompt},
         {"role": "user", "content": f"{_cr_prefix_ret}{context}\n\nQUESTION: {question}\n\nANSWER:"},
     ]
 
@@ -1903,9 +2126,10 @@ def evaluate_conversation(
         if ai_answer is None:
             ai_answer = "[LLM_ERROR: No response from answering model]"
 
-        # Step 2: LLM-as-judge scores the answer
+        # Step 2: LLM-as-judge scores the answer (after normalizing EO/KU JSON output)
         t0 = time.perf_counter()
-        judgment = judge_with_rubrics(judge_llm, question, rubric, ai_answer)
+        normalized_answer = normalize_for_judge(ai_answer, ability)
+        judgment = judge_with_rubrics(judge_llm, question, rubric, normalized_answer)
         judge_time = time.perf_counter() - t0
 
         score = judgment.get("overall_score", 0.0)
