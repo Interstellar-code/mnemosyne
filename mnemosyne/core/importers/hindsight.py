@@ -327,6 +327,28 @@ class HindsightImporter(BaseImporter):
                         f"Failed to import '{mem.get('content', '')[:80]}': {e}"
                     )
             conn.commit()
+
+            # --- MEMORIA backfill: extract structured facts from imported content ---
+            # Hindsight imports write directly to episodic_memory, bypassing
+            # remember() and therefore the regex-based MEMORIA extraction that
+            # populates memoria_facts / memoria_timelines / memoria_kg.
+            # Without this step, the structured retrieval router sees zero
+            # facts for all imported memories and v3's key feature is useless.
+            if result.imported > 0:
+                logger.info("MEMORIA backfill: extracting facts from %d imported memories",
+                            result.imported)
+                try:
+                    beam = mnemosyne.beam
+                    for mem in memories:
+                        try:
+                            beam.extract_and_store_facts(mem["content"], message_idx=0)
+                        except Exception:
+                            pass  # Best-effort per memory
+                    conn.commit()
+                    logger.info("MEMORIA backfill: complete")
+                except Exception as e:
+                    logger.warning("MEMORIA backfill: failed (%s) — structured router "
+                                   "will see 0 facts for imported memories", e)
         except Exception as e:
             result.errors.append(f"Hindsight import failed: {e}")
         result.finished_at = datetime.now().isoformat()

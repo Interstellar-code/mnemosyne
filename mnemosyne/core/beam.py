@@ -1857,6 +1857,11 @@ class BeamMemory:
                 _extract_and_store_entities(self, existing_id, content)
             if extract:
                 _extract_and_store_facts(self, existing_id, content, source)
+            # Phase 2: MEMORIA regex-based extraction (always-on, zero-LLM-cost).
+            # Populates memoria_facts, memoria_timelines, memoria_kg for the
+            # structured retrieval router. Runs silently on every remember()
+            # so the MEMORIA tables stay current regardless of extract=True.
+            self.extract_and_store_facts(content, message_idx=0)
             # Phase 3-4: Extract graph and consolidate veracity for dedup update
             self._ingest_graph_and_veracity(existing_id, content, source, veracity)
             self._emit_event("MEMORY_UPDATED", existing_id, content=content,
@@ -1887,6 +1892,11 @@ class BeamMemory:
         # --- Structured fact extraction ---
         if extract:
             _extract_and_store_facts(self, memory_id, content, source)
+
+        # Phase 2: MEMORIA regex-based extraction (always-on, zero-LLM-cost).
+        # Populates memoria_facts, memoria_timelines, memoria_kg for the
+        # structured retrieval router. Runs on every remember() call.
+        self.extract_and_store_facts(content, message_idx=0)
 
         # Phase 3-4: Extract graph and consolidate veracity for new memory
         self._ingest_graph_and_veracity(memory_id, content, source, veracity)
@@ -2138,6 +2148,8 @@ class BeamMemory:
                     _extract_and_store_entities(self, memory_id, row_content)
                 if extract:
                     _extract_and_store_facts(self, memory_id, row_content, item_source)
+                # Phase 2: MEMORIA regex-based extraction for every batch row.
+                self.extract_and_store_facts(row_content, message_idx=0)
                 # MEMORY_ADDED parity with remember() -- streaming
                 # observers + DeltaSync see batch rows the same way
                 # they see single-row writes.
