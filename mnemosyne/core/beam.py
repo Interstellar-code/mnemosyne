@@ -2667,6 +2667,12 @@ class BeamMemory:
             r'bugs?|commits?|cards?|users?|items?|tests?|APIs?|endpoints?|'
             r'sprints?|tickets?)',
             content, _re.IGNORECASE))
+        # Transient context keywords — metrics extracted near these are likely noise
+        _TRANSIENT_KEYWORDS = (
+            'forecast', 'weather', 'temperature', 'rain', 'snow', 'wind',
+            'humidity', 'chance', 'regenrisiko', 'zum', 'heute', 'morgen',
+            'gestern', 'today', 'tomorrow', 'yesterday', 'week', 'month'
+        )
         for m in _metric_re_iter[:10]:
             num = m.group(1)
             unit = m.group(2)
@@ -2677,6 +2683,9 @@ class BeamMemory:
             # Extract context words before the metric to build a specific key.
             # "dashboard API response time of 250ms" → "response_time_ms"
             pre_text = content[max(0, m.start()-50):m.start()]
+            # Check for transient/forecast context — skip if found
+            if any(kw in pre_text.lower() for kw in _TRANSIENT_KEYWORDS):
+                continue
             # Strip markdown, backticks, and code formatting from pre_text
             _clean_pre = _re.sub(r'`[^`]*`', ' ', pre_text)  # inline code
             _clean_pre = _re.sub(r'\*\*[^*]+\*\*', ' ', _clean_pre)  # bold
@@ -2714,14 +2723,31 @@ class BeamMemory:
                               self._context_snippet(content, m.start()), 0.65)
             counts["metric"] += 1
 
-        # ISO Dates
+        # ISO Dates — require event context within 100 chars to avoid
+        # file paths, report dates, and passing mentions as timeline entries
         for m in _re.finditer(r'\b(\d{4}-\d{2}-\d{2})\b', content):
             dt = m.group(1)
-            ctx = self._context_snippet(content, m.start())
-            self._insert_fact(session, message_idx, 'date', 'iso_date', dt, ctx, 0.7)
-            self._insert_timeline(session, dt, message_idx, ctx[:120], 'iso_date')
-            counts["date"] += 1
-            counts["timeline"] += 1
+            ctx = self._context_snippet(content, m.start(), width=100)
+            # Check for event verbs in context to filter out passing date mentions
+            _ctx_lower = ctx.lower()
+            _has_event_context = any(
+                kw in _ctx_lower for kw in [
+                    'meeting', 'call', 'scheduled', 'happened', 'occurred',
+                    'plan to', 'will be on', 'due on', 'release', 'deadline',
+                    'launched', 'deployed', 'released', 'published', 'posted',
+                    'started', 'began', 'finished', 'completed', 'ended',
+                    'event', 'conference', 'workshop', 'appointment', 'deadline',
+                ]
+            )
+            if not _has_event_context:
+                # Still store as a fact (date mention), but skip timeline entry
+                self._insert_fact(session, message_idx, 'date', 'iso_date', dt, ctx, 0.5)
+                counts["date"] += 1
+            else:
+                self._insert_fact(session, message_idx, 'date', 'iso_date', dt, ctx, 0.7)
+                self._insert_timeline(session, dt, message_idx, ctx[:120], 'iso_date')
+                counts["date"] += 1
+                counts["timeline"] += 1
 
         # Named dates (e.g. March 29, 2024)
         for m in _re.finditer(
@@ -2775,10 +2801,14 @@ class BeamMemory:
             self._insert_kg(session, 'user', 'decision', decision, message_idx, 0.65)
             counts["decision"] += 1
 
-        # Entity-action pairs (MR support)
+        # Entity-action pairs (MR support) — expanded with preference/instruction patterns
         for m in _re.finditer(
-            r'(?:the|my|our)\s+([a-z_]+\s*(?:table|model|schema|API|endpoint|function|module|route|handler))'
-            r'\s+(?:needs?|requires?|should|could|would|will|has|have)\s+([^.,;!?\n]{10,80})',
+            r'(?:the|my|our|your)\s+([a-z_]+'
+            r'(?:\s+(?:table|model|schema|API|endpoint|function|module|route|handler|'
+            r'tool|plugin|script|config|setting|workflow|pipeline|process|system|'
+            r'server|client|service|database|query|file|repo|branch|PR|issue|task|job)))'
+            r'\s+(?:needs?|requires?|should|could|would|will|has|have|uses?|runs?|'
+            r'handles?|processes?|supports?)\s+([^.,;!?\n]{10,80})',
             content, _re.IGNORECASE):
             entity = m.group(1).strip()
             action = m.group(2).strip()
@@ -2796,35 +2826,72 @@ class BeamMemory:
             counts["sequence"] += 1
 
         # Instructions (IF support): explicit user constraints/requirements
+        # The "should" pattern is the biggest noise source — conversational "should I/we"
+        # and system prompt phrases get extracted as instructions.
+        # Fix: add negative filters for known false positives, require imperative
+        # context for bare "should" matches.
+        _INSTRUCTION_FALSE_POSITIVES = [
+            'i think you should leave',  # Netflix show title
+            'should behave',             # system prompt phrase
+            'their work style',          # system prompt phrase
+        ]
+        _INSTR_IMPERATIVE_VERBS = (
+            'always|never|remember|use|keep|avoid|ensure|check|verify|'
+            'run|test|build|deploy|push|pull|merge|commit|close|open|'
+            'update|install|configure|set|enable|disable|add|remove|'
+            'create|delete|start|stop|restart|reload|reset|try|implement|'
+            'write|read|switch|move|copy|rename|send|reply|respond'
+        )
         for m in _re.finditer(
-            r'(?:always|never|must|must not|should(?: not)?|need to(?: not)?|required to|'
-            r'prefer(?: not)? to|want to(?: avoid| ensure| use| keep))\s+([^.,;!?\n]{10,120})',
+            r'(?:always|never|must|must not|'
+            r'should(?: not)?(?=\s+(?:you|we|i|one)\s+(?:'
+            r'' + _INSTR_IMPERATIVE_VERBS + r'))|'
+            r'need(?:s)? to(?: not)?|required to|'
+            r'prefer(?: not)? to|want to(?: avoid| ensure| use| keep))'
+            r'\s+([^.,;!?\n]{10,200})',
             content, _re.IGNORECASE):
             instr = m.group(0).strip()
-            topic = m.group(1).strip()[:40]
+            topic = m.group(1).strip()[:60]
+            # Skip known false positives
+            _instr_lower = instr.lower()
+            if any(fp in _instr_lower for fp in _INSTRUCTION_FALSE_POSITIVES):
+                continue
+            # Skip bare "should" questions not directed at anyone
+            if _re.match(r'^should\s+(?:i|we|it|they|he|she|the)\b', instr, _re.IGNORECASE):
+                continue
             self.conn.execute(
                 "INSERT INTO memoria_instructions (session_id, message_idx, instruction, topic, context_snippet) "
                 "VALUES (?, ?, ?, ?, ?)",
                 (session, message_idx, instr[:200], topic, self._context_snippet(content, m.start())))
             counts["instruction"] = counts.get("instruction", 0) + 1
 
-        # Preferences (PF support): evolving user tastes
+        # Preferences (PF support): evolving user tastes — expanded patterns
         for m in _re.finditer(
-            r'(?:I(?: |\')?(?:like|love|prefer|hate|dislike|enjoy|want|need|tend to|usually|would rather|'
-            r"don't like|don't want|not a fan of|use|stick with|switched to|moved to|changed to))"
-            r'\s+([^.,;!?\n]{10,120})',
+            r'(?:I(?: |\')?(?:like|love|prefer|hate|dislike|enjoy|use|stick with|'
+            r'switched to|moved to|changed to|want|need|'
+            r'tend to|usually|would rather|don\'t like|don\'t want|not a fan of|'
+            r'am okay with|am comfortable with|am used to|am happy with|'
+            r'am tired of|am sick of|prefer not to|try to avoid|'
+            r'find it easier to|find it better to|find it useful to))'
+            r'\s+([^.,;!?\n]{10,200})',
             content, _re.IGNORECASE):
             pref = m.group(0).strip()
-            topic = m.group(1).strip()[:40]
+            topic = m.group(1).strip()[:60]
+            # Extract a clean topic key from the preference for dedup
+            _topic_key = ' '.join(
+                w for w in _re.findall(r'[a-zA-Z]{4,}', topic)
+                if w.lower() not in _FACT_MATCH_STOPWORDS
+            )[:30] or topic[:20]
             # Check for evolution: did this topic already have a preference?
             existing = self.conn.execute(
-                "SELECT preference FROM memoria_preferences "
-                "WHERE session_id = ? AND topic LIKE ? ORDER BY message_idx DESC LIMIT 1",
-                (session, f'%{topic[:30]}%')
+                "SELECT preference, topic FROM memoria_preferences "
+                "WHERE session_id = ? AND (topic LIKE ? OR preference LIKE ?) "
+                "ORDER BY message_idx DESC LIMIT 1",
+                (session, f'%{_topic_key}%', f'%{_topic_key}%')
             ).fetchone()
             evolution = None
             if existing:
-                evolution = f"was: {existing[0][:80]}"
+                evolution = f"was: {existing[0][:120]}"
             self.conn.execute(
                 "INSERT INTO memoria_preferences (session_id, message_idx, preference, topic, evolution, context_snippet) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
@@ -5743,6 +5810,10 @@ class BeamMemory:
         # Run tiered degradation after all-sessions consolidation
         degrade_result = self.degrade_episodic(dry_run=dry_run)
 
+        # Cross-session MEMORIA dedup: clean up redundant entries across sessions
+        if not dry_run:
+            dedup_result = self._deduplicate_memoria_cross_session()
+
         return {
             "status": "dry_run" if dry_run else ("consolidated" if items_consolidated else "no_op"),
             "sessions_scanned": len(session_rows),
@@ -5766,6 +5837,80 @@ class BeamMemory:
             LIMIT ?
         """, (self.session_id, limit))
         return [dict(row) for row in cursor.fetchall()]
+
+    # ------------------------------------------------------------------
+    # MEMORIA dedup
+    # ------------------------------------------------------------------
+    def _deduplicate_memoria_cross_session(self) -> dict:
+        """Cross-session dedup for MEMORIA tables.
+
+        During sleep_all_sessions, redundant entries accumulate across
+        sessions (same fact key, same instruction topic, same preference).
+        This method:
+        - Keeps the most recent entry per unique key+topic across all sessions
+        - For instructions: deactivates duplicates (active=0)
+        - For preferences: merges evolution chains
+        Returns summary counts.
+        """
+        result = {}
+        cursor = self.conn.cursor()
+
+        # 1. Instructions: deactivate duplicates by topic
+        cursor.execute("""
+            SELECT topic, COUNT(*) as cnt, MAX(message_idx) as latest
+            FROM memoria_instructions
+            GROUP BY topic
+            HAVING cnt > 1
+        """)
+        dup_topics = cursor.fetchall()
+        deactivated = 0
+        for topic, cnt, latest_idx in dup_topics:
+            cursor.execute("""
+                UPDATE memoria_instructions
+                SET active = 0
+                WHERE topic = ? AND message_idx < ? AND active = 1
+            """, (topic, latest_idx))
+            deactivated += cursor.rowcount
+        result["instructions_deactivated"] = deactivated
+
+        # 2. Preferences: merge evolution chains by topic key
+        cursor.execute("""
+            SELECT topic, COUNT(*) as cnt, MAX(message_idx) as latest
+            FROM memoria_preferences
+            GROUP BY topic
+            HAVING cnt > 1
+        """)
+        dup_prefs = cursor.fetchall()
+        merged_evo = 0
+        for topic, cnt, latest_idx in dup_prefs:
+            # Get previous preference to set as evolution
+            prev = cursor.execute("""
+                SELECT preference FROM memoria_preferences
+                WHERE topic = ? AND message_idx < ?
+                ORDER BY message_idx DESC LIMIT 1
+            """, (topic, latest_idx)).fetchone()
+            if prev:
+                cursor.execute("""
+                    UPDATE memoria_preferences
+                    SET evolution = ?
+                    WHERE topic = ? AND message_idx = ?
+                """, (f"was: {prev[0][:120]}", topic, latest_idx))
+                merged_evo += 1
+        result["preference_evolutions_merged"] = merged_evo
+
+        # 3. KG: remove exact duplicate triples
+        cursor.execute("""
+            DELETE FROM memoria_kg
+            WHERE rowid NOT IN (
+                SELECT MIN(rowid) FROM memoria_kg
+                GROUP BY subject, predicate, object
+            )
+        """)
+        result["kg_duplicates_removed"] = cursor.rowcount
+
+        self.conn.commit()
+        result["status"] = "ok"
+        return result
 
     # ------------------------------------------------------------------
     # Export / Import
