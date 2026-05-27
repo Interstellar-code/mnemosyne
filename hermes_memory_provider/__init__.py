@@ -636,6 +636,13 @@ class MnemosyneMemoryProvider(MemoryProvider):
         self._auto_sleep_enabled = os.environ.get("MNEMOSYNE_AUTO_SLEEP_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
         self._ignore_patterns: List[str] = []  # Regex patterns to filter from memory
         self._skip_contexts = {"cron", "flush", "subagent", "background", "skill_loop"}  # Agent contexts to skip
+        # Allow override via MNEMOSYNE_SKIP_CONTEXTS env var.
+        # Set to empty string to skip nothing (enable all contexts).
+        # Set to comma-separated names to customize which contexts skip.
+        _skip_env = os.environ.get("MNEMOSYNE_SKIP_CONTEXTS")
+        if _skip_env is not None:
+            _parsed = {c.strip() for c in _skip_env.split(",") if c.strip()}
+            self._skip_contexts = _parsed if _parsed else set()
         # Profile memory isolation: when enabled, each Hermes profile gets its own
         # Mnemosyne bank (separate SQLite DB). Default OFF for backward compatibility.
         self._profile_isolation_enabled = False
@@ -791,6 +798,17 @@ class MnemosyneMemoryProvider(MemoryProvider):
         if shared_surface_path:
             self._shared_surface_path = Path(str(shared_surface_path)).expanduser()
 
+        # skip_contexts: kwargs > config.yaml > env var (already set in __init__)
+        _skip_raw = kwargs.get("skip_contexts")
+        if _skip_raw is None:
+            _skip_raw = self._read_config_key("skip_contexts")
+        if _skip_raw is not None:
+            if isinstance(_skip_raw, str):
+                _parsed = {c.strip() for c in _skip_raw.split(",") if c.strip()}
+                self._skip_contexts = _parsed if _parsed else set()
+            elif isinstance(_skip_raw, (list, tuple, set)):
+                self._skip_contexts = set(str(s).strip() for s in _skip_raw if str(s).strip())
+
         shared_surface_read = kwargs.get("shared_surface_read")
         if shared_surface_read is None:
             shared_surface_read = self._read_config_key("shared_surface_read")
@@ -835,6 +853,7 @@ class MnemosyneMemoryProvider(MemoryProvider):
             {"key": "profile_isolation", "description": "Enable per-profile memory isolation via Mnemosyne banks. Each Hermes profile gets its own SQLite database under mnemosyne/data/banks/<profile>/. Default false for backward compatibility.", "default": False},
             {"key": "shared_surface_path", "description": "SQLite path for shared surface memories. Default is <mnemosyne>/data/shared/mnemosyne.db.", "default": "data/shared/mnemosyne.db"},
             {"key": "shared_surface_read", "description": "When true, mnemosyne_recall merges shared-surface results into private bank recall, tagging each result with its bank ('private' or 'surface'). Default false.", "default": False},
+            {"key": "skip_contexts", "description": "Agent contexts where Mnemosyne should skip initialization. Comma-separated list. Defaults to 'cron,flush,subagent,background,skill_loop'. Set to empty string to enable all contexts. Also configurable via MNEMOSYNE_SKIP_CONTEXTS env var.", "default": "cron,flush,subagent,background,skill_loop"},
         ]
 
     def save_config(self, values: Dict[str, Any], hermes_home: str) -> None:
