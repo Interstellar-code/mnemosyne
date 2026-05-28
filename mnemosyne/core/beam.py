@@ -3090,6 +3090,26 @@ class BeamMemory:
         words = set(re.findall(r'\w+', text_lower))
         if len(words & german_markers) >= 2:
             return 'de'
+        # Spanish: detect accent chars + Spanish markers
+        if any(c in text_lower for c in 'ñáéíóúü¿¡'):
+            return 'es'
+        es_markers = {
+            'y', 'de', 'por', 'con', 'para', 'que', 'qué', 'como',
+            'el', 'la', 'lo', 'los', 'las', 'un', 'una', 'del',
+            'este', 'esta', 'esto', 'ese', 'esa', 'eso', 'aquel',
+            'mi', 'mis', 'tu', 'tus', 'su', 'sus',
+            'es', 'está', 'son', 'hay', 'tiene', 'puede',
+            'más', 'no', 'también', 'si', 'ya', 'nunca', 'he',
+            'se', 'me', 'te', 'le', 'a', 'yo',
+            'ante', 'bajo', 'contra', 'desde', 'en', 'entre',
+            'hacia', 'hasta', 'según', 'sin', 'sobre', 'tras',
+            'todo', 'toda', 'cada', 'muy', 'pero',
+            'siempre', 'usa', 'hacer', 'antes',
+            'recuerda', 'evita',
+        }
+        words = set(re.findall(r'\w+', text_lower))
+        if len(words & es_markers) >= 2:
+            return 'es'
         # Italian: detect accent chars + Italian markers
         if any(c in text_lower for c in 'àèéìòù'):
             italian_markers = {
@@ -3168,6 +3188,61 @@ class BeamMemory:
             'preference': r"(?:Io(?: |')?(?:mi piace|amo|preferisco|odio|non mi piace|uso|utilizzo|sono passato a|ho cambiato a|voglio|ho bisogno|tendo a|di solito|preferirei|non mi piace per niente|non voglio|non sono un fan di|mi va bene|mi trovo bene|sono abituato a|sono felice con|sono stanco di|cerco di evitare|trovo piu facile|trovo meglio|trovo utile))\s+([^.,;!?\n]{10,200})",
             'event_keywords': ['riunione', 'chiamata', 'incontro', 'programmato', 'successo', 'accaduto', 'pianifico', 'sara il', 'scadenza', 'rilascio', 'lancio', 'pubblicato', 'iniziato', 'cominciato', 'finito', 'completato', 'evento', 'conferenza', 'workshop', 'appuntamento'],
             'named_months': r'(?:(?:(?:Gennaio|Febbraio|Marzo|Aprile|Maggio|Giugno|Luglio|Agosto|Settembre|Ottobre|Novembre|Dicembre|gen|feb|mar|apr|mag|giu|lug|ago|set|ott|nov|dic)\s+\d{1,2}(?:°)?,?\s*(?:\d{4})?))',
+        },
+        'es': {
+            'negation': r'(nunca|jamás|tampoco|ni\s+(?:siquiera|de coña|loc[ao]|de broma|hablar)|no\s+(?:me\s+(?:gusta|convence|interesa|molesta|duele)|lo\s+(?:hag[ao]s|haré|haría)|hace\s+falta|quiero|voy\s+a|sé|sabía|puedo|debo|es\s+(?:para\s+tanto|plan|momento)|tiene\s+sentido|estoy\s+(?:de\s+acuerdo|seguro)|hay\s+(?:derecho|manera|tipo|quien)|teng[ao]\s+(?:ni\s+idea|claro)|pienso|creo|son|era|está|estaba|será|está\s+mal|vamos\s+mal))\s+([^.,;!?¿¡\\n]{15,120})',
+            'decision': r'(?:decid(?:í|ió|imos|iste|isteis|ieron|o|es|e|en)|opt(?:é|ó|amos|aste|asteis|aron|o|a|an)\s+por|cambi(?:é|ó|amos|aste|asteis|aron|o|a|an)\s+(?:de|a)|eleg(?:í|ió|imos|iste|isteis|ieron|o|es|e|en)|seleccion(?:é|ó|amos|aste|asteis|aron|o|a|an)|me\s+(?:pas|decant|escog)(?:é|ó|amos|o|a|an)\s+(?:a|por)|migr(?:é|ó|amos|aste|asteis|aron|o|a|an)\s+(?:de|a)|actualic(?:é|ó|amos|aste|asteis|aron|o|a|an)\s+(?:de|a)|sustitu(?:í|yó|imos|iste|isteis|yeron|yo|yes|ye|yen)\s+por|elimin(?:é|ó|amos|aste|asteis|aron|o|a|an)|descart(?:é|ó|amos|aste|asteis|aron|o|a|an)|y\s+si\s+[^.,;!?¿¡\\n]{10,200}|mejor\s+(?:si|así))\s+([^.,;!?¿¡\\n]{10,120})',
+            'entity': r'(el|la|mi|tu|su|nuestr[oa]|vuestr[oa]|mis|tus|sus|los|las)\s+(servidor|maquina|vm|contenedor|docker|nodo|clúster|cluster|router|enrutador|gateway|puerta\s+de\s+enlace|switch|ap|punto\s+de\s+acceso|firewall|cortafuegos|vpn|vlan|dns|dhcp|api|endpoint|función|funcio|módulo|modulo|servicio|proceso|script|plugin|tool|skill|base\s+de\s+datos|bd|tabla|query|consulta|log|backup|snapshot|sensor|cámara|camara|luz|interruptor|alarma|estación\s+meteorológica|estacion\s+meteorologica|automatización|automatizacion|puerta|repo|repositorio|rama|branch|pr|issue|tarea|workflow|pipeline|config|configuración|configuracion|ajuste|carpeta|opciones|archivo|fichero|dashboard|interfaz|sistema|actualización|actualizacion|versión|versio|despliegue|deploy|release|entorno)(?:\s+(?:\w+))?\s+(?:necesita|requiere|debería|deberia|podría|podria|puede|tiene\s+que|usa|utiliza|ejecuta|gestiona|maneja|procesa|soporta|funciona\s+con|depende\s+de|contiene|implementa|despliega|actualiza|configura|corre\s+(?:en|sobre)|monitoriza|notifica|está|esta)\s+([^.,;!?¿¡\\n]{10,80})',
+            'sequence': r'((?:primero|primeramente|en\s+primer\s+lugar|segundo|en\s+segundo\s+lugar|tercero|en\s+tercer\s+lugar|para\s+empezar|yo\s+empezaría\s+por|yo\s+empezaria\s+por|por\s+mi\s+parte|por\s+otro\s+lado|luego|después|despues|a\s+continuación|a\s+continuacion|mientras\s+tanto|al\s+mismo\s+tiempo|finalmente|por\s+último|por\s+ultimo|para\s+terminar|antes\s+de|acto\s+seguido|por\s+una\s+parte|por\s+otra\s+parte|posteriormente)[^.,;!?¿¡\\n]{15,120})',
+            'instruction_false_positives': [
+                'evita perón', 'evita peron',
+                'goma de borrar',
+                'guarda silencio',
+                'busca la paz',
+                'no cambies nunca',
+                'comprimido efervescente',
+                'copia de seguridad',
+                'prueba a ver',
+                'prueba y error',
+                'mira tú por donde', 'mira tu por donde',
+                'baja la cabeza',
+                'no deberías preocuparte por eso ahora', 'no deberias preocuparte por eso ahora',
+                'debería funcionar sin problemas', 'deberia funcionar sin problemas',
+                'mejor lo dejamos así', 'mejor lo dejamos asi',
+                'habría que verlo primero', 'habria que verlo primero',
+                'igual deberías preguntar antes', 'igual deberias preguntar antes',
+                'tendrías que probarlo tú mismo', 'tendrias que probarlo tu mismo',
+                'puedes hacer lo que quieras',
+                'no hace falta que hagas nada',
+                'yo que tú lo dejaba correr', 'yo que tu lo dejaba correr',
+                'a veces es mejor no tocar nada',
+                'nunca he usado', 'nunca he probado', 'nunca he visto',
+                'nunca he tenido', 'nunca he hecho', 'nunca he sido',
+                'nunca has usado', 'nunca ha usado', 'nunca hemos usado',
+                'nunca lo he', 'nunca lo había', 'nunca había',
+            ],
+            'instruction_imperative': 'siempre|nunca|recuerda|recordad|recuerde|recuerden|haz|haced|haga|hagan|usa|usad|use|usen|mantén|mantened|mantenga|mantengan|evita|evitad|evite|eviten|asegúrate|aseguraos|asegúrese|asegúrense|asegurate|aseguraos|asegurese|asegurense|verifica|verificad|verifique|verifiquen|comprueba|comprobad|compruebe|comprueben|revisa|revisad|revise|revisen|ejecuta|ejecutad|ejecute|ejecuten|prueba|probad|pruebe|prueben|pon|poned|ponga|pongan|configura|configurad|configure|configuren|instala|instalad|instale|instalen|actualiza|actualizad|actualice|actualicen|borra|borrad|borre|borren|guarda|guardad|guarde|guarden|busca|buscad|busque|busquen|despliega|desplegad|despliegue|desplieguen|crea|cread|cree|creen|memoriza|memorizad|memorice|memoricen|graba|grabad|grabe|graben|añade|añadid|añada|añadan|anade|anadid|anada|anadan|cambia|cambiad|cambie|cambien|arregla|arreglad|arregle|arreglen|sube|subid|suba|suban|baja|bajad|baje|bajen|carga|cargad|cargue|carguen|descarga|descargad|descargue|descarguen|comprime|comprimid|comprima|compriman|descomprime|descomprimid|descomprima|descompriman|copia|copiad|copie|copien|mueve|moved|mueva|muevan',
+            'instruction': r'(?:siempre|nunca|hay\s+que|deb(?:es|éis|e|en|o|emos|éis|en)\s+|tienes\s+que|tenéis\s+que|tiene\s+que|tienen\s+que|es\s+necesario|es\s+importante|es\s+mejor|es\s+aconsejable|asegúrate\s+de|asegurate\s+de|record(?:ad|a|e|en)\s+|no\s+olvid(?:es|éis|e|en|ad)\s+)([^.,;!?¿¡\\n]{10,200})',
+            'preference': r'(?:(?:yo|a mí|a mi)\s+)?(?:me\s+(?:gusta|encanta|mola|flipa|chifla|va\s+bien|resulta\s+(?:cómodo|comodo|útil|util|fácil|facil|mejor))|no\s+me\s+(?:gusta|mola|interesa|va|conviene)|prefiero|preferiría|preferiria|odian?|odio|detesto|no\s+soporto|me\s+molesta|me\s+duele|no\s+quiero|paso\s+de|estoy\s+(?:harto|cansado)\s+de|estoy\s+acostumbrado\s+a|suelo\s+usar|suelo\s+trabajar|me\s+siento\s+cómodo|comodo\s+con|no\s+soy\s+fan\s+de|he\s+(?:empezado|dejado|comenzado|terminado)\s+(?:a|de)|dejé|deje|descarte|descarté|eliminé|elimine|cambié|cambie|me\s+quedo\s+con|me\s+decanto\s+por|disfruto|me\s+hace\s+feliz|estoy\s+(?:a\s+gusto|probando))\s+([^.,;!?¿¡\\n]{10,200})',
+            'event_keywords': [
+                'reunión', 'reunion', 'llamada', 'cita', 'meeting', 'daily',
+                'sprint', 'planning', 'retro', 'review', 'revisión', 'revision',
+                'demo', 'demostración', 'demostracion',
+                'evento', 'conferencia', 'taller', 'workshop', 'webinar', 'seminario',
+                'cumpleaños', 'cumpleanos', 'aniversario', 'festivo', 'vacaciones',
+                'programado', 'agendado', 'planeado', 'previsto', 'pendiente',
+                'deadline', 'fecha límite', 'fecha tope', 'entrega',
+                'lanzamiento', 'release', 'despliegue', 'deploy',
+                'publicación', 'publicacion', 'subida',
+                'empezó', 'empezo', 'comenzó', 'comenzo', 'inició', 'inicio',
+                'arrancó', 'arranco', 'terminó', 'termino', 'finalizó', 'finalizo',
+                'acabó', 'acabo', 'completé', 'complete',
+                'lanzamos', 'publicamos', 'desplegamos', 'implementamos',
+                'tengo una cita', 'tenemos una reunión', 'vamos a vernos',
+                'agendé', 'agende', 'ocurrió', 'ocurrio', 'sucedió', 'sucedio',
+                'pasó', 'paso',
+            ],
+            'named_months': r'(\d{1,2})\s*de\s*(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|octubre|noviembre|diciembre|ene|feb|mar|abr|may|jun|jul|ago|sep|oct|nov|dic)\s*(?:de\s*(\d{4}))?',
         },
     }
 
@@ -3467,6 +3542,16 @@ class BeamMemory:
         if end < len(content):
             snippet = f"{snippet}..."
         return snippet[:200]
+
+    @staticmethod
+    def _normalize_spanish_accent(text: str) -> str:
+        """Strip Spanish diacritics so 'configuración' matches 'configuracion'."""
+        _accent_map = {
+            'á': 'a', 'é': 'e', 'í': 'i', 'ó': 'o', 'ú': 'u',
+            'Á': 'A', 'É': 'E', 'Í': 'I', 'Ó': 'O', 'Ú': 'U',
+            'ü': 'u', 'Ü': 'U', 'ñ': 'n', 'Ñ': 'N',
+        }
+        return ''.join(_accent_map.get(c, c) for c in text)
 
     # ------------------------------------------------------------------
     # MEMORIA: Structured Fact Retrieval (Phase 2)
