@@ -13,7 +13,7 @@ pip install mnemosyne-memory
 2. Create a bridge file in OpenWebUI's `data/tools/` directory:
 
 ```bash
-echo "from mnemosyne.integrations.openwebui_tool import MnemosyneTool as Mnemosyne" \
+echo "from openwebui_tool import MnemosyneTool as Mnemosyne" \
   > /path/to/open-webui/data/tools/mnemosyne.py
 ```
 
@@ -58,7 +58,7 @@ The LLM decides when to use each tool based on the conversation context.
 - **Testing**: Import the tool in Python directly to verify it works:
   ```python
   import asyncio
-  from mnemosyne.integrations.openwebui_tool import MnemosyneTool
+  from openwebui_tool import MnemosyneTool
   tool = MnemosyneTool()
   result = asyncio.run(tool.mnemosyne_remember("test memory"))
   print(result)

@@ -6,12 +6,12 @@ Class-based @tool with Pydantic Valves for configuration.
 For OpenWebUI (class-based Valves pattern):
     1. pip install mnemosyne-memory
     2. Create bridge file in OpenWebUI's data/tools/ directory:
-       echo "from mnemosyne.integrations.openwebui_tool import MnemosyneTool as Mnemosyne" \\
+       echo "from openwebui_tool import MnemosyneTool as Mnemosyne" \\
          > /path/to/open-webui/data/tools/mnemosyne.py
     3. Configure in OpenWebUI Workspace settings
 
 Standalone usage (for testing/scripting):
-    from mnemosyne.integrations.openwebui_tool import MnemosyneTool
+    from openwebui_tool import MnemosyneTool
     tool = MnemosyneTool()
     result = await tool.mnemosyne_remember("Hello world")
 """

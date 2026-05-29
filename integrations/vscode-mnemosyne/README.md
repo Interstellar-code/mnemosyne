@@ -35,7 +35,7 @@ Browse, search, and manage Mnemosyne memory directly in VS Code.
 
 ```bash
 git clone https://github.com/AxDSan/mnemosyne.git
-cd extensions/vscode-mnemosyne
+cd integrations/vscode-mnemosyne
 npm install
 npm run compile
 ```

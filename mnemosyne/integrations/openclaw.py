@@ -13,7 +13,7 @@ Installation:
     pip install mnemosyne-memory && pip install openclaw
 
 Usage:
-    from mnemosyne.integrations.openclaw import MnemosyneProvider
+    from openclaw import MnemosyneProvider
 
     provider = MnemosyneProvider(config={"db_path": "/data/memory.db"})
     provider.store(key="user_prefs", content="User likes dark mode")
