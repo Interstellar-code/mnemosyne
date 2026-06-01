@@ -3154,6 +3154,9 @@ class BeamMemory:
             row_veracity = clamp_veracity(
                 veracity, context="consolidate_to_episodic.veracity"
             )
+        # Strip closed <think>...</think> blocks that some LLMs emit
+        import re as _re
+        summary = _re.sub(r"<think>.*?</think>", "", summary, flags=_re.DOTALL).strip()
         cursor = self.conn.cursor()
         cursor.execute("""
             INSERT INTO episodic_memory

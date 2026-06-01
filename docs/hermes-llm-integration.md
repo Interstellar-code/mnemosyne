@@ -35,7 +35,7 @@ when Mnemosyne is loaded as a Hermes memory provider):
      then return None / [].
 1. Remote OpenAI-compatible API (only if MNEMOSYNE_LLM_BASE_URL is set
    AND MNEMOSYNE_HOST_LLM_ENABLED is unset/false).
-2. Local llama-cpp-python / ctransformers GGUF (TinyLlama by default).
+2. Local llama-cpp-python / ctransformers GGUF (MiniCPM5-1B by default).
 3. Return None (consolidation) or [] (extraction) — caller falls back to
    the existing non-LLM path.
 ```
@@ -63,7 +63,7 @@ MNEMOSYNE_HOST_LLM_MODEL=gpt-5.1-mini
 
 # Optional: prompt context budget when the host is the chosen path.
 # Default 32000. The existing MNEMOSYNE_LLM_N_CTX (default 2048) is
-# calibrated for TinyLlama and is far too small for typical Codex/GPT
+# calibrated for the local GGUF model and is far too small for typical Codex/GPT
 # context windows — using it as the host budget produces wastefully many
 # small chunks and lossy multi-chunk summaries.
 MNEMOSYNE_HOST_LLM_N_CTX=32000

@@ -318,3 +318,65 @@ class TestHostAwareChunking:
         set_host_llm_backend(None)
         local_budget = local_llm._prompt_token_budget()
         assert local_budget < host_budget
+
+
+class TestThinkTagStripping:
+    """Verify think tag removal from LLM output (closed tags only).
+
+    Unclosed think tags are not stripped because there is no way to
+    distinguish thinking content from the actual response when the
+    closing tag is missing.
+    """
+
+    def test_clean_output_strips_closed_think_tags(self):
+        raw = f"<think>let me reason</think> The answer is 42."
+        assert local_llm._clean_output(raw) == "The answer is 42."
+
+    def test_clean_output_strips_multiline_closed_think_tags(self):
+        raw = f"<think>step 1\nstep 2</think>\nFinal answer."
+        assert local_llm._clean_output(raw) == "Final answer."
+
+    def test_clean_output_strips_multiple_think_blocks(self):
+        raw = f"<think>first</think>middle<think>second</think>end"
+        assert local_llm._clean_output(raw) == "middleend"
+
+    def test_clean_output_preserves_text_without_think_tags(self):
+        raw = "Just a normal summary with no thinking."
+        assert local_llm._clean_output(raw) == "Just a normal summary with no thinking."
+
+    def test_clean_output_empty_after_stripping(self):
+        raw = f"<think>only thinking, no output</think>"
+        assert local_llm._clean_output(raw) == ""
+
+    def test_clean_output_does_not_strip_unclosed_think_tag(self):
+        """Unclosed think tags are left as-is since we cannot determine
+        where thinking ends and the response begins."""
+        raw = f"middle<think>reasoning that never closes"
+        assert local_llm._clean_output(raw) == raw
+
+    def test_try_host_llm_strips_think_tags(self, monkeypatch):
+        """Host LLM output with closed think tags should be cleaned."""
+        monkeypatch.setattr(local_llm, "LLM_ENABLED", True)
+        monkeypatch.setattr(local_llm, "HOST_LLM_ENABLED", True)
+        monkeypatch.setattr(local_llm, "HOST_LLM_TIMEOUT", 5.0)
+        monkeypatch.setattr(local_llm, "HOST_LLM_PROVIDER", None)
+        monkeypatch.setattr(local_llm, "HOST_LLM_MODEL", None)
+        set_host_llm_backend(CallableLLMBackend("test", lambda prompt, **kw: f"<think>reasoning</think>Summary of memories."))
+
+        attempted, text = local_llm._try_host_llm("test prompt", max_tokens=128, temperature=0.3)
+        assert attempted is True
+        assert text == "Summary of memories."
+
+    def test_try_host_llm_does_not_strip_unclosed_think_tag(self, monkeypatch):
+        """Unclosed think tags in host output are left as-is."""
+        monkeypatch.setattr(local_llm, "LLM_ENABLED", True)
+        monkeypatch.setattr(local_llm, "HOST_LLM_ENABLED", True)
+        monkeypatch.setattr(local_llm, "HOST_LLM_TIMEOUT", 5.0)
+        monkeypatch.setattr(local_llm, "HOST_LLM_PROVIDER", None)
+        monkeypatch.setattr(local_llm, "HOST_LLM_MODEL", None)
+        set_host_llm_backend(CallableLLMBackend("test", lambda prompt, **kw: f"<think>reasoning\nActual output"))
+
+        attempted, text = local_llm._try_host_llm("test prompt", max_tokens=128, temperature=0.3)
+        assert attempted is True
+        # Unclosed tag is not stripped - we can't tell where thinking ends
+        assert "<think>" in text

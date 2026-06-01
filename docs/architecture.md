@@ -62,7 +62,7 @@ The `sleep()` function moves stale working memories into episodic memory:
 
 1. Fetches working memories past TTL or below importance threshold
 2. Groups them by source
-3. Attempts LLM summarization (local TinyLlama, remote OpenAI-compatible, or AAAK fallback)
+3. Attempts LLM summarization (local MiniCPM5-1B, remote OpenAI-compatible, or AAAK fallback)
 4. Stores the summary in episodic memory with embeddings
 5. Removes the originals from working memory
 6. Logs the consolidation event

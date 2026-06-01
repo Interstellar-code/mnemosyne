@@ -6,7 +6,7 @@ Uses llama-cpp-python (ARM64 + x86_64 native) with ctransformers fallback.
 Falls back to aaak encoding if the model is unavailable or inference fails.
 
 Model cache: ~/.hermes/mnemosyne/models/
-Default model: TinyLlama-1.1B-Chat-v1.0-GGUF (Q4_K_M, ~600MB)
+Default model: openbmb/MiniCPM5-1B-GGUF (Q4_K_M, ~656MB)
 """
 
 import os
@@ -16,8 +16,8 @@ from pathlib import Path
 from typing import List, Optional
 
 # --- Config ------------------------------------------------------------------
-DEFAULT_MODEL_REPO = "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF"
-DEFAULT_MODEL_FILE = "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"
+DEFAULT_MODEL_REPO = "openbmb/MiniCPM5-1B-GGUF"
+DEFAULT_MODEL_FILE = "MiniCPM5-1B-Q4_K_M.gguf"
 MODEL_CACHE_DIR = Path.home() / ".hermes" / "mnemosyne" / "models"
 
 LLM_ENABLED = os.environ.get("MNEMOSYNE_LLM_ENABLED", "true").lower() in ("1", "true", "yes")
@@ -46,7 +46,7 @@ HOST_LLM_ENABLED = os.environ.get("MNEMOSYNE_HOST_LLM_ENABLED", "false").lower()
 HOST_LLM_PROVIDER = os.environ.get("MNEMOSYNE_HOST_LLM_PROVIDER", "").strip() or None
 HOST_LLM_MODEL = os.environ.get("MNEMOSYNE_HOST_LLM_MODEL", "").strip() or None
 HOST_LLM_TIMEOUT = 15.0  # Per-attempt safety cap; not user-facing.
-# Host context window: TinyLlama-calibrated LLM_N_CTX (2048) is too small for
+# Host context window: local-model-calibrated LLM_N_CTX (2048) is too small for
 # Codex/GPT-class aux models; use this larger budget when the host is the path.
 HOST_LLM_N_CTX = int(os.environ.get("MNEMOSYNE_HOST_LLM_N_CTX", "32000"))
 
@@ -253,10 +253,10 @@ def _build_prompt(memories: List[str], source: str = "") -> str:
 
 
 def _build_host_prompt(memories: List[str], source: str = "") -> str:
-    """Plain-text consolidation prompt for host LLMs (no TinyLlama tokens).
+    """Plain-text consolidation prompt for host LLMs (no local-model tokens).
 
     The host adapter wraps this string as the user-message content of a
-    Chat Completions call; embedding TinyLlama chat-template tokens here
+    Chat Completions call; embedding local-model chat-template tokens here
     would degrade output quality on every modern aux provider.
     """
     custom = _format_sleep_prompt(memories, source=source)
@@ -325,16 +325,19 @@ def _try_host_llm(
         model=HOST_LLM_MODEL,
     )
     # NB: do NOT run host output through _clean_output(): that helper exists
-    # to scrub TinyLlama prompt-template echoes and bulleted prompt repeats
+    # to scrub local-model prompt-template echoes and bulleted prompt repeats
     # from local-model output. Host LLMs (Codex/GPT-class) don't echo our
     # prompt format, AND extract_facts() relies on `- bullet` lines surviving
     # so _parse_facts() can consume them. Just trim whitespace.
     text = raw.strip() if isinstance(raw, str) and raw.strip() else None
+    if text:
+        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
     return (True, text)
 
 
 def _clean_output(text: str) -> str:
     """Strip assistant tokens and extra whitespace from model output."""
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
     text = text.replace("<|assistant|>", "").replace("<|user|>", "")
     text = text.replace("</s>", "").strip()
     text = re.sub(r"^(Summarize the following memories.*?[.!?:]\s*)", "", text, flags=re.IGNORECASE | re.DOTALL)
@@ -353,11 +356,11 @@ def _prompt_token_budget() -> int:
     """Return usable token budget for memory content (reserves overhead + output).
 
     Picks the larger HOST_LLM_N_CTX when the host backend will handle the
-    call; otherwise the TinyLlama-calibrated LLM_N_CTX. This avoids the
+    call; otherwise the local-model-calibrated LLM_N_CTX. This avoids the
     multi-chunk-summary degradation on 128K-context aux providers.
 
     NOTE: output_reserve is capped at min(LLM_MAX_TOKENS, n_ctx // 4) so
-    that LLM_MAX_TOKENS == n_ctx (the default for TinyLlama 1.1B with 2048
+    that LLM_MAX_TOKENS == n_ctx (the default for MiniCPM5-1B with 2048
     context) doesn't leave a negative budget for memory content. See
     BEAM-benchmark root-cause analysis (May 2026). Summarized output fits
     in 128-256 tokens for consolidation; reserving more than 1/4 of the

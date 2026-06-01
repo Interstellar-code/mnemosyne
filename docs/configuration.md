@@ -114,13 +114,13 @@ MNEMOSYNE_EMBEDDING_DIM=768
 | `MNEMOSYNE_LLM_N_CTX` | `2048` | Context window size for the local model |
 | `MNEMOSYNE_LLM_MAX_TOKENS` | `2048` | Maximum output tokens per summary |
 | `MNEMOSYNE_LLM_N_THREADS` | `4` | CPU threads for local inference |
-| `MNEMOSYNE_LLM_REPO` | `TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF` | HuggingFace repo for GGUF model |
-| `MNEMOSYNE_LLM_FILE` | `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` | GGUF filename |
+| `MNEMOSYNE_LLM_REPO` | `openbmb/MiniCPM5-1B-GGUF` | HuggingFace repo for GGUF model |
+| `MNEMOSYNE_LLM_FILE` | `MiniCPM5-1B-Q4_K_M.gguf` | GGUF filename |
 | `MNEMOSYNE_SLEEP_PROMPT` | *(built-in)* | Optional sleep/consolidation prompt override. Supports `{source}`, `{memories}`, and `{memory_count}` placeholders for language-specific summaries. |
 
 ### Remote LLM (OpenAI-compatible)
 
-Use a remote model instead of local TinyLlama:
+Use a remote model instead of the local MiniCPM5-1B GGUF:
 
 | Variable | Default | Description |
 |---|---|---|
@@ -141,7 +141,7 @@ Route consolidation and fact extraction through a host-provided LLM (e.g., Herme
 | `MNEMOSYNE_HOST_LLM_ENABLED` | `false` | Opt in to host-adapter routing |
 | `MNEMOSYNE_HOST_LLM_PROVIDER` | *(none)* | Optional provider override, e.g. `openai-codex` |
 | `MNEMOSYNE_HOST_LLM_MODEL` | *(none)* | Optional model override, e.g. `gpt-5.1-mini` |
-| `MNEMOSYNE_HOST_LLM_N_CTX` | `32000` | Prompt-budget when host is the chosen path (TinyLlama-calibrated `LLM_N_CTX=2048` is too small for Codex/GPT-class) |
+| `MNEMOSYNE_HOST_LLM_N_CTX` | `32000` | Prompt-budget when host is the chosen path (local-model-calibrated `LLM_N_CTX=2048` is too small for Codex/GPT-class) |
 
 When the host call fails, the adapter falls back to the local GGUF model rather than the remote URL. See [hermes-llm-integration.md](hermes-llm-integration.md) for the full behavior model and session-shutdown semantics.
 
@@ -152,7 +152,7 @@ When the host call fails, the adapter falls back to the local GGUF model rather 
    ↓ (on failure: skip remote, go to local)
 1. Remote LLM (if MNEMOSYNE_LLM_BASE_URL is set AND host is not enabled)
    ↓ (on failure)
-2. Local LLM (ctransformers + TinyLlama GGUF)
+2. Local LLM (llama-cpp-python / ctransformers + MiniCPM5-1B GGUF)
    ↓ (on failure or not installed)
 3. AAAK encoding (keyword-based, no LLM required)
 ```
