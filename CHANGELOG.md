@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
-## [Unreleased]
+## [3.3.0] — 2026-06-01
 
 ### Added
 
@@ -14,21 +14,36 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
   Default `["user", "assistant"]` preserves existing behavior. Set to `["user"]`
   to save only user turns, or `[]` to disable conversation autosave while keeping
   explicit `mnemosyne_remember` calls working. Unknown roles are warned and ignored.
+  (Contributed by **bitr8**, closes #209.)
 - **`MNEMOSYNE_SYNC_TURN_USER_LIMIT` / `MNEMOSYNE_SYNC_TURN_ASSISTANT_LIMIT` env vars.**
   `sync_turn()` now respects configurable truncation limits instead of hardcoded
   500/800 slices. Defaults to `500` (user) and `800` (assistant) for backward
   compatibility. Set to `0` to disable truncation.
 - **Fact recall merged into standard `beam.recall()` path.** Set
-  `MNEMOSYNE_FACT_RECALL_ENABLED=1` to merge LLM-extracted facts into recall
-  results. Facts are deduplicated against regular memories by content hash.
-- **Auto-default `scope=global` when `extract=true`.** If no explicit scope is
-  passed, setting `extract=true` infers `scope=global` instead of `session`.
-- **`fact_recall()` now searches `consolidated_facts`** in addition to the raw
-  `facts` table. Fact data stored with `extract=true` is now visible through
-  the default recall path without requiring polyphonic mode.
+  `MNEMOSYNE_FACT_RECALL_ENABLED=1` to merge LLM-extracted facts (from `extract=true`)
+  into recall results. Facts are deduplicated against regular memories by content
+  hash and scored at 0.9x their confidence.
+- **Auto-default `scope=global` when `extract=true`.** If a caller doesn't
+  explicitly pass `scope`, setting `extract=true` now infers `scope=global`
+  instead of the default `session`. Explicit scope overrides are respected.
+- **`fact_recall()` now searches `consolidated_facts`** (sleep-consolidated fact
+  triples) in addition to the raw `facts` table. Previously only accessible
+  through polyphonic recall (`MNEMOSYNE_POLYPHONIC_RECALL=1`). Fact data stored
+  with `extract=true` is now visible through the default recall path.
+- **`MNEMOSYNE_EMBEDDING_API_URL` independent of `OPENROUTER_BASE_URL`.**
+  Embedding models can now use local llama.cpp, OpenAI, Anthropic, or any
+  other provider without requiring OpenRouter configuration. Also fixes a bug
+  where `_OPENAI_BASE_URL` was stale after env read. (Contributed by
+  **mia-fourier**, PR #206.)
 
 ### Fixed
 
+- **`remember()` silently never stored embeddings.** Only `remember_batch()`
+  called `_vec_insert()`. The Hermes provider uses `remember()`, so thousands
+  of working memories had no vectors, making conflict detection always a no-op
+  and degrading vector recall quality. Added `_vec_insert()` call to `remember()`.
+  Threshold for conflict detection relaxed from 0.92 to 0.88 (32 conflicts found
+  vs 23 in real data).
 - **Hardcoded embedding dimension in `binary_vectors.py`.** `EMBEDDING_DIM` was
   hardcoded to 384 (bge-small-en-v1.5), causing `maximally_informative_binarization`
   to silently truncate larger embeddings (e.g. 1024-dim multilingual-e5-large) to
@@ -37,8 +52,92 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
   a 384 fallback when the embeddings module is unavailable. `BYTES_PER_VECTOR`,
   `compression_ratio`, and `theoretical_size_mb` in `get_stats()` are likewise
   computed from the resolved dimension instead of hardcoded constants.
+  (Contributed by **Whishp**, PR #200.)
+- **Same hardcoded 384 in `shmr.py` and `polyphonic_recall.py`.** `shmr.py` used
+  the identical hardcoded constant. `polyphonic_recall.py` hardcoded `384` for
+  bit-type vector normalization, silently breaking for non-384-dim models.
+  Both now derive from `embeddings.EMBEDDING_DIM`. (Contributed by **Whishp**.)
+- **Last hardcoded 384 in `test_integration.py`.** `np.random.randn(384)` on
+  line 238 missed in the earlier pass. Now uses EMBEDDING_DIM like the rest.
+  (Contributed by **Whishp**.)
+- **Plugin directory named `mnemosyne` shadows pip package.** Hermes adds
+  `~/.hermes/plugins/` to `sys.path`, so a symlink named `mnemosyne` resolves
+  before the actual `mnemosyne-memory` pip package, causing `ModuleNotFoundError`
+  on `from mnemosyne.core.memory import Mnemosyne`. The try/except swallowed
+  this silently — tools never registered. Renamed to `hermes-mnemosyne`.
+  (Fixes #212.)
+- **Cross-session deletion of scope=global memories blocked.** `forget_working()`
+  used `WHERE id = ? AND session_id = ?`, preventing deletion of global memories
+  returned by recall() from a different session. Now uses the same pattern as
+  `invalidate()`: `WHERE id = ? AND (session_id = ? OR scope = 'global')`.
+  (Fixes #204.)
+- **`_vec_insert()` ran inside deferred transaction.** sqlite-vec virtual table
+  writes were silently lost when the transaction never committed. Now commits
+  after each `_vec_insert` call. (Contributed by **chinesewebman**.)
+- **`shutil.rmtree()` crashes on symlink targets.** Users who installed via
+  `deploy_hermes_provider.sh` have a symlink at `~/.hermes/plugins/mnemosyne/`.
+  `shutil.rmtree()` raises `Cannot call rmtree on a symbolic link`. Fixed with
+  `is_symlink()` detection and `unlink()` fallback.
+- **Directory junctions used on Windows.** Instead of symlinks (which require
+  admin), the installer now creates directory junctions. No admin required.
+- **Dead `hermes_plugin` tests breaking CI collection.** 4 test files still
+  imported from the removed `hermes_plugin/` directory, causing
+  `ModuleNotFoundError` and killing the entire test suite. Deleted:
+  `test_hermes_plugin_session.py`, `test_hermes_plugin_tools.py`,
+  `test_c13_memory_context_single_injection.py`,
+  `test_c27_provider_init_error_visible.py`. Pruned 2 MCP-routing classes
+  from `test_e6a_followup_gaps.py`.
 
-## [3.1.2] — 2026-05-28
+### Changed
+
+- **refactor: modular Hermes provider.** Split the 2007-line `__init__.py`
+  monolith into 5 clean modules: `tools.py` (460L — 23 tool schemas),
+  `__init__.py` (1515L — MemoryProvider), `audit.py` (138L),
+  `cli.py` (332L), `hermes_llm_adapter.py` (164L). Moved to
+  `integrations/hermes/src/mnemosyne_hermes/` following the MemoriLabs
+  pattern. Ships as standalone `mnemosyne-hermes` pip package. Removed
+  legacy `hermes_plugin/` directory, root `plugin.yaml`, and
+  `deploy_hermes_provider.sh` hack.
+- **refactor: consolidate `extensions/` and `hermes/` into `integrations/`.**
+  Single directory for all external adapters: `integrations/hermes/`,
+  `integrations/obsidian-mnemosyne/`, `integrations/vscode-mnemosyne/`.
+  Python-package integrations stay in `mnemosyne/integrations/`.
+- **Drop Python 3.9 CI support.** EOL since Nov 2025. `requires-python`
+  bumped to `>=3.10` in `pyproject.toml` and `setup.py`. MCP and OpenClaw
+  extras already gated on `>=3.10`, so this formalizes existing behavior.
+- **`MNEMOSYNE_EMBEDDING_API_URL` env var no longer falls back to
+  `OPENROUTER_BASE_URL`.** Embedding providers are independent of the
+  general routing endpoint.
+
+### Documentation
+
+- **LongMemEval 98.9% recall benchmark restored** to README alongside BEAM
+  numbers. Comparison table now shows both: `65.2% BEAM / 98.9% LongMem`.
+- **Hermes Plugin section** revamped: 23 tools in 5 categories, pip install
+  `mnemosyne-hermes` flow, `hermes tools disable memory` step, updated TOC.
+- **Standalone README** for `mnemosyne-hermes`: Memori-inspired, no em-dashes,
+  professional formatting, header image.
+- **Hermes-first positioning** in root README.
+- **Advise disabling built-in Hermes memory** when using Mnemosyne (prevents
+  double-injection and token waste).
+- **Multilingual embedding setup** documented in README with `MNEMOSYNE_EMBEDDING_MODEL`
+  env var and Language Support section.
+- **New env vars documented** in `integrations/hermes/README.md` config table:
+  `SYNC_TURN_USER_LIMIT`, `SYNC_TURN_ASSISTANT_LIMIT`, `FACT_RECALL_ENABLED`,
+  `PREFETCH_CONTENT_CHARS`.
+- **Install script link fixed** in `hermes-mcp.md`. (Contributed by
+  **Joao Fernandes**, PR #201.)
+- **UPDATING.md** updated for v3.1.2 release notes.
+
+### Tests
+
+- 26 tests for `sync_roles` config (bitr8)
+- 8 tests for sync_turn content limit env vars
+- 4 tests for fact recall integration
+- 5 tests for auto-scope-global
+- Pre-existing fact concurrency, polyphonic, and prefetch tests preserved and passing
+
+**Contributors:** Abdias J, Whishp, mia-fourier, bitr8, chinesewebman, Joao Fernandes
 
 ### Fixed
 
