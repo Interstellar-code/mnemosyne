@@ -259,6 +259,7 @@ class TestToolHandlers:
             "mode": "beam",
             "beam": {"working_memory": {}, "episodic_memory": {}}
         }
+        mock_mnemosyne._session_id = "test-session-123"
         with patch("mnemosyne.mcp_tools._create_instance", return_value=mock_mnemosyne):
             result = handle_tool_call("mnemosyne_stats", {
                 "bank": "default"
