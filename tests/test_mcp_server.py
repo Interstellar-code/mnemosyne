@@ -223,8 +223,10 @@ class TestToolHandlers:
                 "bank": "default"
             })
         assert result["status"] == "consolidated"
-        assert result["dry_run"] is False
         assert "result" in result
+        assert "working" in result
+        assert "episodic" in result
+        assert result["bank"] == "default"
         mock_mnemosyne.sleep.assert_called_once_with(dry_run=False)
 
     def test_handle_scratchpad_read(self, mock_mnemosyne):
@@ -248,6 +250,15 @@ class TestToolHandlers:
 
     def test_handle_get_stats(self, mock_mnemosyne):
         """handle_get_stats returns JSON-serializable stats."""
+        mock_mnemosyne.get_stats.return_value = {
+            "total_memories": 42,
+            "total_sessions": 3,
+            "sources": {"conversation": 30, "file": 12},
+            "last_memory": "2026-04-29T01:00:00",
+            "database": "/test/db",
+            "mode": "beam",
+            "beam": {"working_memory": {}, "episodic_memory": {}}
+        }
         with patch("mnemosyne.mcp_tools._create_instance", return_value=mock_mnemosyne):
             result = handle_tool_call("mnemosyne_stats", {
                 "bank": "default"
