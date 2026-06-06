@@ -117,6 +117,36 @@ def _format_prefetch_content(content: str, limit: int) -> str:
     return f"{cut}..."
 
 
+# Low-quality fragment filter for prefetch.
+#
+# The regex fact extractor can emit bare single-token "facts" (a stray adverb, a
+# particle, or a truncated word). Such tokens FTS-match common query words and can
+# outrank real memories in the per-turn prefetch window. A real, injectable memory
+# is a phrase, not a lone token, so drop lone short/stopword tokens. Exact- and
+# length-based only, so genuine short multi-word facts are never affected.
+_PREFETCH_FRAGMENT_STOPWORDS = frozenset({
+    "still", "what", "most", "almost", "back", "now", "too", "right",
+    "being", "going", "here", "there", "then", "just", "also", "only",
+    "even", "very", "really", "again", "away", "off", "out", "up",
+    "down", "over", "that", "this", "it", "so",
+})
+_PREFETCH_MIN_FRAGMENT_CHARS = 8   # lone tokens shorter than this are dropped
+_PREFETCH_OVERFETCH = 16           # recall more, then filter junk and cap
+_PREFETCH_TOP_K = 8                # final injected count (unchanged behavior)
+
+
+def _is_low_quality_prefetch(content: str) -> bool:
+    """True if recalled content is a bare single-token fragment with no value as
+    injected context. Multi-word phrases always pass."""
+    c = (content or "").strip()
+    if not c:
+        return True
+    if len(c.split()) <= 1 and (len(c) <= _PREFETCH_MIN_FRAGMENT_CHARS
+                                or c.lower() in _PREFETCH_FRAGMENT_STOPWORDS):
+        return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Tool schemas
 # ---------------------------------------------------------------------------
@@ -1113,7 +1143,7 @@ class MnemosyneMemoryProvider(MemoryProvider):
             import os
             author_id = self._beam.author_id or os.environ.get("MNEMOSYNE_AUTHOR_ID")
             recall_kwargs: Dict[str, Any] = dict(
-                query=query, top_k=8,
+                query=query, top_k=_PREFETCH_OVERFETCH,  # over-fetch; junk filtered below
                 temporal_weight=0.2, temporal_halflife=48,
             )
             # Only pass author_id when explicitly non-empty.  Passing an empty
@@ -1135,9 +1165,12 @@ class MnemosyneMemoryProvider(MemoryProvider):
             MIN_IMPORTANCE_THRESHOLD = 0.5
             filtered = [
                 r for r in results
-                if r.get("score", 0) >= MIN_SCORE_THRESHOLD
-                or r.get("importance", 0) >= MIN_IMPORTANCE_THRESHOLD
+                if (r.get("score", 0) >= MIN_SCORE_THRESHOLD
+                    or r.get("importance", 0) >= MIN_IMPORTANCE_THRESHOLD)
+                and not _is_low_quality_prefetch(r.get("content", ""))
             ]
+            # Cap back to the intended injection size after over-fetch+filter.
+            filtered = filtered[:_PREFETCH_TOP_K]
             if not filtered:
                 return ""
             lines = ["## Mnemosyne Context"]
