@@ -131,14 +131,13 @@ def _inject_config_table(config_page_path, table):
         f.write(result)
 
 
-def main():
-    version = _version()
-    schema = _config_schema()
-
-    # Use absolute paths relative to known repo locations
-    _script_dir = os.path.dirname(os.path.abspath(__file__))
-    _repo_root = os.path.dirname(_script_dir)
-    docs_root = os.path.normpath(os.path.join(_repo_root, '..', 'mnemosyne-docs', 'src'))
+def _write_website_mirror(docs_root, version, schema):
+    """Write tool schema + config + metadata to the website sibling repo.
+    Gracefully skips if the sibling repo doesn't exist (CI runners, bare checkouts).
+    """
+    if not os.path.isdir(docs_root):
+        print(f'  ⚠️  Sibling docs repo not found — skipping website mirror')
+        return
 
     # 1. Tool schema page
     tool_page = os.path.join(
@@ -174,6 +173,33 @@ def main():
         json.dump(meta, f, indent=2)
     print('  Provider metadata')
     print('')
+
+
+def main():
+    version = _version()
+    schema = _config_schema()
+
+    # Use absolute paths relative to known repo locations
+    _script_dir = os.path.dirname(os.path.abspath(__file__))
+    _repo_root = os.path.dirname(_script_dir)
+
+    # Canonical copies: always write to docs/api/ inside this repo
+    canonical_root = os.path.join(_repo_root, 'docs', 'api')
+    os.makedirs(canonical_root, exist_ok=True)
+
+    tool_schema_dest = os.path.join(canonical_root, 'tool-schema.mdx')
+    with open(tool_schema_dest, 'w') as f:
+        f.write(_gen_tool_schema(ALL_TOOL_SCHEMAS, version))
+
+    config_dest = os.path.join(canonical_root, 'configuration.mdx')
+    with open(config_dest, 'w') as f:
+        f.write(_gen_config_table(schema))
+
+    print('  Canonical docs written to docs/api/')
+
+    # Website mirror (sibling repo — skip if unavailable)
+    docs_root = os.path.normpath(os.path.join(_repo_root, '..', 'mnemosyne-docs', 'src'))
+    _write_website_mirror(docs_root, version, schema)
 
 
 if __name__ == '__main__':
