@@ -52,6 +52,8 @@ def register_cli(subparser):
     import_cmd.add_argument("--generate-script", action="store_true", help="Generate a migration script for the provider")
     import_cmd.add_argument("--agentic", action="store_true", help="Generate agent migration instructions (prompt to give your AI agent)")
     import_cmd.add_argument("--output-script", type=str, help="Save generated script to file")
+    import_cmd.add_argument("--db-path", type=str, help="Holographic memory store path (default: ~/.hermes/memory_store.db)")
+    import_cmd.add_argument("--min-trust", type=float, default=0.0, help="Minimum trust score threshold 0.0-1.0 (holographic only)")
 
     subparser.set_defaults(func=mnemosyne_command)
 
@@ -258,6 +260,36 @@ def mnemosyne_command(args):
                     }
                     result = import_from_provider(
                         "hindsight", mem,
+                        **import_kwargs,
+                    )
+                    _print_import_result(result)
+                    return 0 if result.failed == 0 else 1
+                except ValueError as e:
+                    print(f"Error: {e}")
+                    return 1
+                except Exception as e:
+                    print(f"Import failed: {e}")
+                    return 1
+
+            if cross_provider == "holographic":
+                db_path = getattr(args, "db_path", None)
+                min_trust = getattr(args, "min_trust", 0.0)
+
+                print("Importing from holographic memory...")
+                if dry_run:
+                    print("  (dry-run mode: no memories will be written)")
+
+                try:
+                    from mnemosyne.core.importers import import_from_provider
+                    import_kwargs = {
+                        "db_path": db_path,
+                        "min_trust": min_trust,
+                        "dry_run": dry_run,
+                        "session_id": session_id,
+                        "channel_id": channel_id,
+                    }
+                    result = import_from_provider(
+                        "holographic", mem,
                         **import_kwargs,
                     )
                     _print_import_result(result)
