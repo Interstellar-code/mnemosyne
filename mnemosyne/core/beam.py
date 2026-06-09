@@ -1978,6 +1978,13 @@ class BeamMemory:
         from mnemosyne.core.annotations import AnnotationStore
         self.annotations = AnnotationStore(db_path=self.db_path, conn=self.conn)
 
+        # Owner-scoped canonical (single-source-of-truth) facts (issue #256).
+        # Shares this BeamMemory's thread-local connection like AnnotationStore.
+        # Lazily wired and additive — opening an existing DB just creates the
+        # canonical_facts table on first init; nothing else changes.
+        from mnemosyne.core.canonical import CanonicalStore
+        self.canonical = CanonicalStore(db_path=self.db_path, conn=self.conn)
+
         # Phase 3: Episodic graph (shared connection)
         self.episodic_graph = None
         if EpisodicGraph is not None:

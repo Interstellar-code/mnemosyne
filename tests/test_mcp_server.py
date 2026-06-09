@@ -21,9 +21,11 @@ class TestToolSchemas:
     """Verify tool schemas match MCP spec and are valid JSON."""
 
     def test_all_tools_present(self):
-        """All 23 tools must be defined."""
+        """All 25 tools must be defined."""
         names = [t["name"] for t in TOOLS]
-        assert len(names) == 23
+        assert len(names) == 25
+        assert "mnemosyne_remember_canonical" in names
+        assert "mnemosyne_recall_canonical" in names
         assert "mnemosyne_remember" in names
         assert "mnemosyne_recall" in names
         assert "mnemosyne_sleep" in names
@@ -301,9 +303,9 @@ class TestMCPIntegration:
         assert hasattr(mcp_tools, "handle_tool_call")
 
     def test_get_tool_definitions_returns_all(self):
-        """get_tool_definitions returns all 23 tools."""
+        """get_tool_definitions returns all 25 tools."""
         tools = get_tool_definitions()
-        assert len(tools) == 23
+        assert len(tools) == 25
         names = [t["name"] for t in tools]
         assert "mnemosyne_remember" in names
 

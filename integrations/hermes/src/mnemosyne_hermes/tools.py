@@ -273,6 +273,51 @@ TRIPLE_QUERY_SCHEMA = {
     },
 }
 
+REMEMBER_CANONICAL_SCHEMA = {
+    "name": "mnemosyne_remember_canonical",
+    "description": (
+        "Store a CANONICAL (single-source-of-truth) self-fact for the current "
+        "profile. Each (category, name) slot holds exactly one current value: "
+        "restating the same body is a no-op, and a new body supersedes the old "
+        "one (kept as history). Use for stable identity cards — name, voice, "
+        "stable preferences, relationships — that must not contradict themselves "
+        "over time. Scoped privately to this profile. For relational facts use "
+        "mnemosyne_triple_add; for episodic recall use mnemosyne_remember."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "category": {"type": "string", "description": "Slot group, e.g. 'identity', 'voice', 'preference'"},
+            "name": {"type": "string", "description": "Slot key within the category, e.g. 'name', 'pronouns'"},
+            "body": {"type": "string", "description": "The authoritative free-text value for this slot"},
+            "source": {"type": "string", "description": "Optional provenance label", "default": ""},
+            "confidence": {"type": "number", "description": "Optional 0..1 confidence", "default": 1.0},
+        },
+        "required": ["category", "name", "body"],
+    },
+}
+
+RECALL_CANONICAL_SCHEMA = {
+    "name": "mnemosyne_recall_canonical",
+    "description": (
+        "Read CANONICAL self-facts for the current profile. With category+name: "
+        "return the single authoritative value for that slot. With category "
+        "only: list that category's slots. With query: substring-search the "
+        "profile's canonical values. With nothing: list all canonical slots. "
+        "Set include_history=true to also return superseded versions of a slot."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "category": {"type": "string", "default": ""},
+            "name": {"type": "string", "default": ""},
+            "query": {"type": "string", "description": "Substring search across the profile's canonical values", "default": ""},
+            "include_history": {"type": "boolean", "description": "Include superseded versions (requires category+name)", "default": False},
+            "limit": {"type": "integer", "description": "Max results for query/list modes", "default": 10},
+        },
+    },
+}
+
 SCRATCHPAD_WRITE_SCHEMA = {
     "name": "mnemosyne_scratchpad_write",
     "description": "Write a temporary note to the Mnemosyne scratchpad.",
@@ -454,6 +499,7 @@ ALL_TOOL_SCHEMAS = [
     REMEMBER_SCHEMA, RECALL_SCHEMA, SHARED_REMEMBER_SCHEMA, SHARED_RECALL_SCHEMA,
     SHARED_FORGET_SCHEMA, SHARED_STATS_SCHEMA, SLEEP_SCHEMA, STATS_SCHEMA,
     INVALIDATE_SCHEMA, VALIDATE_SCHEMA, GET_SCHEMA, TRIPLE_ADD_SCHEMA, TRIPLE_QUERY_SCHEMA,
+    REMEMBER_CANONICAL_SCHEMA, RECALL_CANONICAL_SCHEMA,
     SCRATCHPAD_WRITE_SCHEMA, SCRATCHPAD_READ_SCHEMA, SCRATCHPAD_CLEAR_SCHEMA,
     EXPORT_SCHEMA, UPDATE_SCHEMA, FORGET_SCHEMA, IMPORT_SCHEMA, DIAGNOSE_SCHEMA,
     GRAPH_QUERY_SCHEMA, GRAPH_LINK_SCHEMA,

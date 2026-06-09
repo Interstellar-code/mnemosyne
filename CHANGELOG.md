@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
+## [3.5.0] — 2026-06-09
+
+### Added
+
+- **Owner-scoped canonical (single-source-of-truth) facts** (issue #256). A new
+  `CanonicalStore` (`mnemosyne/core/canonical.py`) gives long-running personas an
+  identity layer where each `(owner_id, category, name)` slot holds exactly one
+  current value. Restating a stable self-fact is a no-op (no duplicate
+  accumulation); a new value supersedes the old one, which is preserved as
+  history — the TripleStore `valid_until` pattern, extended with an owner
+  dimension. Implemented as **one SQLite table plus a partial unique index**
+  (`… WHERE valid_until IS NULL`); no new dependency, no FTS table.
+  - Two new tools, `mnemosyne_remember_canonical` and `mnemosyne_recall_canonical`
+    (the latter covers exact-slot read, category/whole-bank listing, version
+    history, and owner-scoped substring search). Exposed on both the Hermes
+    provider and the MCP surface — total tool count 23 → 25.
+  - `BeamMemory` now exposes `self.canonical`, sharing its thread-local
+    connection (no extra file descriptor), mirroring `self.annotations`.
+  - Owner isolation is enforced by construction: the provider derives `owner_id`
+    from the active profile identity and never reads it from tool args, so one
+    profile cannot read or write another's canonical bank. The shared surface is
+    untouched and keeps its cross-profile role.
+  - Fully additive and opt-in: the `canonical_facts` table is created lazily on
+    first init; existing tables, tools, and recall output are unchanged.
+
 ## [3.4.0] — 2026-06-01
 
 ### Added

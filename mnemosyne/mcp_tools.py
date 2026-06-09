@@ -570,6 +570,85 @@ def _handle_triple_query(arguments: Dict[str, Any]) -> Dict[str, Any]:
     return {"results_count": len(results), "results": results, "store": "triples"}
 
 
+def _canonical_owner(arguments: Dict[str, Any]) -> str:
+    """Owner id for canonical ops over the MCP surface.
+
+    The shared tool schema does not expose owner_id (so an LLM can't target
+    another owner's bank); over MCP the owner is a deployment-level setting via
+    MNEMOSYNE_DEFAULT_OWNER, defaulting to "default" for single-owner use."""
+    return (os.environ.get("MNEMOSYNE_DEFAULT_OWNER") or "default").strip() or "default"
+
+
+def _handle_remember_canonical(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle mnemosyne_remember_canonical tool call."""
+    from mnemosyne.core.canonical import CanonicalStore
+
+    category = (arguments.get("category") or "").strip()
+    name = (arguments.get("name") or "").strip()
+    body = (arguments.get("body") or "").strip()
+    if not category or not name:
+        return {"error": "category and name are required"}
+    if not body:
+        return {"error": "body is required"}
+
+    bank = _resolve_bank(arguments)
+    mem = _create_instance(bank=bank)
+    store = getattr(mem.beam, "canonical", None)
+    if store is None:
+        db_path = mem.beam.db_path if hasattr(mem.beam, "db_path") else mem.db_path
+        store = CanonicalStore(db_path=db_path, conn=mem.beam.conn)
+
+    owner_id = _canonical_owner(arguments)
+    row = store.remember(
+        owner_id, category, name, body,
+        source=arguments.get("source", "canonical_tool"),
+        confidence=arguments.get("confidence", 1.0),
+    )
+    status = row.pop("status", "stored")
+    return {"status": status, "owner_id": owner_id, "category": category,
+            "name": name, "version": row.get("version"), "store": "canonical"}
+
+
+def _handle_recall_canonical(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle mnemosyne_recall_canonical tool call."""
+    from mnemosyne.core.canonical import CanonicalStore
+
+    category = (arguments.get("category") or "").strip()
+    name = (arguments.get("name") or "").strip()
+    query = (arguments.get("query") or "").strip()
+    include_history = bool(arguments.get("include_history", False))
+    try:
+        limit = int(arguments.get("limit", 10))
+    except (TypeError, ValueError):
+        limit = 10
+
+    bank = _resolve_bank(arguments)
+    mem = _create_instance(bank=bank)
+    store = getattr(mem.beam, "canonical", None)
+    if store is None:
+        db_path = mem.beam.db_path if hasattr(mem.beam, "db_path") else mem.db_path
+        store = CanonicalStore(db_path=db_path, conn=mem.beam.conn)
+    owner_id = _canonical_owner(arguments)
+
+    if query:
+        results = store.search(owner_id, query, limit=limit)
+        return {"mode": "search", "owner_id": owner_id, "query": query,
+                "results_count": len(results), "results": results, "store": "canonical"}
+    if category and name:
+        if include_history:
+            results = store.history(owner_id, category, name)
+            return {"mode": "history", "owner_id": owner_id, "category": category,
+                    "name": name, "results_count": len(results),
+                    "results": results, "store": "canonical"}
+        row = store.recall(owner_id, category, name)
+        return {"mode": "recall", "owner_id": owner_id, "category": category,
+                "name": name, "found": row is not None, "result": row,
+                "store": "canonical"}
+    results = store.list(owner_id, category=category or None)
+    return {"mode": "list", "owner_id": owner_id, "category": category or None,
+            "results_count": len(results), "results": results, "store": "canonical"}
+
+
 def _handle_scratchpad_write(arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Handle mnemosyne_scratchpad_write tool call."""
     content = arguments.get("content", "").strip()
@@ -760,6 +839,8 @@ _TOOL_HANDLERS = {
     "mnemosyne_get": _handle_get,
     "mnemosyne_triple_add": _handle_triple_add,
     "mnemosyne_triple_query": _handle_triple_query,
+    "mnemosyne_remember_canonical": _handle_remember_canonical,
+    "mnemosyne_recall_canonical": _handle_recall_canonical,
     "mnemosyne_scratchpad_write": _handle_scratchpad_write,
     "mnemosyne_scratchpad_read": _handle_scratchpad_read,
     "mnemosyne_scratchpad_clear": _handle_scratchpad_clear,

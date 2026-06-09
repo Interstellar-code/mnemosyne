@@ -52,7 +52,13 @@ class TestToolRegistration:
     def test_all_tools_registered(self, tmp_path):
         provider = _provider(tmp_path)
         names = _tool_names(provider)
-        assert len(names) == 23, f"Expected 23 tools, got {len(names)}"
+        assert len(names) == 25, f"Expected 25 tools, got {len(names)}"
+
+    def test_canonical_tools_present(self, tmp_path):
+        provider = _provider(tmp_path)
+        names = _tool_names(provider)
+        for tool in ("remember_canonical", "recall_canonical"):
+            assert f"mnemosyne_{tool}" in names
 
     def test_new_8_tools_present(self, tmp_path):
         provider = _provider(tmp_path)

@@ -538,6 +538,46 @@ triples = store.get_triples_for_subject("memory_id_abc")
 
 ---
 
+## CanonicalStore (Single Source of Truth)
+
+**Module:** `mnemosyne.core.canonical`
+
+Owner-scoped canonical facts. Each `(owner_id, category, name)` slot holds
+exactly **one** current value — the right home for a persona's stable identity
+cards (name, voice, durable preferences) that must not contradict themselves
+over time. Restating a value is a no-op; a new value supersedes the old one,
+which is preserved as history (the TripleStore `valid_until` pattern, with an
+owner dimension). Backed by one SQLite table plus a partial unique index — no
+new dependency.
+
+```python
+from mnemosyne.core.canonical import CanonicalStore
+
+store = CanonicalStore(db_path)
+
+# Upsert the canonical value for a slot (returns the current row + status).
+store.remember("jessi", "identity", "name", "My name is Jessi.")   # status="created"
+store.remember("jessi", "identity", "name", "My name is Jessi.")   # status="unchanged" (no-op)
+store.remember("jessi", "identity", "name", "I go by Jess now.")    # status="updated"
+
+store.recall("jessi", "identity", "name")["body"]      # "I go by Jess now."
+store.list("jessi")                                    # all current slots for the owner
+store.list("jessi", category="identity")               # one category
+store.history("jessi", "identity", "name")             # every version, newest first
+store.search("jessi", "Jess")                          # owner-scoped substring search
+store.forget("jessi", "identity", "name")              # retire a slot (kept as history)
+```
+
+When used through `BeamMemory` the store is available as `beam.canonical`,
+sharing the beam's connection. Two profiles each get an isolated namespace via
+`owner_id`; the shared surface remains the place for *cross-profile* sharing.
+
+Exposed as the `mnemosyne_remember_canonical` and `mnemosyne_recall_canonical`
+tools (see below). The provider derives `owner_id` from the active profile, so a
+profile cannot reach another profile's canonical bank.
+
+---
+
 ## MCP Server
 
 **Module:** `mnemosyne.mcp_server`

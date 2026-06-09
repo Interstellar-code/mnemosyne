@@ -531,6 +531,51 @@ TRIPLE_QUERY_SCHEMA = {
     },
 }
 
+REMEMBER_CANONICAL_SCHEMA = {
+    "name": "mnemosyne_remember_canonical",
+    "description": (
+        "Store a CANONICAL (single-source-of-truth) self-fact for the current "
+        "profile. Each (category, name) slot holds exactly one current value: "
+        "restating the same body is a no-op, and a new body supersedes the old "
+        "one (kept as history). Use for stable identity cards — name, voice, "
+        "stable preferences, relationships — that must not contradict themselves "
+        "over time. Scoped privately to this profile. For relational facts use "
+        "mnemosyne_triple_add; for episodic recall use mnemosyne_remember."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "category": {"type": "string", "description": "Slot group, e.g. 'identity', 'voice', 'preference'"},
+            "name": {"type": "string", "description": "Slot key within the category, e.g. 'name', 'pronouns'"},
+            "body": {"type": "string", "description": "The authoritative free-text value for this slot"},
+            "source": {"type": "string", "description": "Optional provenance label", "default": ""},
+            "confidence": {"type": "number", "description": "Optional 0..1 confidence", "default": 1.0},
+        },
+        "required": ["category", "name", "body"],
+    },
+}
+
+RECALL_CANONICAL_SCHEMA = {
+    "name": "mnemosyne_recall_canonical",
+    "description": (
+        "Read CANONICAL self-facts for the current profile. With category+name: "
+        "return the single authoritative value for that slot. With category "
+        "only: list that category's slots. With query: substring-search the "
+        "profile's canonical values. With nothing: list all canonical slots. "
+        "Set include_history=true to also return superseded versions of a slot."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "category": {"type": "string", "default": ""},
+            "name": {"type": "string", "default": ""},
+            "query": {"type": "string", "description": "Substring search across the profile's canonical values", "default": ""},
+            "include_history": {"type": "boolean", "description": "Include superseded versions (requires category+name)", "default": False},
+            "limit": {"type": "integer", "description": "Max results for query/list modes", "default": 10},
+        },
+    },
+}
+
 SCRATCHPAD_WRITE_SCHEMA = {
     "name": "mnemosyne_scratchpad_write",
     "description": "Write a temporary note to the Mnemosyne scratchpad.",
@@ -712,6 +757,7 @@ ALL_TOOL_SCHEMAS = [
     REMEMBER_SCHEMA, RECALL_SCHEMA, SHARED_REMEMBER_SCHEMA, SHARED_RECALL_SCHEMA,
     SHARED_FORGET_SCHEMA, SHARED_STATS_SCHEMA, SLEEP_SCHEMA, STATS_SCHEMA,
     INVALIDATE_SCHEMA, VALIDATE_SCHEMA, GET_SCHEMA, TRIPLE_ADD_SCHEMA, TRIPLE_QUERY_SCHEMA,
+    REMEMBER_CANONICAL_SCHEMA, RECALL_CANONICAL_SCHEMA,
     SCRATCHPAD_WRITE_SCHEMA, SCRATCHPAD_READ_SCHEMA, SCRATCHPAD_CLEAR_SCHEMA,
     EXPORT_SCHEMA, UPDATE_SCHEMA, FORGET_SCHEMA, IMPORT_SCHEMA, DIAGNOSE_SCHEMA,
     GRAPH_QUERY_SCHEMA, GRAPH_LINK_SCHEMA,
@@ -1475,6 +1521,10 @@ class MnemosyneMemoryProvider(MemoryProvider):
                 return self._handle_triple_add(args)
             elif tool_name == "mnemosyne_triple_query":
                 return self._handle_triple_query(args)
+            elif tool_name == "mnemosyne_remember_canonical":
+                return self._handle_remember_canonical(args)
+            elif tool_name == "mnemosyne_recall_canonical":
+                return self._handle_recall_canonical(args)
             elif tool_name == "mnemosyne_scratchpad_write":
                 return self._handle_scratchpad_write(args)
             elif tool_name == "mnemosyne_scratchpad_read":
@@ -1910,6 +1960,84 @@ class MnemosyneMemoryProvider(MemoryProvider):
         results = query_triples(subject=subject, predicate=predicate, object=obj,
                                 db_path=self._beam.db_path)
         return json.dumps({"count": len(results), "results": results})
+
+    def _canonical_owner(self) -> str:
+        """Owner id for canonical reads/writes: the active profile identity.
+
+        Derived internally and never taken from tool args, so a profile cannot
+        read or write another profile's canonical bank — owner isolation is
+        enforced by construction. Falls back to "default" when no profile
+        identity is set (single-profile / non-persona deployments)."""
+        return (getattr(self, "_agent_identity", None) or "").strip() or "default"
+
+    def _handle_remember_canonical(self, args: Dict[str, Any]) -> str:
+        category = (args.get("category") or "").strip()
+        name = (args.get("name") or "").strip()
+        body = (args.get("body") or "").strip()
+        if not category or not name:
+            return json.dumps({"error": "category and name are required"})
+        if not body:
+            return json.dumps({"error": "body is required"})
+        source = args.get("source") or "canonical_tool"
+        try:
+            confidence = float(args.get("confidence", 1.0))
+        except (TypeError, ValueError):
+            confidence = 1.0
+        owner_id = self._canonical_owner()
+        row = self._beam.canonical.remember(
+            owner_id, category, name, body,
+            source=source, confidence=confidence,
+        )
+        status = row.pop("status", "stored")
+        self._audit_event(
+            "remember_canonical", bank="canonical",
+            source_tool="mnemosyne_remember_canonical",
+            metadata={"category": category, "name": name, "status": status,
+                      "version": row.get("version")},
+        )
+        return json.dumps({
+            "status": status,
+            "owner_id": owner_id,
+            "category": category,
+            "name": name,
+            "version": row.get("version"),
+            "body_preview": body[:120],
+        })
+
+    def _handle_recall_canonical(self, args: Dict[str, Any]) -> str:
+        category = (args.get("category") or "").strip()
+        name = (args.get("name") or "").strip()
+        query = (args.get("query") or "").strip()
+        include_history = bool(args.get("include_history", False))
+        try:
+            limit = int(args.get("limit", 10))
+        except (TypeError, ValueError):
+            limit = 10
+        owner_id = self._canonical_owner()
+        store = self._beam.canonical
+
+        # Free-text search mode.
+        if query:
+            results = store.search(owner_id, query, limit=limit)
+            return json.dumps({"mode": "search", "owner_id": owner_id,
+                               "query": query, "count": len(results),
+                               "results": results})
+        # Exact slot read (optionally with history).
+        if category and name:
+            if include_history:
+                results = store.history(owner_id, category, name)
+                return json.dumps({"mode": "history", "owner_id": owner_id,
+                                   "category": category, "name": name,
+                                   "count": len(results), "results": results})
+            row = store.recall(owner_id, category, name)
+            return json.dumps({"mode": "recall", "owner_id": owner_id,
+                               "category": category, "name": name,
+                               "found": row is not None, "result": row})
+        # List mode (whole bank, or one category).
+        results = store.list(owner_id, category=category or None)
+        return json.dumps({"mode": "list", "owner_id": owner_id,
+                           "category": category or None,
+                           "count": len(results), "results": results})
 
     def _handle_scratchpad_write(self, args: Dict[str, Any]) -> str:
         content = args.get("content", "").strip()
