@@ -79,9 +79,10 @@ def _remove_link(link_path: Path) -> None:
 
 
 def _ensure_link() -> bool:
-    """Create the plugin link from ~/.hermes/plugins/hermes-mnemosyne -> hermes_memory_provider.
+    """Create the plugin link from ~/.hermes/plugins/mnemosyne -> hermes_memory_provider.
 
     Uses symlinks on POSIX, directory junctions on Windows (no admin required).
+    Automatically migrates from old plugin directory name (hermes-mnemosyne).
     """
     hermes_home = _get_hermes_home()
     if not hermes_home:
@@ -92,12 +93,32 @@ def _ensure_link() -> bool:
     plugins_dir = hermes_home / "plugins"
     plugins_dir.mkdir(parents=True, exist_ok=True)
 
-    target = plugins_dir / "hermes-mnemosyne"
+    target = plugins_dir / "mnemosyne"
     source = _get_mnemosyne_root() / "hermes_memory_provider"
 
     if not source.exists():
         print(f"❌ Mnemosyne MemoryProvider not found at {source}")
         return False
+
+    # Migrate from old plugin directory name (hermes-mnemosyne -> mnemosyne)
+    old_target = plugins_dir / "hermes-mnemosyne"
+    if old_target.is_symlink() or old_target.exists():
+        _remove_link(old_target)
+        print(f"🔄 Removed old plugin directory: {old_target}")
+
+    # Migrate config from old provider name
+    config_path = hermes_home / "config.yaml"
+    if config_path.is_file():
+        try:
+            config_text = config_path.read_text(encoding="utf-8")
+            if "provider: hermes-mnemosyne" in config_text:
+                new_text = config_text.replace(
+                    "provider: hermes-mnemosyne", "provider: mnemosyne"
+                )
+                config_path.write_text(new_text, encoding="utf-8")
+                print("🔄 Updated config: memory.provider hermes-mnemosyne -> mnemosyne")
+        except Exception:
+            pass
 
     # Remove existing link or directory
     if target.is_symlink() or target.exists():
@@ -227,15 +248,15 @@ def uninstall():
         print("❌ Hermes not found.")
         return
 
-    target = hermes_home / "plugins" / "hermes-mnemosyne"
-    if target.is_symlink() or target.exists():
-        if _is_windows():
-            _remove_link(target)
-        elif target.is_symlink():
-            target.unlink()
-        else:
-            import shutil
-            shutil.rmtree(target)
+    target = hermes_home / "plugins" / "mnemosyne"
+    old_target = hermes_home / "plugins" / "hermes-mnemosyne"
+
+    found = False
+    for t in [target, old_target]:
+        if t.is_symlink() or t.exists():
+            _remove_link(t)
+            found = True
+    if found:
         print(f"Removed {target}")
     else:
         print("ℹ️  Mnemosyne plugin not found in Hermes.")
