@@ -343,7 +343,7 @@ Edit `~/.hermes/config.yaml`:
 
 ```yaml
 memory:
-  enabled: false
+  memory_enabled: false
 user_profile_enabled: false
 ```
 

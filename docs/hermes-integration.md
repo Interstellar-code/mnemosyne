@@ -78,11 +78,11 @@ Edit `~/.hermes/config.yaml`:
 
 ```yaml
 memory:
-  enabled: false
+  memory_enabled: false
 user_profile_enabled: false
 ```
 
-The first turns off the file-based MEMORY.md system. The second stops USER.md injection. Both are redundant once Mnemosyne is active.
+`memory_enabled: false` turns off the file-based MEMORY.md system. `user_profile_enabled: false` stops USER.md injection. Both are redundant once Mnemosyne is active.
 
 ### Step 5: Verify
 
