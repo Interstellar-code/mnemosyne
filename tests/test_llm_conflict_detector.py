@@ -119,7 +119,7 @@ def test_beam_integration_with_llm_conflict(mock_call, temp_db):
         
         # Modify the timestamp of the first memory to be 14 hours older using Python ISO format
         from datetime import datetime, timedelta
-        id1_ts = (datetime.now() - timedelta(hours=14)).isoformat()
+        id1_ts = (datetime.now() - timedelta(hours=100)).isoformat()
         cursor = mem.conn.cursor()
         cursor.execute("UPDATE working_memory SET timestamp = ? WHERE id = ?", (id1_ts, id1))
         mem.conn.commit()
@@ -128,7 +128,7 @@ def test_beam_integration_with_llm_conflict(mock_call, temp_db):
         id2 = mem.remember("No wait, the project meeting is definitely on June 5th")
         
         # Modify the timestamp of the second memory to be 13 hours older using Python ISO format
-        id2_ts = (datetime.now() - timedelta(hours=13)).isoformat()
+        id2_ts = (datetime.now() - timedelta(hours=99)).isoformat()
         cursor.execute("UPDATE working_memory SET timestamp = ? WHERE id = ?", (id2_ts, id2))
         mem.conn.commit()
 

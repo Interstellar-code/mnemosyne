@@ -266,7 +266,12 @@ if _emb_dim_env is not None:
 else:
     EMBEDDING_DIM = _embeddings.EMBEDDING_DIM
 WORKING_MEMORY_MAX_ITEMS = int(os.environ.get("MNEMOSYNE_WM_MAX_ITEMS", "10000"))
-WORKING_MEMORY_TTL_HOURS = int(os.environ.get("MNEMOSYNE_WM_TTL_HOURS", "24"))
+WORKING_MEMORY_TTL_HOURS = int(os.environ.get("MNEMOSYNE_WM_TTL_HOURS", "168"))
+WM_BUMP_CAP_HOURS = int(os.environ.get("MNEMOSYNE_WM_BUMP_CAP_HOURS", "24"))
+WM_PINNED_IDS = set(
+    pid.strip() for pid in os.environ.get("MNEMOSYNE_WM_PINNED_IDS", "").split(",")
+    if pid.strip()
+)
 EPISODIC_RECALL_LIMIT = int(os.environ.get("MNEMOSYNE_EP_LIMIT", "50000"))
 SLEEP_BATCH_SIZE = int(os.environ.get("MNEMOSYNE_SLEEP_BATCH", "5000"))
 SCRATCHPAD_MAX_ITEMS = int(os.environ.get("MNEMOSYNE_SP_MAX", "1000"))
@@ -814,6 +819,9 @@ def init_beam(db_path: Path = None):
     _add_column_if_missing(conn, "working_memory", "last_recalled", "TIMESTAMP DEFAULT NULL")
     _add_column_if_missing(conn, "episodic_memory", "recall_count", "INTEGER DEFAULT 0")
     _add_column_if_missing(conn, "episodic_memory", "last_recalled", "TIMESTAMP DEFAULT NULL")
+
+    # --- Migration: pinned flag for usage-driven decay (v3.0) ---
+    _add_column_if_missing(conn, "working_memory", "pinned", "INTEGER DEFAULT 0")
 
     # --- Migration: temporal validity + scope (v2.2) ---
     _add_column_if_missing(conn, "working_memory", "valid_until", "TIMESTAMP DEFAULT NULL")
@@ -3037,7 +3045,13 @@ class BeamMemory:
     def get_context(self, limit: int = 10) -> List[Dict]:
         """Get working_memory for prompt injection.
         Global memories first, then sorted by importance (high first),
-        then by recency. High-importance rules/bans surface reliably."""
+        then by recency. High-importance rules/bans surface reliably.
+
+        Bumps recall_count and last_recalled on returned items, capped
+        so a single read cannot extend the effective clock by more than
+        WM_BUMP_CAP_HOURS. Prevents infinite extension of stale items
+        while keeping hot items visible."""
+
         cursor = self.conn.cursor()
         now = datetime.now().isoformat()
         cursor.execute("""
@@ -3052,7 +3066,40 @@ class BeamMemory:
                 timestamp DESC
             LIMIT ?
         """, (self.session_id, now, limit))
-        return [dict(row) for row in cursor.fetchall()]
+        rows = [dict(row) for row in cursor.fetchall()]
+        if not rows:
+            return rows
+
+        # Bump recall_count + last_recalled for every item returned.
+        # Each bump extends last_recalled by at most WM_BUMP_CAP_HOURS
+        # to prevent a single get_context() from fully resetting a stale item.
+        now_dt = datetime.now()
+        bump_delta = timedelta(hours=WM_BUMP_CAP_HOURS)
+        for row in rows:
+            # Read current values for this item
+            cursor.execute(
+                "SELECT last_recalled FROM working_memory WHERE id = ?",
+                (row["id"],)
+            )
+            cur = cursor.fetchone()
+            if cur is None:
+                continue
+            old_ts = cur["last_recalled"]
+            if old_ts is None:
+                new_last = now_dt
+            else:
+                try:
+                    parsed = datetime.fromisoformat(old_ts)
+                except (ValueError, TypeError):
+                    new_last = now_dt
+                else:
+                    new_last = min(now_dt, parsed + bump_delta)
+            cursor.execute(
+                "UPDATE working_memory SET recall_count = recall_count + 1, last_recalled = ? WHERE id = ?",
+                (new_last.isoformat(), row["id"])
+            )
+        self.conn.commit()
+        return rows
 
     def invalidate(self, memory_id: str, replacement_id: str = None) -> bool:
         """
@@ -6907,14 +6954,14 @@ class BeamMemory:
         # and miss the NULL rows. See Codex /review note for C9.
         # consolidated_at IS NULL filters out rows already processed by
         # a prior sleep so we don't re-summarize the same originals.
-        # E4.a.1: select veracity so the summary can inherit aggregated
-        # source-row trust signal (instead of defaulting to 'unknown').
+        # pinned = 1 items survive consolidation and stay in working memory.
         cursor.execute(f"""
             SELECT id, content, source, timestamp, importance, metadata_json, scope, valid_until, veracity
             FROM working_memory
             WHERE COALESCE(session_id, 'default') = ?
               AND timestamp < ?
               AND consolidated_at IS NULL
+              AND (pinned IS NULL OR pinned = 0)
             ORDER BY timestamp ASC
             LIMIT {SLEEP_BATCH_SIZE}
         """, (self.session_id, cutoff))

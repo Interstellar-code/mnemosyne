@@ -234,7 +234,7 @@ class TestE4a1SleepEndToEndVeracity:
         not the legacy 0.8 unknown default)."""
         monkeypatch.setattr("mnemosyne.core.local_llm.llm_available", lambda: False)
         beam = BeamMemory(session_id="s1", db_path=temp_db)
-        old_ts = (datetime.now() - timedelta(hours=20)).isoformat()
+        old_ts = (datetime.now() - timedelta(hours=200)).isoformat()
         self._seed_wm_with_veracity(temp_db, "s1", old_ts, [
             ("user wants feature A", "stated"),
             ("user wants feature B", "stated"),
@@ -255,7 +255,7 @@ class TestE4a1SleepEndToEndVeracity:
         """Majority stated, minority inferred → stated wins by count."""
         monkeypatch.setattr("mnemosyne.core.local_llm.llm_available", lambda: False)
         beam = BeamMemory(session_id="s1", db_path=temp_db)
-        old_ts = (datetime.now() - timedelta(hours=20)).isoformat()
+        old_ts = (datetime.now() - timedelta(hours=200)).isoformat()
         self._seed_wm_with_veracity(temp_db, "s1", old_ts, [
             ("explicit user fact 1", "stated"),
             ("explicit user fact 2", "stated"),
@@ -274,7 +274,7 @@ class TestE4a1SleepEndToEndVeracity:
         """2-stated + 2-inferred → tie → inferred wins (lower weight)."""
         monkeypatch.setattr("mnemosyne.core.local_llm.llm_available", lambda: False)
         beam = BeamMemory(session_id="s1", db_path=temp_db)
-        old_ts = (datetime.now() - timedelta(hours=20)).isoformat()
+        old_ts = (datetime.now() - timedelta(hours=200)).isoformat()
         self._seed_wm_with_veracity(temp_db, "s1", old_ts, [
             ("fact 1", "stated"),
             ("fact 2", "stated"),
@@ -294,7 +294,7 @@ class TestE4a1SleepEndToEndVeracity:
         the aggregator falls back to 'unknown' for them — back-compat."""
         monkeypatch.setattr("mnemosyne.core.local_llm.llm_available", lambda: False)
         beam = BeamMemory(session_id="s1", db_path=temp_db)
-        old_ts = (datetime.now() - timedelta(hours=20)).isoformat()
+        old_ts = (datetime.now() - timedelta(hours=200)).isoformat()
         # Insert via raw SQL with NULL veracity to simulate pre-E4 rows.
         conn = sqlite3.connect(temp_db)
         conn.execute(

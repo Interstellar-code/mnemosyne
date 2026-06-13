@@ -138,7 +138,7 @@ class TestWorkingMemory:
         beam = BeamMemory(session_id="s1", db_path=temp_db)
         # Insert old memory directly
         conn = sqlite3.connect(temp_db)
-        old_ts = (datetime.now() - timedelta(hours=25)).isoformat()
+        old_ts = (datetime.now() - timedelta(hours=200)).isoformat()
         conn.execute(
             "INSERT INTO working_memory (id, content, source, timestamp, session_id) VALUES (?, ?, ?, ?, ?)",
             ("old1", "old content", "conversation", old_ts, "s1")
@@ -191,7 +191,7 @@ class TestSleepCycle:
         beam = BeamMemory(session_id="s1", db_path=temp_db)
         # Inject old working memories
         conn = sqlite3.connect(temp_db)
-        old_ts = (datetime.now() - timedelta(hours=20)).isoformat()
+        old_ts = (datetime.now() - timedelta(hours=200)).isoformat()
         for i in range(3):
             conn.execute(
                 "INSERT INTO working_memory (id, content, source, timestamp, session_id) VALUES (?, ?, ?, ?, ?)",
@@ -211,7 +211,7 @@ class TestSleepCycle:
     def test_sleep_dry_run(self, temp_db):
         beam = BeamMemory(session_id="s1", db_path=temp_db)
         conn = sqlite3.connect(temp_db)
-        old_ts = (datetime.now() - timedelta(hours=20)).isoformat()
+        old_ts = (datetime.now() - timedelta(hours=200)).isoformat()
         conn.execute(
             "INSERT INTO working_memory (id, content, source, timestamp, session_id) VALUES (?, ?, ?, ?, ?)",
             ("old1", "task one", "conversation", old_ts, "s1")
@@ -229,7 +229,7 @@ class TestSleepCycle:
     def test_sleep_remains_session_scoped(self, temp_db):
         beam = BeamMemory(session_id="s1", db_path=temp_db)
         conn = sqlite3.connect(temp_db)
-        old_ts = (datetime.now() - timedelta(hours=20)).isoformat()
+        old_ts = (datetime.now() - timedelta(hours=200)).isoformat()
         conn.executemany(
             "INSERT INTO working_memory (id, content, source, timestamp, session_id) VALUES (?, ?, ?, ?, ?)",
             [
@@ -278,7 +278,7 @@ class TestSleepCycle:
 
         # Inject a memory that will be picked up by sleep()
         conn = sqlite3.connect(temp_db)
-        old_ts = (datetime.now() - timedelta(hours=20)).isoformat()
+        old_ts = (datetime.now() - timedelta(hours=200)).isoformat()
         conn.execute(
             "INSERT INTO working_memory (id, content, source, timestamp, session_id) "
             "VALUES (?, ?, ?, ?, ?)",
@@ -312,7 +312,7 @@ class TestSleepCycle:
     def test_sleep_all_sessions_consolidates_inactive_sessions(self, temp_db):
         beam = BeamMemory(session_id="s1", db_path=temp_db)
         conn = sqlite3.connect(temp_db)
-        old_ts = (datetime.now() - timedelta(hours=20)).isoformat()
+        old_ts = (datetime.now() - timedelta(hours=200)).isoformat()
         fresh_ts = datetime.now().isoformat()
         conn.executemany(
             "INSERT INTO working_memory (id, content, source, timestamp, session_id) VALUES (?, ?, ?, ?, ?)",
@@ -355,7 +355,7 @@ class TestSleepCycle:
     def test_sleep_all_sessions_dry_run_preserves_working_memory(self, temp_db):
         beam = BeamMemory(session_id="s1", db_path=temp_db)
         conn = sqlite3.connect(temp_db)
-        old_ts = (datetime.now() - timedelta(hours=20)).isoformat()
+        old_ts = (datetime.now() - timedelta(hours=200)).isoformat()
         conn.executemany(
             "INSERT INTO working_memory (id, content, source, timestamp, session_id) VALUES (?, ?, ?, ?, ?)",
             [
@@ -398,7 +398,7 @@ class TestSleepCycle:
 
         beam = BeamMemory(session_id="s1", db_path=temp_db)
         conn = sqlite3.connect(temp_db)
-        old_ts = (datetime.now() - timedelta(hours=20)).isoformat()
+        old_ts = (datetime.now() - timedelta(hours=200)).isoformat()
         conn.executemany(
             "INSERT INTO working_memory (id, content, source, timestamp, session_id) VALUES (?, ?, ?, ?, ?)",
             [
@@ -471,7 +471,7 @@ class TestSleepCycle:
 
         beam = BeamMemory(session_id="s1", db_path=temp_db)
         conn = sqlite3.connect(temp_db)
-        old_ts = (datetime.now() - timedelta(hours=20)).isoformat()
+        old_ts = (datetime.now() - timedelta(hours=200)).isoformat()
         # Three distinct unique tokens — one per seeded memory.
         # Pick tokens that won't collide with FTS stop-words or the deterministic
         # concat header text.
@@ -773,7 +773,7 @@ class TestCrossSessionRecall:
 
         # Backdate all working memories so they are old enough to consolidate
         conn = sqlite3.connect(temp_db)
-        old_ts = (datetime.now() - timedelta(hours=48)).isoformat()
+        old_ts = (datetime.now() - timedelta(hours=200)).isoformat()
         conn.execute("UPDATE working_memory SET timestamp = ?", (old_ts,))
         conn.commit()
         conn.close()
@@ -959,7 +959,7 @@ class TestTokenAwareConsolidation:
 
         # Backdate so sleep() picks them up
         conn = sqlite3.connect(temp_db)
-        old_ts = (datetime.now() - timedelta(hours=48)).isoformat()
+        old_ts = (datetime.now() - timedelta(hours=200)).isoformat()
         conn.execute("UPDATE working_memory SET timestamp = ?", (old_ts,))
         conn.commit()
         conn.close()
@@ -1207,7 +1207,7 @@ class TestTieredDegradation:
         beam = BeamMemory(session_id="s1", db_path=temp_db)
         # Inject old working memory to trigger consolidation
         conn = sqlite3.connect(temp_db)
-        old_ts = (datetime.now() - timedelta(hours=48)).isoformat()
+        old_ts = (datetime.now() - timedelta(hours=200)).isoformat()
         for i in range(2):
             conn.execute(
                 "INSERT INTO working_memory (id, content, source, timestamp, session_id) VALUES (?, ?, ?, ?, ?)",
@@ -1229,7 +1229,7 @@ class TestTieredDegradation:
 
         beam = BeamMemory(session_id="s1", db_path=temp_db)
         conn = sqlite3.connect(temp_db)
-        old_ts = (datetime.now() - timedelta(hours=48)).isoformat()
+        old_ts = (datetime.now() - timedelta(hours=200)).isoformat()
         conn.execute(
             "INSERT INTO working_memory (id, content, source, timestamp, session_id) VALUES (?, ?, ?, ?, ?)",
             ("s2-old", "all sessions sleep test", "conversation", old_ts, "s2")
@@ -1523,7 +1523,7 @@ class TestConsolidationHealth:
         beam = BeamMemory(session_id="s1", db_path=temp_db)
         # Inject old working memories
         conn = sqlite3.connect(temp_db)
-        old_ts = (datetime.now() - timedelta(hours=20)).isoformat()
+        old_ts = (datetime.now() - timedelta(hours=200)).isoformat()
         for i in range(3):
             conn.execute(
                 "INSERT INTO working_memory (id, content, source, timestamp, session_id) VALUES (?, ?, ?, ?, ?)",
@@ -1548,7 +1548,7 @@ class TestConsolidationHealth:
         beam = BeamMemory(session_id="s1", db_path=temp_db)
         # Inject old working memories
         conn = sqlite3.connect(temp_db)
-        old_ts = (datetime.now() - timedelta(hours=20)).isoformat()
+        old_ts = (datetime.now() - timedelta(hours=200)).isoformat()
         for i in range(3):
             conn.execute(
                 "INSERT INTO working_memory (id, content, source, timestamp, session_id) VALUES (?, ?, ?, ?, ?)",
@@ -1576,7 +1576,7 @@ class TestConsolidationHealth:
 
         beam = BeamMemory(session_id="s1", db_path=temp_db)
         conn = sqlite3.connect(temp_db)
-        old_ts = (datetime.now() - timedelta(hours=20)).isoformat()
+        old_ts = (datetime.now() - timedelta(hours=200)).isoformat()
         conn.execute(
             "INSERT INTO working_memory (id, content, source, timestamp, session_id) VALUES (?, ?, ?, ?, ?)",
             ("old1", "test task", "conversation", old_ts, "s1"),
@@ -1596,7 +1596,7 @@ class TestConsolidationHealth:
 
         beam = BeamMemory(session_id="s1", db_path=temp_db)
         conn = sqlite3.connect(temp_db)
-        old_ts = (datetime.now() - timedelta(hours=20)).isoformat()
+        old_ts = (datetime.now() - timedelta(hours=200)).isoformat()
         conn.execute(
             "INSERT INTO working_memory (id, content, source, timestamp, session_id) VALUES (?, ?, ?, ?, ?)",
             ("old1", "test task", "conversation", old_ts, "s1"),
@@ -1627,7 +1627,7 @@ class TestConsolidationHealth:
 
         beam = BeamMemory(session_id="s1", db_path=temp_db)
         conn = sqlite3.connect(temp_db)
-        old_ts = (datetime.now() - timedelta(hours=20)).isoformat()
+        old_ts = (datetime.now() - timedelta(hours=200)).isoformat()
         conn.executemany(
             "INSERT INTO working_memory (id, content, source, timestamp, session_id) VALUES (?, ?, ?, ?, ?)",
             [

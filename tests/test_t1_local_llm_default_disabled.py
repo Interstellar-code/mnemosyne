@@ -195,7 +195,7 @@ class TestSleepIsFast:
         db = tmp_path / "t1_sleep.db"
         beam = BeamMemory(session_id="s1", db_path=db)
         conn = sqlite3.connect(db)
-        old_ts = (datetime.now() - timedelta(hours=20)).isoformat()
+        old_ts = (datetime.now() - timedelta(hours=200)).isoformat()
         conn.executemany(
             "INSERT INTO working_memory (id, content, source, timestamp, session_id) "
             "VALUES (?, ?, ?, ?, ?)",
