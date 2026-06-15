@@ -93,8 +93,8 @@ def mnemosyne_command(args):
         print(json.dumps({"working": working, "episodic": episodic, "memoria": memoria}, indent=2))
 
     elif cmd == "version":
-        from mnemosyne import __version__, __author__
-        print(f"Mnemosyne {__version__} by {__author__}")
+        from mnemosyne import __version__
+        print(f"Mnemosyne v{__version__}")
 
     elif cmd == "sleep":
         dry_run = bool(getattr(args, "dry_run", False))
