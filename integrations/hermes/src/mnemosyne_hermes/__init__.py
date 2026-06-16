@@ -24,11 +24,12 @@ import sys
 import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # Mnemosyne core is installed via pip (mnemosyne-memory>=3.1 dependency).
 # No path hacks needed — standard imports work.
 from mnemosyne.core.episodic_graph import GraphEdge
+from mnemosyne.core.beam import WORKING_MEMORY_TTL_HOURS
 
 __version__ = "0.2.0"
 
@@ -925,7 +926,17 @@ class MnemosyneMemoryProvider(MemoryProvider):
             stats = self._beam.get_working_stats()
             working = stats.get("total", 0)
             if working > self._auto_sleep_threshold:
-                logger.info("Mnemosyne auto-sleep: working=%d > threshold=%d", working, self._auto_sleep_threshold)
+                # Cheap eligibility check: are there any unconsolidated
+                # working memories old enough to consolidate? Avoids
+                # spinning up a full sleep pass just to find nothing
+                # eligible (common with longer TTLs after a prior
+                # auto-sleep already consolidated everything).
+                cutoff = (datetime.now() - timedelta(hours=WORKING_MEMORY_TTL_HOURS // 2)).isoformat()
+                eligible = self._beam._count_unconsolidated_before(cutoff)
+                if eligible == 0:
+                    return
+
+                logger.info("Mnemosyne auto-sleep: working=%d, eligible=%d > threshold=%d", working, eligible, self._auto_sleep_threshold)
                 sleep_fn = self._beam.sleep_all_sessions if hasattr(self._beam, "sleep_all_sessions") else self._beam.sleep
                 sleep_thread = threading.Thread(target=sleep_fn, daemon=True)
                 sleep_thread.start()

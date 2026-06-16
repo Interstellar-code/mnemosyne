@@ -3572,11 +3572,15 @@ class BeamMemory:
         if not rows:
             return rows
 
-        # Bump recall_count + last_recalled for every item returned.
-        # Each bump extends last_recalled by at most WM_BUMP_CAP_HOURS
-        # to prevent a single get_context() from fully resetting a stale item.
+        # Batch bump recall_count + last_recalled in a single UPDATE
+        # with bulk WHERE IN (...) to reduce write amplification on the
+        # get_context() hot path (called on nearly every turn in Hermes
+        # provider mode).
+        # Per-row bump logic preserved: each row gets min(now, parsed +
+        # bump_delta) so stale items aren't fully reset by a single call.
         now_dt = datetime.now()
         bump_delta = timedelta(hours=WM_BUMP_CAP_HOURS)
+        updates = {}  # iso_timestamp -> [ids]
         for row in rows:
             old_ts = row.pop("last_recalled", None)
             if old_ts is None:
@@ -3588,9 +3592,15 @@ class BeamMemory:
                     new_last = now_dt
                 else:
                     new_last = min(now_dt, parsed + bump_delta)
+            ts = new_last.isoformat()
+            updates.setdefault(ts, []).append(row["id"])
+
+        cursor.execute("BEGIN TRANSACTION")
+        for ts, ids in updates.items():
+            placeholders = ",".join("?" for _ in ids)
             cursor.execute(
-                "UPDATE working_memory SET recall_count = recall_count + 1, last_recalled = ? WHERE id = ?",
-                (new_last.isoformat(), row["id"])
+                f"UPDATE working_memory SET recall_count = recall_count + 1, last_recalled = ? WHERE id IN ({placeholders})",
+                (ts, *ids)
             )
         self.conn.commit()
         return rows
@@ -3776,6 +3786,20 @@ class BeamMemory:
             "unconsolidated": unconsolidated,
             "last": last[0] if last else None,
         }
+
+    def _count_unconsolidated_before(self, cutoff: str) -> int:
+        """Count working memories eligible for consolidation before cutoff.
+        Used by _maybe_auto_sleep() to skip full sleep passes when nothing
+        is eligible — avoids unnecessary database work on always-on agents
+        with longer TTLs after a prior auto-sleep already consolidated everything."""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "SELECT COUNT(*) FROM working_memory "
+            "WHERE timestamp < ? AND consolidated_at IS NULL "
+            "AND (pinned IS NULL OR pinned = 0)",
+            (cutoff,),
+        )
+        return cursor.fetchone()[0]
 
     # DEPRECATED -- kept for backward compatibility with hermes_memory_provider/cli.py
     def get_global_working_stats(self) -> Dict:
