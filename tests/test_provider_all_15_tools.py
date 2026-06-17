@@ -298,3 +298,16 @@ class TestUnavailableGuard:
         provider = MnemosyneMemoryProvider()
         provider._beam = None
         assert provider.system_prompt_block() == ""
+
+    def test_system_prompt_tells_agent_to_read_mnemosyne_context_first(self):
+        """Pin the rule added in #321 on the legacy provider path."""
+        provider = MnemosyneMemoryProvider()
+        provider._beam = object()
+
+        block = provider.system_prompt_block()
+
+        assert "## Mnemosyne Context" in block
+        assert "read it before calling retrieval tools" in block
+        assert "answer directly" in block
+        assert "session_search" in block
+        assert "missing, stale, or insufficient" in block

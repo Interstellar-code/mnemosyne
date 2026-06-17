@@ -1560,7 +1560,12 @@ class MnemosyneMemoryProvider(MemoryProvider):
                 "Active (native local memory). Use mnemosyne_remember to store ANY "
                 "durable fact, preference, identity, or insight. Use mnemosyne_recall to search. "
                 "Use mnemosyne_shared_* tools for manual shared surface CRUD. "
-                "The legacy memory tool is deprecated for durable storage — Mnemosyne is primary."
+                "The legacy memory tool is deprecated for durable storage — Mnemosyne is primary.\n"
+                "\n"
+                "When a `## Mnemosyne Context` block is injected into the current turn, "
+                "read it before calling retrieval tools. If it answers the user's question, "
+                "answer directly. Use session_search only when the injected Mnemosyne "
+                "context is missing, stale, or insufficient."
             )
         # C27: when init failed (as opposed to a deliberate skip-context),
         # surface the failure in the system prompt so the agent -- and through

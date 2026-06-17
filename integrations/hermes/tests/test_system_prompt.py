@@ -20,3 +20,23 @@ def test_system_prompt_routes_to_structured_mnemosyne_surfaces():
     assert "mnemosyne_scratchpad_*" in block
     assert "mnemosyne_shared_*" in block
     assert "Do not save one-off task progress" in block
+
+
+def test_system_prompt_tells_agent_to_read_mnemosyne_context_first():
+    """Pin the rule added in #321.
+
+    The Mnemosyne context block is injected into the turn and the agent
+    should answer from it before reaching for session_search. Without
+    this standing rule, the agent defaults to retrieval tools out of
+    habit and wastes a turn.
+    """
+    provider = MnemosyneMemoryProvider()
+    provider._beam = object()
+
+    block = provider.system_prompt_block()
+
+    assert "## Mnemosyne Context" in block
+    assert "read it before calling retrieval tools" in block
+    assert "answer directly" in block
+    assert "session_search" in block
+    assert "missing, stale, or insufficient" in block

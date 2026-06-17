@@ -881,7 +881,12 @@ class MnemosyneMemoryProvider(MemoryProvider):
                 "mnemosyne_validate/invalidate/update/forget for provenance, corrections, stale facts, and cleanup; "
                 "mnemosyne_scratchpad_* for temporary working notes; "
                 "mnemosyne_shared_* only for compact cross-agent stable metadata, never raw conversation.\n"
-                "Prefer compact, declarative, non-imperative memories. Do not save one-off task progress."
+                "Prefer compact, declarative, non-imperative memories. Do not save one-off task progress.\n"
+                "\n"
+                "When a `## Mnemosyne Context` block is injected into the current turn, "
+                "read it before calling retrieval tools. If it answers the user's question, "
+                "answer directly. Use session_search only when the injected Mnemosyne "
+                "context is missing, stale, or insufficient."
             )
         # C27: when init failed (as opposed to a deliberate skip-context),
         # surface the failure in the system prompt so the agent -- and through
