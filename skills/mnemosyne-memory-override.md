@@ -1,64 +1,104 @@
 ---
 name: mnemosyne-memory-override
-description: |
-  Hard rule override that forces Mnemosyne for all durable memory storage.
-  The legacy memory tool is DEPRECATED for user preferences, credentials,
-  and project conventions. Use memory ONLY for ephemeral session state.
-trigger: |
-  Whenever you would use memory(action="add|replace|remove") for anything
-  that should survive across sessions, STOP and use mnemosyne_remember instead.
+description: Tier-1 memory tool remains the sole writer of MEMORY.md/USER.md; durable searchable facts prefer Tier-2 mnemosyne_remember. Policy inverted from v0.1.
+version: 0.2.0
+trigger:
+  - memory
+  - mnemosyne
+platforms:
+  - hermes
+  - codex
+  - claude-code
+  - cursor
 ---
 
-# Mnemosyne Memory Override
+> **Superseded by the matrix-memory contract (v0.2).** This file is retained as the
+> host skill-hook location so agents and platform bindings that discover skills by
+> path (`skills/mnemosyne-memory-override.md`) continue to load the correct policy.
+> The v0.1 override (which banned the built-in memory tool) is **inverted** here —
+> the built-in memory tool is now sacred and must NOT be deprecated or bypassed.
+> See `skills/matrix-memory/SKILL.md` for the full three-tier discipline.
 
-## CRITICAL RULE
+---
 
-**NEVER use the `memory` tool for durable facts.**
+# Mnemosyne Memory Override — v0.2 Policy (Inverted)
 
-The legacy `memory` system is deprecated. It has a tiny 2,200 character limit
-and does not use vector search. Mnemosyne is the single source of truth for
-all durable user data.
+## What changed from v0.1
 
-## Mapping
+v0.1 banned the built-in `memory` tool and routed everything to `mnemosyne_remember`.
+That policy is abolished. Under the matrix-memory contract:
 
-| Old (FORBIDDEN) | New (REQUIRED) |
-|-----------------|----------------|
-| `memory(action="add", target="user", ...)` | `mnemosyne_remember(content=..., importance=0.9+, source="preference")` |
-| `memory(action="add", target="memory", ...)` | `mnemosyne_remember(content=..., importance=0.7+, source="fact")` |
-| `memory(action="replace", ...)` | `mnemosyne_remember` with updated content |
-| `memory(action="remove", ...)` | Not needed — Mnemosyne ages out low-importance entries |
+- Tier 1 (MEMORY.md / USER.md) is **sacred** and owned exclusively by the built-in
+  `memory` tool.
+- The contract does NOT expose a Tier 1 write path. Agents must never add or replace
+  Tier 1 entries through the contract layer.
+- `mnemosyne_remember` (Tier 2) is preferred for searchable, durable knowledge —
+  but this is **advisory discipline**, not a ban on Tier 1.
 
-## When to use legacy memory (rare)
+---
 
-- Ephemeral session state (current todo list, temp flags)
-- When Mnemosyne is explicitly confirmed down
+## Current Policy Rules
 
-## Muscle Memory / Reflex Problem
+### Rule 1 — Built-in memory tool is the sole Tier-1 writer
 
-You will reflexively reach for `memory` out of old habit. This is a known bug
-in your training. Before EVERY memory tool call, pause and ask:
+The built-in `memory` tool (writing to MEMORY.md / USER.md) is **not deprecated**.
+It remains the correct and only mechanism for persisting user identity, profile data,
+and stable preferences that the user has explicitly asked to remember.
 
-> "Is this durable? Would I want this next session?"
+Do NOT route Tier-1 writes through `mnemosyne_remember`. Do NOT call
+`mnemosyne_forget` as a replacement for `memory(action="remove")` on Tier-1 entries
+unless you are deleting via the contract layer (which exposes only deletes, not adds).
 
-If yes → use `mnemosyne_remember`
-If no (temp flag, todo state) → `memory` is acceptable
+### Rule 2 — Durable searchable facts prefer Tier 2
 
-## Migration Cleanup
+For knowledge that benefits from search, consolidation, or knowledge-graph indexing
+(project conventions, learned facts, episodic context), prefer:
 
-When moving data from legacy memory to Mnemosyne:
-1. Save to Mnemosyne first with `mnemosyne_remember`
-2. Then REMOVE the old entry from `memory` with `memory(action="remove")`
-3. This prevents stale duplicates and confusion
+```
+mnemosyne_remember(content=<fact>, importance=<0.7–1.0>, source=<type>, tags=[...])
+```
 
-## Committing Changes
+This is **advisory**: the built-in memory tool is not forbidden, but `mnemosyne_remember`
+is the better tool for anything a future session would want to search or recall.
 
-The user expects fixes to be committed and pushed individually.
-Do not claim a fix is done until it is committed to its respective repo.
+### Rule 3 — Contract does not expose a Tier-1 write path (structural)
 
-## Enforcement
+The matrix-memory contract intentionally omits a Tier-1 write tool. This is a
+structural decision, not a workaround. If you find yourself needing to write to
+Tier 1 through the contract, you are misrouting — use the built-in `memory` tool
+directly.
 
-If you catch yourself typing `memory(action=` for durable data:
-1. CANCEL that tool call
-2. Use `mnemosyne_remember` instead
-3. Set importance >= 0.7 for anything that matters later
-4. If you already polluted legacy memory, remove the entry immediately
+### Rule 4 — Tier-1 deletes go through the contract
+
+Removing a Tier-1 entry via the contract layer:
+
+```
+mnemosyne_forget(kind="memory", key=<key>)   # removes from MEMORY.md
+mnemosyne_forget(kind="user", key=<key>)     # removes from USER.md
+```
+
+This is the only Tier-1 mutation the contract exposes.
+
+### Rule 5 — Follow the three-tier discipline for all other routing
+
+For the full routing table, dry_run + confirm_token discipline, audit logging, and
+the evergreen test, read:
+
+```
+skills/matrix-memory/SKILL.md
+```
+
+---
+
+## Summary Routing Table
+
+| What to store | Tool | Tier |
+|---------------|------|------|
+| Identity / profile (user-requested) | built-in `memory` tool | 1 |
+| Durable fact / convention / episode | `mnemosyne_remember` | 2 |
+| Long-form human-readable article | `wiki_create_page` / `wiki_update_page` | 3 |
+| Delete Tier-1 entry | `mnemosyne_forget(kind="memory"\|"user")` | 1 |
+
+---
+
+*Full discipline: `skills/matrix-memory/SKILL.md`*

@@ -494,6 +494,15 @@ RECALL_SCHEMA = {
                 "description": "If true, return a structured per-query recall explain trace. Default false.",
                 "default": False,
             },
+            "tier": {
+                "type": "string",
+                "description": (
+                    "matrix-memory contract tier filter. '1' = MEMORY.md/USER.md "
+                    "passthrough only, '2' (default) = Mnemosyne, '3' = wiki, "
+                    "'all' = Tier 1 + Mnemosyne. tier=4 is never accepted."
+                ),
+                "default": "2",
+            },
         },
         "required": ["query"],
     },
@@ -825,13 +834,27 @@ UPDATE_SCHEMA = {
 
 FORGET_SCHEMA = {
     "name": "mnemosyne_forget",
-    "description": "Permanently delete a memory by ID.",
+    "description": (
+        "Permanently delete a memory by ID, or a Tier 1 entry (MEMORY.md/USER.md) "
+        "via the matrix-memory contract. Destructive: requires a confirm_token from "
+        "a prior dry_run."
+    ),
     "parameters": {
         "type": "object",
         "properties": {
             "memory_id": {"type": "string", "description": "ID of the memory to delete"},
+            "target": {
+                "type": "string",
+                "description": "Tier 1 only: substring of the MEMORY.md/USER.md entry to remove (use with kind).",
+            },
+            "kind": {
+                "type": "string",
+                "description": "Tier 1 only: 'memory' or 'user' to delete from MEMORY.md/USER.md.",
+            },
+            "dry_run": {"type": "boolean", "description": "Preview without applying (default true in agent context)."},
+            "confirm_token": {"type": "string", "description": "Token from the dry_run, required to apply this destructive op."},
         },
-        "required": ["memory_id"],
+        "required": [],
     },
 }
 
@@ -993,6 +1016,63 @@ ALL_TOOL_SCHEMAS = [
     GRAPH_QUERY_SCHEMA, GRAPH_LINK_SCHEMA,
     *ALL_SYNC_TOOL_SCHEMAS,
     *ALL_PERSONA_TOOL_SCHEMAS,
+]
+
+# ---------------------------------------------------------------------------
+# matrix-memory contract (v0.2): Tier 3 wiki tools added on top of Mnemosyne.
+# These are not upstream Mnemosyne tools; they bridge the Karpathy markdown
+# wiki to Tier 2 via the WikiBridge. See skills/matrix-memory/SKILL.md.
+# ---------------------------------------------------------------------------
+MEMORY_CREATE_PAGE_SCHEMA = {
+    "name": "memory_create_page",
+    "description": (
+        "Tier 3: create a Karpathy-style markdown wiki page. The page body is "
+        "one-way bridged into Mnemosyne (Tier 2) so it becomes recallable. "
+        "Destructive (overwrites): requires a confirm_token from a prior dry_run."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "Wiki-relative path, e.g. 'entities/project-atlas.md'."},
+            "content": {"type": "string", "description": "Full markdown content (frontmatter optional)."},
+            "dry_run": {"type": "boolean", "description": "Preview without applying (default true in agent context)."},
+            "confirm_token": {"type": "string", "description": "Token from the dry_run, required to apply."},
+        },
+        "required": ["path", "content"],
+    },
+}
+MEMORY_UPDATE_PAGE_SCHEMA = {
+    "name": "memory_update_page",
+    "description": (
+        "Tier 3: update a wiki page via find/replace, then re-bridge it into "
+        "Mnemosyne. Destructive: requires a confirm_token from a prior dry_run."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "Wiki-relative path of the page to update."},
+            "find": {"type": "string", "description": "Exact text to find."},
+            "replace": {"type": "string", "description": "Replacement text."},
+            "dry_run": {"type": "boolean", "description": "Preview without applying (default true in agent context)."},
+            "confirm_token": {"type": "string", "description": "Token from the dry_run, required to apply."},
+        },
+        "required": ["path", "find", "replace"],
+    },
+}
+MEMORY_SHOW_PAGE_SCHEMA = {
+    "name": "memory_show_page",
+    "description": "Tier 3: read a wiki page (rendered markdown). Read-only.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "Wiki-relative path of the page to read."},
+        },
+        "required": ["path"],
+    },
+}
+
+WIKI_TOOL_SCHEMAS = [
+    MEMORY_CREATE_PAGE_SCHEMA, MEMORY_UPDATE_PAGE_SCHEMA, MEMORY_SHOW_PAGE_SCHEMA,
 ]
 
 
@@ -1602,6 +1682,16 @@ class MnemosyneMemoryProvider(MemoryProvider):
         if self._beam is not None:
             self._activate_in_module()
             self._init_audit_log()
+            # matrix-memory contract (v0.2): build Tier 1/wiki/safety, run the
+            # one-time MEMORY.md/USER.md migration, and start the wiki poller.
+            try:
+                self._ensure_contract()
+                self._tier1.migrate_once(
+                    lambda content, source="semantic": self._beam.remember(content=content, source=source)
+                )
+                self._wiki.start_polling()
+            except Exception as exc:
+                logger.warning("matrix-memory contract init skipped: %s", exc)
 
         # Register the Hermes auxiliary LLM backend so Mnemosyne can route
         # consolidation and fact extraction through Hermes' authenticated
@@ -1962,7 +2052,7 @@ class MnemosyneMemoryProvider(MemoryProvider):
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         """Return tool schemas — static, do not depend on initialization state."""
-        return list(ALL_TOOL_SCHEMAS)
+        return list(ALL_TOOL_SCHEMAS) + list(WIKI_TOOL_SCHEMAS)
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
         if tool_name == "mnemosyne_sleep" and self._reflect_disabled_for_cron and (self._agent_context or "").strip().lower() == "cron":
@@ -1982,6 +2072,20 @@ class MnemosyneMemoryProvider(MemoryProvider):
                 "reason": reason,
                 "error": f"Mnemosyne unavailable: {reason}",
             })
+        # --- matrix-memory contract layer (v0.2) ---
+        # Tier 1 passthrough, Tier 3 wiki tools, and dry_run/confirm_token
+        # safety wraps are applied here, BEFORE the raw Mnemosyne dispatch.
+        try:
+            routed = self._contract_route(tool_name, args)
+            if routed is not None:
+                return routed
+        except Exception as exc:  # contract layer must never mask the engine
+            logger.error("matrix-memory contract route '%s' failed: %s", tool_name, exc)
+            return json.dumps({"error": f"matrix-memory contract '{tool_name}' failed: {exc}"})
+        return self._dispatch_raw(tool_name, args)
+
+    def _dispatch_raw(self, tool_name: str, args: Dict[str, Any]) -> str:
+        """Raw Mnemosyne tool dispatch (pre-contract behavior)."""
         try:
             if tool_name == "mnemosyne_remember":
                 return self._handle_remember(args)
@@ -2072,6 +2176,113 @@ class MnemosyneMemoryProvider(MemoryProvider):
                 "status": "error",
                 "error": f"Persona adapter unavailable: {exc}",
             })
+
+    # ------------------------------------------------------------------
+    # matrix-memory contract (v0.2)
+    # ------------------------------------------------------------------
+    def _ensure_contract(self) -> None:
+        """Lazily build the Tier 1 / wiki / safety contract components."""
+        if getattr(self, "_contract_ready", False):
+            return
+        from .safety import SafetyGate
+        from .tier1 import Tier1Passthrough
+        from .wiki_bridge import WikiBridge
+
+        # Safety wraps (dry_run/confirm_token) are opt-in so the fork stays a
+        # drop-in superset of upstream Mnemosyne. The Hermes agent binding sets
+        # MNEMOSYNE_MATRIX_SAFETY=1; programmatic/CLI (operator) use leaves it off
+        # per spec §8.2. Tier 1, wiki tools, and the tier=4 guard are always on.
+        safety_enabled = os.environ.get("MNEMOSYNE_MATRIX_SAFETY", "0").strip().lower() in ("1", "true", "yes", "on")
+        self._safety = SafetyGate(self._agent_context, enabled=safety_enabled)
+        self._tier1 = Tier1Passthrough(self._hermes_home or None)
+        self._wiki = WikiBridge(
+            self._hermes_home or None,
+            remember_fn=self._contract_remember_fn,
+            graph_link_fn=self._contract_graph_link_fn,
+        )
+        self._contract_ready = True
+
+    def _contract_remember_fn(self, content: str, source: str = "wiki", tags=None):
+        """Adapter: contract write -> Mnemosyne remember. Tags ride in metadata."""
+        if not self._beam:
+            return None
+        metadata = {"tags": list(tags)} if tags else None
+        return self._beam.remember(content=content, source=source, metadata=metadata)
+
+    def _contract_graph_link_fn(self, source: str, target: str, relationship: str = "references"):
+        """Adapter: wikilink -> episodic graph edge. Degrades gracefully when the
+        KG backend is unavailable (spec §7.3 keeps the wikilink graph soft)."""
+        try:
+            return self._handle_graph_link(
+                {"source_id": source, "target_id": target, "relationship": relationship}
+            )
+        except Exception as exc:
+            logger.debug("wiki graph link skipped (%s -> %s): %s", source, target, exc)
+            return None
+
+    def _contract_route(self, tool_name: str, args: Dict[str, Any]):
+        """Return a JSON str if the contract layer handled this call, else None
+        (fall through to raw Mnemosyne dispatch)."""
+        self._ensure_contract()
+        safety = self._safety
+
+        # Tier 3 wiki tools -------------------------------------------------
+        if tool_name == "memory_show_page":
+            return json.dumps(self._wiki.show_page(args.get("path", "")))
+        if tool_name == "memory_create_page":
+            return safety.guard(
+                tool_name, args,
+                lambda: json.dumps(self._wiki.create_page(args.get("path", ""), args.get("content", ""))),
+            )
+        if tool_name == "memory_update_page":
+            return safety.guard(
+                tool_name, args,
+                lambda: json.dumps(self._wiki.update_page(
+                    args.get("path", ""), args.get("find", ""), args.get("replace", ""))),
+            )
+
+        # Tier 1 extended recall -------------------------------------------
+        if tool_name == "mnemosyne_recall":
+            tier = str(args.get("tier", "2")).strip().lower()
+            if tier == "4":
+                return json.dumps({"error": "tier=4 is not accepted; valid tiers are 1|2|3|all"})
+            if tier == "1":
+                hits = self._tier1.recall(args.get("query", ""))
+                return json.dumps({"query": args.get("query", ""), "count": len(hits), "results": hits, "tiers": "1"})
+            if tier == "all":
+                raw = self._dispatch_raw(tool_name, args)
+                return self._merge_tier1(args.get("query", ""), raw)
+            return None  # tier 2/3 -> plain Mnemosyne recall
+
+        # Tier 1 extended forget (MEMORY.md/USER.md delete) ----------------
+        if tool_name == "mnemosyne_forget" and str(args.get("kind", "")).strip().lower() in ("memory", "user"):
+            kind = str(args.get("kind")).strip().lower()
+            return safety.guard(
+                tool_name, args,
+                lambda: json.dumps(self._tier1.forget(args.get("target", ""), kind)),
+            )
+
+        # Generic safety wrap for every other write tool ------------------
+        if safety.needs_wrap(tool_name):
+            return safety.guard(tool_name, args, lambda: self._dispatch_raw(tool_name, args))
+
+        return None
+
+    def _merge_tier1(self, query: str, raw_json: str) -> str:
+        """Prepend Tier 1 hits to a raw Mnemosyne recall payload (tier=all)."""
+        try:
+            payload = json.loads(raw_json)
+            if not isinstance(payload, dict):
+                payload = {"results": []}
+        except Exception:
+            payload = {"results": []}
+        hits = self._tier1.recall(query)
+        results = list(hits) + list(payload.get("results") or [])
+        payload["results"] = results
+        payload["count"] = len(results)
+        payload["query"] = query
+        payload["tiers"] = "all"
+        return json.dumps(payload)
 
     def _handle_remember(self, args: Dict[str, Any]) -> str:
         # Import at call-site so the provider module loads even when
@@ -2881,6 +3092,13 @@ class MnemosyneMemoryProvider(MemoryProvider):
     SHUTDOWN_DRAIN_TIMEOUT_SECONDS = _parse_env_float("MNEMOSYNE_SHUTDOWN_DRAIN_TIMEOUT", 2)
 
     def shutdown(self) -> None:
+        # matrix-memory contract (v0.2): stop the wiki polling thread.
+        wiki = getattr(self, "_wiki", None)
+        if wiki is not None:
+            try:
+                wiki.stop_polling()
+            except Exception as exc:
+                logger.debug("wiki poller stop failed: %s", exc)
         # If session_end's daemon thread is still consolidating when shutdown
         # arrives, briefly wait for it. Otherwise clearing the host backend
         # next would race with the in-flight summarize/extract call and a

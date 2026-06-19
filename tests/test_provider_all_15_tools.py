@@ -52,7 +52,8 @@ class TestToolRegistration:
     def test_all_tools_registered(self, tmp_path):
         provider = _provider(tmp_path)
         names = _tool_names(provider)
-        assert len(names) == 33, f"Expected 33 tools, got {len(names)}"
+        # 33 Mnemosyne tools + 3 matrix-memory contract wiki tools (v0.2 fork)
+        assert len(names) == 36, f"Expected 36 tools, got {len(names)}"
 
     def test_canonical_tools_present(self, tmp_path):
         provider = _provider(tmp_path)
