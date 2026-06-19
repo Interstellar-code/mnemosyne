@@ -22,7 +22,7 @@ class Tier1Passthrough:
 
     def __init__(self, hermes_home: str | None = None) -> None:
         if hermes_home is None:
-            hermes_home = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
+            hermes_home = _resolve_hermes_home()
         self._hermes_home = Path(hermes_home)
         memories_dir = self._hermes_home / "memories"
         self.memory_path: Path = memories_dir / "MEMORY.md"
@@ -201,3 +201,18 @@ class Tier1Passthrough:
             return "\n".join(remaining_entries)
         else:
             return "\n\n".join(remaining_entries)
+
+
+def _resolve_hermes_home() -> str:
+    """Return the active Hermes home with profile awareness when available.
+
+    Prefer Hermes core's `get_hermes_home()` when this integration is loaded
+    inside Hermes proper. Fall back to the historical env/default behavior when
+    the provider is imported standalone outside Hermes.
+    """
+    try:
+        from hermes_constants import get_hermes_home
+
+        return str(get_hermes_home())
+    except Exception:
+        return os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
