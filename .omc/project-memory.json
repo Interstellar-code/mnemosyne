@@ -1,0 +1,309 @@
+{
+  "version": "1.0.0",
+  "lastScanned": 1781847903503,
+  "projectRoot": "/Volumes/Ext-nvme/Development/mnemosyne",
+  "techStack": {
+    "languages": [
+      {
+        "name": "Python",
+        "version": null,
+        "confidence": "high",
+        "markers": [
+          "pyproject.toml"
+        ]
+      }
+    ],
+    "frameworks": [
+      {
+        "name": "pytest",
+        "version": null,
+        "category": "testing"
+      }
+    ],
+    "packageManager": null,
+    "runtime": null
+  },
+  "build": {
+    "buildCommand": null,
+    "testCommand": "cd /Volumes/Ext-nvme/Development/mnemosyne; uv run --with pytest python -m pytest tests/test_contract_e2e_realengine.py -q 2>&1 | grep -vE \"Fetching|it/s|HF_TOKEN|^(INFO|DEBUG|WARNING)\" | tail -8",
+    "lintCommand": "ruff check",
+    "devCommand": null,
+    "scripts": {}
+  },
+  "conventions": {
+    "namingStyle": null,
+    "importStyle": null,
+    "testPattern": null,
+    "fileOrganization": null
+  },
+  "structure": {
+    "isMonorepo": false,
+    "workspaces": [],
+    "mainDirectories": [
+      "assets",
+      "docs",
+      "examples",
+      "scripts",
+      "tests"
+    ],
+    "gitBranches": {
+      "defaultBranch": "main",
+      "branchingStrategy": null
+    }
+  },
+  "customNotes": [],
+  "directoryMap": {
+    "assets": {
+      "path": "assets",
+      "purpose": "Static assets",
+      "fileCount": 1,
+      "lastAccessed": 1781847903473,
+      "keyFiles": [
+        "mnemosyne.jpg"
+      ]
+    },
+    "deploy": {
+      "path": "deploy",
+      "purpose": null,
+      "fileCount": 0,
+      "lastAccessed": 1781847903479,
+      "keyFiles": []
+    },
+    "docs": {
+      "path": "docs",
+      "purpose": "Documentation",
+      "fileCount": 20,
+      "lastAccessed": 1781847903484,
+      "keyFiles": [
+        "README.md",
+        "api-reference.md",
+        "architecture.md",
+        "audit-report-2026-05-11.md",
+        "audit-report-2026-05-13.md"
+      ]
+    },
+    "examples": {
+      "path": "examples",
+      "purpose": "Example code",
+      "fileCount": 1,
+      "lastAccessed": 1781847903485,
+      "keyFiles": [
+        "embedding_server.py"
+      ]
+    },
+    "hermes_memory_provider": {
+      "path": "hermes_memory_provider",
+      "purpose": null,
+      "fileCount": 7,
+      "lastAccessed": 1781847903488,
+      "keyFiles": [
+        "README.md",
+        "__init__.py",
+        "audit.py",
+        "cli.py",
+        "hermes_llm_adapter.py"
+      ]
+    },
+    "integrations": {
+      "path": "integrations",
+      "purpose": null,
+      "fileCount": 0,
+      "lastAccessed": 1781847903489,
+      "keyFiles": []
+    },
+    "mnemosyne": {
+      "path": "mnemosyne",
+      "purpose": null,
+      "fileCount": 6,
+      "lastAccessed": 1781847903493,
+      "keyFiles": [
+        "__init__.py",
+        "cli.py",
+        "diagnose.py",
+        "install.py",
+        "mcp_server.py"
+      ]
+    },
+    "scripts": {
+      "path": "scripts",
+      "purpose": "Build/utility scripts",
+      "fileCount": 9,
+      "lastAccessed": 1781847903493,
+      "keyFiles": [
+        "backfill_temporal_triples.py",
+        "cleanup_noisy_mentions.py",
+        "generate-docs.py",
+        "heal_quality.py",
+        "memoria_audit.py"
+      ]
+    },
+    "skills": {
+      "path": "skills",
+      "purpose": null,
+      "fileCount": 1,
+      "lastAccessed": 1781847903493,
+      "keyFiles": [
+        "mnemosyne-memory-override.md"
+      ]
+    },
+    "tests": {
+      "path": "tests",
+      "purpose": "Test files",
+      "fileCount": 113,
+      "lastAccessed": 1781847903494,
+      "keyFiles": [
+        "benchmark_beam.py",
+        "benchmark_beam_comprehensive.py",
+        "benchmark_beam_scale.py",
+        "benchmark_beam_sota.py",
+        "benchmark_beam_working_memory.py"
+      ]
+    },
+    "tools": {
+      "path": "tools",
+      "purpose": null,
+      "fileCount": 15,
+      "lastAccessed": 1781847903498,
+      "keyFiles": [
+        "beam_phase3_test.py",
+        "bench_100k_fast.py",
+        "bench_100k_gemma.py",
+        "bench_audit_log.py",
+        "bench_nai0.py"
+      ]
+    },
+    "docs/api": {
+      "path": "docs/api",
+      "purpose": "API routes",
+      "fileCount": 2,
+      "lastAccessed": 1781847903501,
+      "keyFiles": [
+        "configuration.mdx",
+        "tool-schema.mdx"
+      ]
+    }
+  },
+  "hotPaths": [
+    {
+      "path": "hermes_memory_provider/__init__.py",
+      "accessCount": 48,
+      "lastAccessed": 1781853722121,
+      "type": "file"
+    },
+    {
+      "path": "hermes_memory_provider/safety.py",
+      "accessCount": 8,
+      "lastAccessed": 1781851099160,
+      "type": "file"
+    },
+    {
+      "path": "mnemosyne/core/memory.py",
+      "accessCount": 5,
+      "lastAccessed": 1781849122495,
+      "type": "file"
+    },
+    {
+      "path": "tests/test_contract_e2e_realengine.py",
+      "accessCount": 4,
+      "lastAccessed": 1781852402758,
+      "type": "file"
+    },
+    {
+      "path": "tests/test_provider_all_15_tools.py",
+      "accessCount": 4,
+      "lastAccessed": 1781853760690,
+      "type": "file"
+    },
+    {
+      "path": "skills/mnemosyne-memory-override.md",
+      "accessCount": 3,
+      "lastAccessed": 1781850231065,
+      "type": "file"
+    },
+    {
+      "path": "hermes_memory_provider/plugin.yaml",
+      "accessCount": 1,
+      "lastAccessed": 1781848686002,
+      "type": "file"
+    },
+    {
+      "path": "mnemosyne/mcp_tools.py",
+      "accessCount": 1,
+      "lastAccessed": 1781848686278,
+      "type": "file"
+    },
+    {
+      "path": "mnemosyne/core/beam.py",
+      "accessCount": 1,
+      "lastAccessed": 1781849105334,
+      "type": "file"
+    },
+    {
+      "path": "integrations/hermes/src/mnemosyne_hermes/plugin.yaml",
+      "accessCount": 1,
+      "lastAccessed": 1781849158331,
+      "type": "file"
+    },
+    {
+      "path": "integrations/hermes/src/mnemosyne_hermes/__init__.py",
+      "accessCount": 1,
+      "lastAccessed": 1781849168978,
+      "type": "file"
+    },
+    {
+      "path": "hermes_memory_provider/tier1.py",
+      "accessCount": 1,
+      "lastAccessed": 1781849617857,
+      "type": "file"
+    },
+    {
+      "path": "hermes_memory_provider/tests/test_tier1_passthrough.py",
+      "accessCount": 1,
+      "lastAccessed": 1781849650530,
+      "type": "file"
+    },
+    {
+      "path": "hermes_memory_provider/tests/test_safety_wraps.py",
+      "accessCount": 1,
+      "lastAccessed": 1781849652763,
+      "type": "file"
+    },
+    {
+      "path": "hermes_memory_provider/tests/test_migration.py",
+      "accessCount": 1,
+      "lastAccessed": 1781849779103,
+      "type": "file"
+    },
+    {
+      "path": "hermes_memory_provider/wiki_bridge.py",
+      "accessCount": 1,
+      "lastAccessed": 1781850188662,
+      "type": "file"
+    },
+    {
+      "path": "skills/matrix-memory/SKILL.md",
+      "accessCount": 1,
+      "lastAccessed": 1781850199554,
+      "type": "file"
+    },
+    {
+      "path": "hermes_memory_provider/tests/test_wiki_bridge.py",
+      "accessCount": 1,
+      "lastAccessed": 1781850236284,
+      "type": "file"
+    },
+    {
+      "path": "tests/test_hermes_memory_provider_shared_multi_agent.py",
+      "accessCount": 1,
+      "lastAccessed": 1781851013408,
+      "type": "file"
+    },
+    {
+      "path": "hermes_memory_provider/tests/test_contract_integration.py",
+      "accessCount": 1,
+      "lastAccessed": 1781851169995,
+      "type": "file"
+    }
+  ],
+  "userDirectives": []
+}
