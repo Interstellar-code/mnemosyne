@@ -1,7 +1,0 @@
-{
-  "tool_name": "Bash",
-  "tool_input_preview": "{\"command\":\"zap grep -n \\\"RECALL_SCHEMA\\\\|FORGET_SCHEMA\\\\|REMEMBER_SCHEMA\\\\|_SCHEMA = {\\\\|def shutdown\\\\|def get_tool_schemas\\\\|def _handle_forget\\\\|def _activate_in_module\\\\|def _deactivate_in_module...",
-  "error": "Exit code 2\nrg: regex parse error:\n    (?:RECALL_SCHEMA|FORGET_SCHEMA|REMEMBER_SCHEMA|_SCHEMA = {|def shutdown|def get_tool_schemas|def _handle_forget|def _activate_in_module|def _deactivate_in_module)\n                                                              ^\nerror: repetition quantifier expects a valid decimal\n0 matches for 'RECALL_SCHEMA\\|FORGET_SCHEMA\\|REMEMBER_SCHEMA\\|_SCHEMA = {\\|def shutdown\\|def get_tool_schemas\\|def _handle_forget\\|def _activate_in_module\\|def _deactivate_in_module...",
-  "timestamp": "2026-06-19T06:29:04.831Z",
-  "retry_count": 1
-}
