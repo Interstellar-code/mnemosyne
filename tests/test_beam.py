@@ -258,6 +258,53 @@ def test_wm_vec_search_falls_back_when_vec_working_missing_row(temp_db):
     assert results[0]["sim"] == pytest.approx(1.0)
 
 
+def test_recall_keeps_strong_working_memory_vector_only_hit(temp_db, monkeypatch):
+    np = pytest.importorskip("numpy")
+    beam = BeamMemory(session_id="wm-strong-vector", db_path=temp_db)
+    now = datetime.now().isoformat()
+    memory_id = "vector-only-hit"
+
+    beam.conn.execute(
+        """
+        INSERT INTO working_memory
+            (id, content, source, timestamp, session_id, scope, importance)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            memory_id,
+            "Rohit prefers concise but warm responses on Telegram, especially for code review",
+            "chat",
+            now,
+            "wm-strong-vector",
+            "session",
+            0.5,
+        ),
+    )
+    beam.conn.commit()
+
+    monkeypatch.setattr(beam_module._embeddings, "available", lambda: True)
+    monkeypatch.setattr(
+        beam_module._embeddings,
+        "embed_query",
+        lambda _query: np.array([1.0, 0.0, 0.0], dtype=np.float32),
+    )
+    monkeypatch.setattr(
+        beam_module,
+        "_wm_vec_search",
+        lambda conn, emb, k=20, **kwargs: [{"id": memory_id, "sim": 0.92}],
+    )
+    monkeypatch.setattr(beam_module, "_vec_available", lambda conn: False)
+    monkeypatch.setattr(beam_module, "_in_memory_vec_search", lambda conn, emb, k=20: [])
+    monkeypatch.setattr(beam_module, "_fts_search", lambda conn, query, k=20: [])
+    monkeypatch.setattr(beam_module, "_find_memories_by_entity", lambda self, query: [])
+    monkeypatch.setattr(beam_module, "_find_memories_by_fact", lambda self, query: [])
+
+    results = beam.recall("user communication style preferences", top_k=5)
+
+    assert [r["id"] for r in results if r.get("tier") == "working"] == [memory_id]
+    assert results[0]["dense_score"] == pytest.approx(0.92, rel=1e-6)
+
+
 def test_vec_working_coverage_reports_missing_and_repair_fills_gap(temp_db):
     beam = BeamMemory(session_id="vec-working-coverage", db_path=temp_db)
     _require_vec_working(beam.conn)

@@ -6,6 +6,7 @@ import textwrap
 from pathlib import Path
 
 import pytest
+from unittest.mock import patch
 
 from hermes_memory_provider.tier1 import Tier1Passthrough
 
@@ -180,6 +181,15 @@ class TestRecall:
         results = t1.recall("Quiet")
         assert len(results) == 1
         assert results[0]["source"] == "user"
+
+
+class TestHomeResolution:
+    def test_default_home_uses_hermes_core_profile_path(self, tmp_path: Path):
+        profile_home = tmp_path / ".hermes" / "profiles" / "switch"
+        with patch("hermes_constants.get_hermes_home", return_value=profile_home):
+            t1 = Tier1Passthrough()
+        assert t1.memory_path == profile_home / "memories" / "MEMORY.md"
+        assert t1.user_path == profile_home / "memories" / "USER.md"
 
 
 # ---------------------------------------------------------------------------

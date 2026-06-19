@@ -5443,7 +5443,13 @@ class BeamMemory:
             else:
                 relevance = _lexical_relevance(query_words, row["content"], query_lower)
                 row_min_relevance = single_token_relevance if broad_multi_hit_query else min_relevance
-            if relevance >= row_min_relevance or (wm_ranks and len(query_words) <= 1 and relevance > 0):
+            vec_sim = wm_vec_sims.get(row["id"], 0.0)
+            strong_vector_only_hit = vec_sim >= 0.65
+            if (
+                relevance >= row_min_relevance
+                or (wm_ranks and len(query_words) <= 1 and relevance > 0)
+                or strong_vector_only_hit
+            ):
                 decay = _recency_decay(row["timestamp"])
                 # Phase 4: configurable scoring for working memory
                 # keyword_share = (1 - importance_weight) * 0.6, recency_share = (1 - importance_weight) * 0.4
@@ -5451,7 +5457,6 @@ class BeamMemory:
                 rc_share = (1.0 - iw) * 0.4
                 base_score = relevance * kw_share + row["importance"] * iw + (relevance ** 2) * 0.08
                 # Blend vector similarity into working memory score (weighted toward keyword precision)
-                vec_sim = wm_vec_sims.get(row["id"], 0.0)
                 if vec_sim > 0:
                     base_score = base_score * 0.80 + vec_sim * 0.20
                 score = base_score * (rc_share + (1.0 - rc_share) * decay)
