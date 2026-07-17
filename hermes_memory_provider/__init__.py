@@ -1465,8 +1465,22 @@ class MnemosyneMemoryProvider(MemoryProvider):
             config_path = os.path.join(self._hermes_home, "config.yaml") if self._hermes_home else ""
             if not config_path or not os.path.exists(config_path):
                 return None
-            with open(config_path, "r") as f:
-                config = yaml.safe_load(f) or {}
+            # Cache parsed YAML by (path, mtime). _apply_provider_config calls
+            # this once per key and a fresh provider is built on every AIAgent
+            # construction, so an uncached safe_load re-parsed config.yaml on
+            # every request — the second half of the #169 loop stall (~4400 of
+            # 5306 agent-init samples were here).
+            # ponytail: dict get/set is atomic in CPython; a rare concurrent
+            # miss just re-parses, so no lock. Invalidates on file mtime change.
+            mtime = os.path.getmtime(config_path)
+            cache = globals().setdefault("_MNEMOSYNE_CONFIG_CACHE", {})
+            hit = cache.get(config_path)
+            if hit and hit[0] == mtime:
+                config = hit[1]
+            else:
+                with open(config_path, "r") as f:
+                    config = yaml.safe_load(f) or {}
+                cache[config_path] = (mtime, config)
             return config.get("memory", {}).get("mnemosyne", {}).get(key)
         except Exception:
             return None
