@@ -151,7 +151,7 @@ class TestPairedOutcomesJSONL:
 
     def test_harness_help_shows_config_id_flag(self):
         """`--config-id` flag is exposed."""
-        harness = _REPO_ROOT / "tools" / "evaluate_beam_end_to_end.py"
+        harness = _REPO_ROOT / "_benchmarks" / "evaluate_beam_end_to_end.py"
         result = subprocess.run(
             [sys.executable, str(harness), "--help"],
             capture_output=True, text=True, timeout=30,
@@ -187,7 +187,7 @@ class TestPairedOutcomesJSONL:
     def test_paired_outcomes_file_constant_defined(self):
         """The harness module exposes PAIRED_OUTCOMES_FILE so tests
         and downstream tools have a stable reference."""
-        import tools.evaluate_beam_end_to_end as harness
+        import _benchmarks.evaluate_beam_end_to_end as harness
         assert hasattr(harness, "PAIRED_OUTCOMES_FILE")
         assert str(harness.PAIRED_OUTCOMES_FILE).endswith("paired_outcomes.jsonl")
 
@@ -232,5 +232,5 @@ class TestPairedOutcomesJSONL:
     def test_paired_outcomes_constants_path_under_results(self):
         """Paired outcomes file should live alongside the main results
         JSON, both under `results/`. Pins the convention."""
-        import tools.evaluate_beam_end_to_end as harness
+        import _benchmarks.evaluate_beam_end_to_end as harness
         assert harness.PAIRED_OUTCOMES_FILE.parent == harness.RESULTS_FILE.parent

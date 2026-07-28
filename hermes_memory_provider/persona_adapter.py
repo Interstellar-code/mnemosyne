@@ -1,5 +1,5 @@
 """
-Persona adapter for the hermes_memory_provider package (v3.10.0).
+Persona adapter for the hermes_memory_provider package (v3.11.1).
 
 Exposes the L3 persona tier as 4 tools:
 - mnemosyne_persona_promote(memory_id, tier, reason)

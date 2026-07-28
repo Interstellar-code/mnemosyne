@@ -1,4 +1,4 @@
-"""Tool schemas for the L3 persona layer (v3.10.0).
+"""Tool schemas for the L3 persona layer (v3.11.1).
 
 4 tools: promote, demote, list, reinforce.
 All schema names follow mnemosyne_persona_* convention used elsewhere

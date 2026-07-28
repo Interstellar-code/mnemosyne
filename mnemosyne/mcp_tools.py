@@ -106,15 +106,13 @@ _GET_STATS_SCHEMA = _SchemaProxy("mnemosyne_stats")
 # Helper functions
 # ---------------------------------------------------------------------------
 
-_MNEMOSYNE_HOME = os.environ.get("MNEMOSYNE_HOME", str(Path.home() / ".hermes" / "mnemosyne"))
+_HERMES_HOME = os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))
+_MNEMOSYNE_HOME = os.environ.get("MNEMOSYNE_HOME", str(Path(_HERMES_HOME) / "mnemosyne"))
 
 
 def _shared_db_path() -> Path:
     """Return the shared surface DB path."""
     return Path(os.environ.get("MNEMOSYNE_SHARED_DB_PATH", str(Path(_MNEMOSYNE_HOME) / "data" / "shared" / "mnemosyne.db")))
-
-
-_HERMES_HOME = os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))
 
 
 def _create_instance(session_id: str = None, author_id: str = None,

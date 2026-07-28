@@ -51,6 +51,7 @@ def _get_connection(db_path: str) -> sqlite3.Connection:
 def get_memory_stats(db_path: str) -> Dict[str, Any]:
     """Get memory statistics across all tiers."""
     stats: Dict[str, Any] = {"tiers": {}, "total": 0}
+    conn = None
     try:
         conn = _get_connection(db_path)
         cursor = conn.cursor()
@@ -86,9 +87,13 @@ def get_memory_stats(db_path: str) -> Dict[str, Any]:
                 cursor.execute(f"SELECT COUNT(*) FROM {fts_table}")
                 stats[f"fts_{fts_table}"] = cursor.fetchone()[0]
 
-        conn.close()
     except Exception as e:
         stats["error"] = str(e)
+    finally:
+        # close() used to sit inside the try, so any query that raised leaked
+        # the connection outright (hermes-agent#196).
+        if conn is not None:
+            conn.close()
     return stats
 
 
@@ -103,6 +108,7 @@ def search_memories(
 ) -> List[Dict[str, Any]]:
     """Search memories with optional filters."""
     results: List[Dict[str, Any]] = []
+    conn = None
     try:
         conn = _get_connection(db_path)
         cursor = conn.cursor()
@@ -156,14 +162,17 @@ def search_memories(
                     "tier": table,
                 })
 
-        conn.close()
     except Exception as e:
         logger.warning("Search error: %s", e)
+    finally:
+        if conn is not None:
+            conn.close()
     return results
 
 
 def get_memory_detail(db_path: str, memory_id: str) -> Optional[Dict[str, Any]]:
     """Get a single memory by ID."""
+    conn = None
     try:
         conn = _get_connection(db_path)
         cursor = conn.cursor()
@@ -178,12 +187,13 @@ def get_memory_detail(db_path: str, memory_id: str) -> Optional[Dict[str, Any]]:
             if row:
                 result = dict(row)
                 result["tier"] = table
-                conn.close()
                 return result
 
-        conn.close()
     except Exception as e:
         logger.warning("Detail error: %s", e)
+    finally:
+        if conn is not None:
+            conn.close()
     return None
 
 

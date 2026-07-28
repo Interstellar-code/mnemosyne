@@ -9,6 +9,7 @@ Mnemosyne runs everywhere. Pick your platform:
 | [OpenAI Codex CLI](codex-mcp.md) | MCP (stdio) | `.codex/mcp.json` |
 | [Windsurf](windsurf-mcp.md) | MCP (stdio) | `.windsurf/mcp_config.json` |
 | [OpenWebUI](openwebui-tool.md) | Native @tool | Workspace tool config |
+| [Pi](pi.md) | Pi extension + skill | `pi install npm:@mnemosyne-oss/pi-mnemosyne` |
 | [Hermes Agent](hermes-mcp.md) | MCP + Plugin | `~/.hermes/config.yaml` |
 
 ## Quick Start (any MCP client)
