@@ -46,7 +46,11 @@ def _default_data_dir() -> Path:
     """Return the current default data directory, honoring runtime env changes."""
     if os.environ.get("MNEMOSYNE_DATA_DIR"):
         return Path(os.environ["MNEMOSYNE_DATA_DIR"])
-    return DEFAULT_DATA_DIR
+    root = Path(
+        os.environ.get("HERMES_HOME")
+        or (Path(os.environ["HOME"]) / ".hermes" if os.environ.get("HOME") else Path.home() / ".hermes")
+    )
+    return root / "mnemosyne" / "data"
 
 
 def _default_db_path() -> Path:
