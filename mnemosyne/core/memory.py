@@ -21,6 +21,7 @@ from pathlib import Path
 
 import os
 
+from mnemosyne.core import conn_sweep
 from mnemosyne.core import embeddings as _embeddings
 from mnemosyne.core.beam import BeamMemory, init_beam, _get_connection as _beam_get_connection
 _thread_local = threading.local()
@@ -58,6 +59,9 @@ def _get_connection(db_path = None) -> sqlite3.Connection:
     path = Path(db_path) if db_path else _default_db_path()
     if not hasattr(_thread_local, 'conn') or _thread_local.conn is None or getattr(_thread_local, 'db_path', None) != str(path):
         path.parent.mkdir(parents=True, exist_ok=True)
+        # Connections stranded by exited threads are cyclic garbage and stay
+        # open until a cyclic collection runs; sweep periodically (#196).
+        conn_sweep.note_connection_opened()
         _thread_local.conn = sqlite3.connect(str(path), check_same_thread=False)
         _thread_local.conn.row_factory = sqlite3.Row
         _thread_local.conn.execute("PRAGMA journal_mode=WAL")

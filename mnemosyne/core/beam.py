@@ -29,6 +29,8 @@ from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional, Any, Set, Union, Tuple
 from pathlib import Path
 
+from mnemosyne.core import conn_sweep
+
 
 logger = logging.getLogger(__name__)
 
@@ -447,6 +449,9 @@ def _get_connection(db_path: Path = None) -> sqlite3.Connection:
 
     if needs_reconnect:
         path.parent.mkdir(parents=True, exist_ok=True)
+        # Connections stranded by exited threads are cyclic garbage and stay
+        # open until a cyclic collection runs; sweep periodically (#196).
+        conn_sweep.note_connection_opened()
         conn = sqlite3.connect(
             str(path),
             check_same_thread=False,
