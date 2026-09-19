@@ -85,7 +85,27 @@ def _get_conn(db_path = None) -> sqlite3.Connection:
 
 
 def init_triples(db_path: Path = None):
+    """Create the triples table and supporting indexes if absent.
+
+    Idempotent. Safe to call on databases that already have the table.
+    Opens and closes its own connection; does not leak file descriptors.
+
+    Mirrors annotations.init_annotations / canonical.init_canonical, which
+    were hardened this way; this function was missed. BeamMemory.__init__
+    calls it on every construction, so the unclosed handle leaked one
+    connection per memory operation — 2 fds each (.db + -wal).
+    """
     conn = _get_conn(db_path)
+    try:
+        _init_triples_with_conn(conn)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _init_triples_with_conn(conn: sqlite3.Connection) -> None:
     cursor = conn.cursor()
     
     cursor.execute("""
