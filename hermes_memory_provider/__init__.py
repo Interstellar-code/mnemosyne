@@ -20,6 +20,7 @@ import os
 import re
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
@@ -1147,6 +1148,14 @@ class MnemosyneMemoryProvider(MemoryProvider):
     # it's not re-parsed on every _maybe_auto_sleep call.
     _AUTO_SLEEP_TIMEOUT_SECONDS = _parse_env_float("MNEMOSYNE_AUTO_SLEEP_TIMEOUT", 5)
 
+    # One cross-session auto-sleep sweep in flight per process. Class-level
+    # because a gateway runs one provider instance per agent session, all
+    # sharing the same DB(s).
+    # ponytail: process-global lock, per-db_path locks if multiple banks need concurrent sweeps.
+    _SWEEP_LOCK = threading.Lock()
+    # monotonic time the lock was taken; only used to warn about a stuck sweep.
+    _SWEEP_HELD_SINCE: Optional[float] = None
+
     _VALID_SYNC_ROLES: frozenset = frozenset({"user", "assistant"})
 
     def __init__(self):
@@ -1174,6 +1183,10 @@ class MnemosyneMemoryProvider(MemoryProvider):
         self._turn_count = 0
         self._auto_sleep_threshold = 50
         self._auto_sleep_enabled = os.environ.get("MNEMOSYNE_AUTO_SLEEP_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
+        # Bounds for the cross-session auto-sleep sweep (oldest sessions first).
+        # Negative max_sessions disables the cap.
+        self._sweep_max_sessions = _parse_env_optional_int("MNEMOSYNE_SLEEP_SWEEP_MAX_SESSIONS", 10)
+        self._sweep_time_budget = _parse_env_float("MNEMOSYNE_SLEEP_SWEEP_TIME_BUDGET", 120.0)
         # Reflection/sleep guardrails.  "reflection" maps to Mnemosyne's
         # sleep/consolidation path in the Hermes provider.  Cron skipping is
         # default-on per issue #337; max_calls_per_session defaults to 3 and
@@ -1214,6 +1227,8 @@ class MnemosyneMemoryProvider(MemoryProvider):
         # daemon thread from racing with unregister and falling through to
         # MNEMOSYNE_LLM_BASE_URL.
         self._session_end_thread: Optional[threading.Thread] = None
+        # Last auto-sleep worker thread (tests join it).
+        self._sweep_thread: Optional[threading.Thread] = None
         # C13: per-instance tracking of whether THIS provider contributed
         # to the module-level _active_provider_count. Lets each instance
         # increment exactly once on activate and decrement exactly once on
@@ -1329,6 +1344,22 @@ class MnemosyneMemoryProvider(MemoryProvider):
             except (TypeError, ValueError):
                 logger.warning("Mnemosyne: invalid sleep_threshold=%r, keeping %d",
                                sleep_threshold, self._auto_sleep_threshold)
+
+        # cross-session sweep bounds: kwargs > config.yaml > env/defaults (__init__)
+        sweep_max = kwargs.get("sleep_sweep_max_sessions")
+        if sweep_max is None:
+            sweep_max = self._read_config_key("sleep_sweep_max_sessions")
+        if sweep_max is not None:
+            self._sweep_max_sessions = _coerce_optional_int(sweep_max, self._sweep_max_sessions)
+        sweep_budget = kwargs.get("sleep_sweep_time_budget")
+        if sweep_budget is None:
+            sweep_budget = self._read_config_key("sleep_sweep_time_budget")
+        if sweep_budget is not None:
+            try:
+                self._sweep_time_budget = float(sweep_budget)
+            except (TypeError, ValueError):
+                logger.warning("Mnemosyne: invalid sleep_sweep_time_budget=%r, keeping %s",
+                               sweep_budget, self._sweep_time_budget)
 
         # reflect guardrails: prefer kwargs, then memory.mnemosyne.reflect,
         # then flat memory.mnemosyne keys, then env/defaults set in __init__.
@@ -1515,6 +1546,8 @@ class MnemosyneMemoryProvider(MemoryProvider):
         return [
             {"key": "auto_sleep", "description": "Auto-run sleep() when working memory exceeds threshold. Set true to enable. Backward-compatible with MNEMOSYNE_AUTO_SLEEP_ENABLED env var.", "default": False},
             {"key": "sleep_threshold", "description": "Working memory count before auto-sleep triggers", "default": 50},
+            {"key": "sleep_sweep_max_sessions", "description": "Max sessions (oldest first) consolidated per cross-session auto-sleep sweep. Negative disables the cap. Env: MNEMOSYNE_SLEEP_SWEEP_MAX_SESSIONS.", "default": 10},
+            {"key": "sleep_sweep_time_budget", "description": "Seconds after which a cross-session auto-sleep sweep stops starting new sessions. Env: MNEMOSYNE_SLEEP_SWEEP_TIME_BUDGET.", "default": 120},
             {"key": "reflect", "description": "Reflection/sleep guardrails. Supports disabled_for_cron (default true) and max_calls_per_session (default 3; negative disables cap). Env: MNEMOSYNE_REFLECT_DISABLED_FOR_CRON, MNEMOSYNE_REFLECT_MAX_CALLS_PER_SESSION.", "default": {"disabled_for_cron": True, "max_calls_per_session": 3}},
             {"key": "vector_type", "description": "Vector storage type (note: not yet wired to BeamMemory at runtime; reserved for future use)", "choices": ["float32", "int8", "bit"], "default": "int8"},
             {"key": "ignore_patterns", "description": "Regex patterns to filter from memory storage (one per line in config, or comma-separated). Memories matching any pattern are skipped.", "default": []},
@@ -2023,41 +2056,104 @@ class MnemosyneMemoryProvider(MemoryProvider):
             stats = self._beam.get_working_stats()
             working = stats.get("total", 0)
             if working > self._auto_sleep_threshold:
-                # Cheap eligibility check: are there any unconsolidated
-                # working memories old enough to consolidate?
+                from mnemosyne.core import local_llm
                 cutoff = (datetime.now() - timedelta(hours=WORKING_MEMORY_TTL_HOURS // 2)).isoformat()
-                eligible = self._beam._count_unconsolidated_before(cutoff)
+                # With the Hermes host LLM backend (registered in initialize())
+                # sweep old memories across ALL sessions -- sleep() alone
+                # strands every inactive session. Host-only: an unattended
+                # sweep must not fall to a remote URL / local GGUF, and must
+                # never degrade a whole backlog to lossy AAAK compression.
+                # sleep_sweep_max_sessions=0 disables the sweep. Otherwise
+                # stay session-local (pre-#252 behaviour).
+                sweep = self._sweep_max_sessions != 0 and local_llm._host_backend_will_handle_call()
+                if not sweep:
+                    logger.info("Mnemosyne auto-sleep: no host LLM backend or sweep disabled — "
+                                "cross-session sweep skipped, session-local sleep only")
+                # Eligibility counted over exactly what the action consolidates.
+                eligible = self._beam._count_unconsolidated_before(
+                    cutoff, session_id=None if sweep else self._beam.session_id,
+                    respect_backoff=sweep)
                 if eligible == 0:
                     return
-
-                skip = self._reserve_reflection_budget("auto_sleep")
-                if skip is not None:
-                    logger.info("Mnemosyne auto-sleep skipped: %s", json.dumps(skip))
+                if sweep and not self._SWEEP_LOCK.acquire(blocking=False):
+                    held_since = MnemosyneMemoryProvider._SWEEP_HELD_SINCE
+                    # ponytail: warn-only; a hung host LLM call holds the lock
+                    # until the process restarts. Add a per-call LLM timeout
+                    # or a force-release if this warning shows up in practice.
+                    if held_since is not None and time.monotonic() - held_since > 3 * self._sweep_time_budget:
+                        logger.warning("Mnemosyne auto-sleep: sweep lock held for %.0fs (> 3x time budget) — "
+                                       "previous sweep may be hung", time.monotonic() - held_since)
+                    else:
+                        logger.debug("Mnemosyne auto-sleep: sweep already in flight, skipping")
                     return
+                if sweep:
+                    MnemosyneMemoryProvider._SWEEP_HELD_SINCE = time.monotonic()
 
-                logger.info("Mnemosyne auto-sleep: working=%d, eligible=%d > threshold=%d", working, eligible, self._auto_sleep_threshold)
-                # Use session-scoped sleep to avoid timeout on large databases.
-                # Create a SEPARATE BeamMemory instance for the daemon thread
-                # so it gets its own SQLite connection via _thread_local.
-                # Reusing self._beam.conn from a daemon thread races with the
-                # main thread's sync_turn() writes, causing episodic INSERT
-                # failures (commit rolled back by concurrent main-thread writes).
-                beam_ref = self._beam
-                def _sleep_isolated():
-                    try:
-                        BeamClass = _get_beam_class()
-                        sleep_beam = BeamClass(
-                            session_id=beam_ref.session_id,
-                            db_path=beam_ref.db_path,
-                            author_id=beam_ref.author_id,
-                            author_type=beam_ref.author_type,
-                            channel_id=beam_ref.channel_id,
-                        )
-                        sleep_beam.sleep()
-                    except Exception as inner:
-                        logger.debug("Mnemosyne auto-sleep worker failed: %s", inner)
-                sleep_thread = threading.Thread(target=_sleep_isolated, daemon=True)
-                sleep_thread.start()
+                thread_started = False
+                try:
+                    skip = self._reserve_reflection_budget("auto_sleep")
+                    if skip is not None:
+                        logger.info("Mnemosyne auto-sleep skipped: %s", json.dumps(skip))
+                        return
+
+                    logger.info("Mnemosyne auto-sleep (%s): working=%d, eligible=%d > threshold=%d",
+                                "sweep" if sweep else "session", working, eligible, self._auto_sleep_threshold)
+                    # Create a SEPARATE BeamMemory instance for the daemon thread
+                    # so it gets its own SQLite connection via _thread_local.
+                    # Reusing self._beam.conn from a daemon thread races with the
+                    # main thread's sync_turn() writes, causing episodic INSERT
+                    # failures (commit rolled back by concurrent main-thread writes).
+                    beam_ref = self._beam
+                    max_sessions = self._sweep_max_sessions
+                    time_budget = self._sweep_time_budget
+                    def _sleep_isolated():
+                        try:
+                            BeamClass = _get_beam_class()
+                            sleep_beam = BeamClass(
+                                session_id=beam_ref.session_id,
+                                db_path=beam_ref.db_path,
+                                author_id=beam_ref.author_id,
+                                author_type=beam_ref.author_type,
+                                channel_id=beam_ref.channel_id,
+                            )
+                            if not sweep:
+                                sleep_beam.sleep()
+                                return
+                            # Claims left by a sleep killed mid-run (e.g. a
+                            # session-end thread outliving its process) are
+                            # never retried otherwise.
+                            # 6h staleness: well past any sweep's time budget,
+                            # so an in-flight sleep's claims are never stolen.
+                            from mnemosyne.core.beam import CONSOLIDATION_RETRY_BACKOFF_SECONDS
+                            sleep_beam.reclaim_orphans(stale_after_seconds=CONSOLIDATION_RETRY_BACKOFF_SECONDS)
+                            result = sleep_beam.sleep_all_sessions(
+                                max_sessions=max_sessions,
+                                time_budget_seconds=time_budget,
+                                require_host_llm=True,
+                            )
+                            logger.info(
+                                "Mnemosyne auto-sleep sweep: sessions=%s items=%s llm=%s stopped=%s",
+                                result.get("sessions_consolidated"), result.get("items_consolidated"),
+                                result.get("llm_used"), result.get("stopped_reason"),
+                            )
+                        except Exception as inner:
+                            logger.debug("Mnemosyne auto-sleep worker failed: %s", inner)
+                        finally:
+                            if sweep:
+                                MnemosyneMemoryProvider._SWEEP_HELD_SINCE = None
+                                self._SWEEP_LOCK.release()
+                    sleep_thread = threading.Thread(target=_sleep_isolated, daemon=True)
+                    self._sweep_thread = sleep_thread
+                    sleep_thread.start()
+                    thread_started = True
+                finally:
+                    if sweep and not thread_started:
+                        MnemosyneMemoryProvider._SWEEP_HELD_SINCE = None
+                        self._SWEEP_LOCK.release()
+                if sweep:
+                    # Bounded by max_sessions/time budget; never joined so a
+                    # slow LLM cannot hold up the sync_turn worker.
+                    return
                 sleep_thread.join(timeout=self._AUTO_SLEEP_TIMEOUT_SECONDS)
                 if sleep_thread.is_alive():
                     logger.warning("Mnemosyne auto-sleep timed out after %.0fs — consolidation deferred", self._AUTO_SLEEP_TIMEOUT_SECONDS)
@@ -3129,22 +3225,26 @@ class MnemosyneMemoryProvider(MemoryProvider):
                 )
         self._session_end_thread = None
 
-        # Symmetric with initialize(): clear the Hermes host LLM backend so a
-        # process that later uses Mnemosyne outside Hermes does not retain a
-        # stale reference into agent.auxiliary_client.
-        try:
-            from hermes_memory_provider.hermes_llm_adapter import unregister_hermes_host_llm
-            unregister_hermes_host_llm()
-        except Exception as exc:
-            logger.debug("Mnemosyne could not unregister Hermes auxiliary LLM backend: %s", exc)
-        self._beam = None
-
         # C13: decrement this instance's contribution to the module-level
         # active-provider count. ``_provider_active`` stays True if other
         # provider instances are still active in the process (codex
         # review #3 -- a single shared bool can't represent multi-
         # instance lifecycle).
         self._deactivate_in_module()
+
+        # Symmetric with initialize(): clear the Hermes host LLM backend so a
+        # process that later uses Mnemosyne outside Hermes does not retain a
+        # stale reference into agent.auxiliary_client. The backend is
+        # process-global: only the last active primary instance clears it,
+        # otherwise every gateway session end would pull it out from under
+        # other sessions and any in-flight auto-sleep sweep (#252).
+        if self._agent_context not in self._skip_contexts and _active_provider_count == 0:
+            try:
+                from hermes_memory_provider.hermes_llm_adapter import unregister_hermes_host_llm
+                unregister_hermes_host_llm()
+            except Exception as exc:
+                logger.debug("Mnemosyne could not unregister Hermes auxiliary LLM backend: %s", exc)
+        self._beam = None
 
 
 # ---------------------------------------------------------------------------

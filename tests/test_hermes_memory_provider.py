@@ -126,6 +126,8 @@ def test_shutdown_clears_host_backend(monkeypatch):
     """
     from hermes_memory_provider import hermes_llm_adapter
 
+    import hermes_memory_provider as hmp
+    monkeypatch.setattr(hmp, "_active_provider_count", 0)
     provider = MnemosyneMemoryProvider()
     # Manually register to simulate a live session.
     hermes_llm_adapter.register_hermes_host_llm()
@@ -134,6 +136,26 @@ def test_shutdown_clears_host_backend(monkeypatch):
     provider.shutdown()
     assert get_host_llm_backend() is None
     assert provider._beam is None
+
+
+def test_shutdown_preserves_host_backend_while_other_instances_active(monkeypatch):
+    """#252: the backend is process-global; one gateway session ending must
+    not unregister it for the other sessions (or an in-flight sleep sweep)."""
+    import hermes_memory_provider as hmp
+    from hermes_memory_provider import hermes_llm_adapter
+
+    monkeypatch.setattr(hmp, "_active_provider_count", 0)
+    first, second = MnemosyneMemoryProvider(), MnemosyneMemoryProvider()
+    first._activate_in_module()
+    second._activate_in_module()
+    hermes_llm_adapter.register_hermes_host_llm()
+    try:
+        first.shutdown()
+        assert get_host_llm_backend() is not None
+        second.shutdown()
+        assert get_host_llm_backend() is None
+    finally:
+        hermes_llm_adapter.unregister_hermes_host_llm()
 
 
 def test_shutdown_skip_context_preserves_host_backend(monkeypatch):
@@ -915,7 +937,12 @@ class TestMaybeAutoSleep:
     """Verify _maybe_auto_sleep uses session-scoped sleep with isolated connection."""
 
     def _make_provider(self, monkeypatch, beam_mock=None):
-        """Helper: create a provider with a mocked beam."""
+        """Helper: create a provider with a mocked beam.
+
+        No LLM backend: these tests cover the session-local path; the
+        cross-session sweep is covered in test_auto_sleep_sweep.py.
+        """
+        monkeypatch.setattr("mnemosyne.core.local_llm._host_backend_will_handle_call", lambda: False)
         if beam_mock is None:
             beam_mock = MagicMock()
             beam_mock.session_id = "hermes_test123"
@@ -930,7 +957,7 @@ class TestMaybeAutoSleep:
         return provider
 
     def test_auto_sleep_uses_session_scoped_sleep_not_sleep_all_sessions(self, monkeypatch):
-        """_maybe_auto_sleep must call beam.sleep(), NOT sleep_all_sessions()."""
+        """Without an LLM, _maybe_auto_sleep must call beam.sleep(), NOT sleep_all_sessions()."""
         beam_mock = MagicMock()
         beam_mock.session_id = "hermes_test123"
         beam_mock.db_path = "/tmp/test.db"

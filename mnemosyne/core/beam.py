@@ -283,6 +283,15 @@ WM_PINNED_IDS = set(
 )
 EPISODIC_RECALL_LIMIT = int(os.environ.get("MNEMOSYNE_EP_LIMIT", "50000"))
 SLEEP_BATCH_SIZE = int(os.environ.get("MNEMOSYNE_SLEEP_BATCH", "5000"))
+# Backoff for rows a no-AAAK sleep could not summarize: they are un-claimed with
+# consolidation_claimed_at=<failure time> (consolidated_at stays NULL) and the
+# host-LLM sweep skips them until this has elapsed. Also the sweep's
+# reclaim_orphans() staleness, so an in-flight sleep's claims are never stolen.
+CONSOLIDATION_RETRY_BACKOFF_SECONDS = 6 * 3600
+
+
+def _retry_backoff_cutoff() -> str:
+    return (datetime.now() - timedelta(seconds=CONSOLIDATION_RETRY_BACKOFF_SECONDS)).isoformat()
 SCRATCHPAD_MAX_ITEMS = int(os.environ.get("MNEMOSYNE_SP_MAX", "1000"))
 RECENCY_HALFLIFE_HOURS = float(os.environ.get("MNEMOSYNE_RECENCY_HALFLIFE", "168"))  # 1 week default
 
@@ -3933,18 +3942,29 @@ class BeamMemory:
             "last": last[0] if last else None,
         }
 
-    def _count_unconsolidated_before(self, cutoff: str) -> int:
+    def _count_unconsolidated_before(self, cutoff: str, session_id: Optional[str] = None,
+                                     respect_backoff: bool = False) -> int:
         """Count working memories eligible for consolidation before cutoff.
         Used by _maybe_auto_sleep() to skip full sleep passes when nothing
         is eligible — avoids unnecessary database work on always-on agents
-        with longer TTLs after a prior auto-sleep already consolidated everything."""
+        with longer TTLs after a prior auto-sleep already consolidated everything.
+
+        session_id=None counts DB-wide (what sleep_all_sessions() consolidates);
+        a session_id counts only what sleep() for that session would pick up.
+        respect_backoff=True excludes rows in their failed-summary backoff,
+        matching sleep_all_sessions(require_host_llm=True)."""
         cursor = self.conn.cursor()
-        cursor.execute(
-            "SELECT COUNT(*) FROM working_memory "
-            "WHERE timestamp < ? AND consolidated_at IS NULL "
-            "AND (pinned IS NULL OR pinned = 0)",
-            (cutoff,),
-        )
+        sql = ("SELECT COUNT(*) FROM working_memory "
+               "WHERE timestamp < ? AND consolidated_at IS NULL "
+               "AND (pinned IS NULL OR pinned = 0)")
+        params: Tuple[Any, ...] = (cutoff,)
+        if session_id is not None:
+            sql += " AND COALESCE(session_id, 'default') = ?"
+            params += (session_id,)
+        if respect_backoff:
+            sql += " AND (consolidation_claimed_at IS NULL OR consolidation_claimed_at < ?)"
+            params += (_retry_backoff_cutoff(),)
+        cursor.execute(sql, params)
         return cursor.fetchone()[0]
 
     # DEPRECATED -- kept for backward compatibility with hermes_memory_provider/cli.py
@@ -7824,11 +7844,20 @@ class BeamMemory:
             "candidate_ids": candidate_ids,
         }
 
-    def sleep(self, dry_run: bool = False, force: bool = False) -> Dict:
+    def sleep(self, dry_run: bool = False, force: bool = False,
+              allow_aaak: bool = True, run_maintenance: bool = True) -> Dict:
         """
         Consolidate old working_memory for this session into episodic summaries.
         Uses a local lightweight LLM when available; falls back to aaak
         compression if the model is missing or inference fails.
+
+        allow_aaak=False: a source group that gets no LLM summary is
+        un-claimed instead of AAAK-encoded, with consolidation_claimed_at set
+        as a failure marker; rows still in that backoff
+        (CONSOLIDATION_RETRY_BACKOFF_SECONDS) are not selected in this mode.
+        With allow_aaak=True (default) the marker is ignored and the claim
+        below simply overwrites it.
+        run_maintenance=False skips the trailing degrade_episodic() pass.
 
         Post-E3 (additive): the source working_memory rows are NOT
         deleted. Instead they're marked with consolidated_at = NOW
@@ -7860,6 +7889,8 @@ class BeamMemory:
         # consolidated_at IS NULL filters out rows already processed by
         # a prior sleep so we don't re-summarize the same originals.
         # pinned = 1 items survive consolidation and stay in working memory.
+        backoff_sql = "" if allow_aaak else "AND (consolidation_claimed_at IS NULL OR consolidation_claimed_at < ?)"
+        backoff_params = () if allow_aaak else (_retry_backoff_cutoff(),)
         cursor.execute(f"""
             SELECT id, content, source, timestamp, importance, metadata_json, scope, valid_until, veracity
             FROM working_memory
@@ -7867,9 +7898,10 @@ class BeamMemory:
               AND timestamp < ?
               AND consolidated_at IS NULL
               AND (pinned IS NULL OR pinned = 0)
+              {backoff_sql}
             ORDER BY timestamp ASC
             LIMIT {SLEEP_BATCH_SIZE}
-        """, (self.session_id, cutoff))
+        """, (self.session_id, cutoff, *backoff_params))
         rows = cursor.fetchall()
         if not rows:
             return {"status": "no_op", "message": "No old working memories to consolidate"}
@@ -8023,6 +8055,23 @@ class BeamMemory:
                         llm_used_count += 1
                         llm_succeeded = True
 
+            if summary is None and not allow_aaak:
+                logger.warning(
+                    "sleep: no LLM summary for source=%r (items=%d) — "
+                    "un-claiming with retry backoff instead of AAAK fallback", source, len(items),
+                )
+                if not dry_run:
+                    # claimed_at doubles as the failure marker (backoff start);
+                    # reclaim_orphans() ignores it since consolidated_at is NULL.
+                    group_placeholders = ",".join("?" * len(ids))
+                    cursor.execute(
+                        f"UPDATE working_memory SET consolidated_at = NULL, consolidation_claimed_at = ? "
+                        f"WHERE id IN ({group_placeholders})",
+                        (datetime.now().isoformat(), *ids),
+                    )
+                    self.conn.commit()
+                continue
+
             # --- Fallback to aaak encoding ---
             if summary is None:
                 logger.warning(
@@ -8103,6 +8152,10 @@ class BeamMemory:
             summaries_created += 1
 
         method = "llm" if llm_used_count == summaries_created else ("llm+aaak" if llm_used_count > 0 else "aaak")
+        if not dry_run and not consolidated_ids:
+            # Only reachable with allow_aaak=False: every group was un-claimed.
+            return {"status": "no_op", "message": "No LLM summary; rows left for a later sleep",
+                    "items_consolidated": 0, "summaries_created": 0, "llm_used": 0}
         if not dry_run:
             cursor.execute("""
                 INSERT INTO consolidation_log (session_id, items_consolidated, summary_preview, created_at)
@@ -8116,7 +8169,7 @@ class BeamMemory:
             self.conn.commit()
 
         # Run tiered degradation after consolidation
-        degrade_result = self.degrade_episodic(dry_run=dry_run)
+        degrade_result = self.degrade_episodic(dry_run=dry_run) if run_maintenance else None
 
         logger.info(
             "sleep: consolidated=%d summaries=%d conflicts=%d llm=%s method=%s",
@@ -8139,7 +8192,10 @@ class BeamMemory:
             }
         }
 
-    def sleep_all_sessions(self, dry_run: bool = False, force: bool = False) -> Dict:
+    def sleep_all_sessions(self, dry_run: bool = False, force: bool = False,
+                           max_sessions: Optional[int] = None,
+                           time_budget_seconds: Optional[float] = None,
+                           require_host_llm: bool = False) -> Dict:
         """
         Consolidate eligible old working memories across all sessions.
 
@@ -8149,21 +8205,39 @@ class BeamMemory:
 
         When force=True, skips the age cutoff and consolidates all
         non-consolidated working memories across all sessions immediately.
+
+        Bounding (for unattended sweeps): sessions are processed oldest-first;
+        max_sessions caps how many are taken per call, time_budget_seconds stops
+        starting new sessions once exceeded (a session already running is not
+        interrupted). require_host_llm=True (the unattended auto-sleep sweep)
+        consolidates only through the registered host LLM backend: it stops
+        when none is registered, never AAAK-encodes (groups without an LLM
+        summary are un-claimed), and skips the degrade/dedup maintenance
+        passes. Repeated calls drain the backlog.
         """
+        import time
+        from mnemosyne.core import local_llm
+
+        started = time.monotonic()
         cursor = self.conn.cursor()
         cutoff = (datetime.now() - timedelta(hours=WORKING_MEMORY_TTL_HOURS // 2)).isoformat()
         if force:
             cutoff = datetime.max.isoformat()
-        # Mirror sleep()'s filter: only count rows that haven't been
-        # consolidated yet, so we don't redo work on every maintenance pass.
+        # Mirror sleep()'s filter (consolidated_at, pinned, NULL->'default')
+        # so every selected session has rows sleep() will actually pick up --
+        # otherwise a pinned-only session would occupy a max_sessions slot forever.
         cursor.execute("""
-            SELECT session_id, COUNT(*) AS eligible
+            SELECT COALESCE(session_id, 'default') AS session_id, COUNT(*) AS eligible
             FROM working_memory
             WHERE timestamp < ?
               AND consolidated_at IS NULL
-            GROUP BY session_id
+              AND (pinned IS NULL OR pinned = 0)
+              AND (? = 0 OR consolidation_claimed_at IS NULL OR consolidation_claimed_at < ?)
+            GROUP BY COALESCE(session_id, 'default')
             ORDER BY MIN(timestamp) ASC
-        """, (cutoff,))
+            LIMIT ?
+        """, (cutoff, int(require_host_llm), _retry_backoff_cutoff(),
+              -1 if max_sessions is None else max(0, int(max_sessions))))
         session_rows = cursor.fetchall()
         if not session_rows:
             return {
@@ -8187,8 +8261,22 @@ class BeamMemory:
         errors = []
         model_refresh_proposals = 0
         model_refresh_applied = 0
+        stopped_reason = None
+        attempted = 0
 
         for row in session_rows:
+            if (time_budget_seconds is not None and attempted
+                    and time.monotonic() - started >= time_budget_seconds):
+                stopped_reason = "time_budget"
+                break
+            # Checked per session, not once: the host LLM can be unregistered
+            # (last provider shutdown) while a sweep is in flight.
+            if require_host_llm and not dry_run and not local_llm._host_backend_will_handle_call():
+                stopped_reason = "no_host_llm"
+                logger.warning("sleep_all_sessions: no host LLM backend registered — "
+                               "skipping instead of AAAK fallback")
+                break
+            attempted += 1
             session_id = row["session_id"] if hasattr(row, "keys") else row[0]
             if session_id is None:
                 session_id = "default"
@@ -8211,7 +8299,9 @@ class BeamMemory:
                     author_id=self.author_id,
                     author_type=self.author_type,
                 )
-                result = beam.sleep(dry_run=dry_run, force=force)
+                result = beam.sleep(dry_run=dry_run, force=force,
+                                    allow_aaak=not require_host_llm,
+                                    run_maintenance=not require_host_llm)
                 result = dict(result)
                 result["session_id"] = session_id
                 result["eligible"] = row["eligible"] if hasattr(row, "keys") else row[1]
@@ -8232,17 +8322,22 @@ class BeamMemory:
                 )
                 errors.append({"session_id": session_id, "error": repr(exc)})
 
-        # Run tiered degradation after all-sessions consolidation
-        degrade_result = self.degrade_episodic(dry_run=dry_run)
+        # Run tiered degradation after all-sessions consolidation. The
+        # unattended host-LLM sweep skips both passes: they run outside the
+        # time budget and degrade truncates without an LLM.
+        degrade_result = None
+        if not require_host_llm:
+            degrade_result = self.degrade_episodic(dry_run=dry_run)
 
-        # Cross-session MEMORIA dedup: clean up redundant entries across sessions
-        if not dry_run:
-            dedup_result = self._deduplicate_memoria_cross_session()
+            # Cross-session MEMORIA dedup: clean up redundant entries across sessions
+            if not dry_run:
+                dedup_result = self._deduplicate_memoria_cross_session()
 
         return {
             "status": "dry_run" if dry_run else ("consolidated" if items_consolidated else "no_op"),
             "sessions_scanned": len(session_rows),
             "sessions_consolidated": sessions_consolidated,
+            "stopped_reason": stopped_reason,
             "items_consolidated": items_consolidated,
             "summaries_created": summaries_created,
             "llm_used": llm_used,

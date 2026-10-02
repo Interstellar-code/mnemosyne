@@ -27,7 +27,7 @@ class FakeBeam:
     def get_episodic_stats(self):
         return {"total": 1}
 
-    def _count_unconsolidated_before(self, cutoff):
+    def _count_unconsolidated_before(self, cutoff, session_id=None, respect_backoff=False):
         return 1
 
 
