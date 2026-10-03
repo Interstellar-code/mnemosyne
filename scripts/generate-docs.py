@@ -162,7 +162,8 @@ CONFIG_ENTRIES = [
 
     # ── Hermes Provider ──
     {"key": "MNEMOSYNE_SYNC_ROLES", "env": "MNEMOSYNE_SYNC_ROLES", "default": "user", "desc": "Conversation roles to sync into memory; default user-only to avoid assistant transcript noise"},
-    {"key": "MNEMOSYNE_SKIP_CONTEXTS", "env": "MNEMOSYNE_SKIP_CONTEXTS", "default": "cron,flush,subagent,background,skill_loop", "desc": "Comma-separated context names to skip"},
+    {"key": "MNEMOSYNE_SKIP_CONTEXTS", "env": "MNEMOSYNE_SKIP_CONTEXTS", "default": "flush,subagent,background,skill_loop", "desc": "Comma-separated context names to skip"},
+    {"key": "MNEMOSYNE_PASSIVE_SKIP_CONTEXTS", "env": "MNEMOSYNE_PASSIVE_SKIP_CONTEXTS", "default": "cron", "desc": "Comma-separated contexts with passive writes/recall off but explicit memory tools on"},
     {"key": "MNEMOSYNE_SYNC_TURN_USER_LIMIT", "env": "MNEMOSYNE_SYNC_TURN_USER_LIMIT", "default": "500", "desc": "Max chars of user content synced per turn (0=no limit)"},
     {"key": "MNEMOSYNE_SYNC_TURN_ASSISTANT_LIMIT", "env": "MNEMOSYNE_SYNC_TURN_ASSISTANT_LIMIT", "default": "800", "desc": "Max chars of assistant content synced per turn (0=no limit)"},
     {"key": "MNEMOSYNE_PREFETCH_CONTENT_CHARS", "env": "MNEMOSYNE_PREFETCH_CONTENT_CHARS", "default": "0", "desc": "Truncate prefetched content to N chars (0=no truncation)"},

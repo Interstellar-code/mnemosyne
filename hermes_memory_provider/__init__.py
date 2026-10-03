@@ -1120,6 +1120,12 @@ def _parse_env_bool(key: str, default: bool) -> bool:
     return _coerce_bool(os.environ.get(key), default)
 
 
+def _parse_context_set(raw: Any) -> Set[str]:
+    """Agent-context list from a comma-separated string or a list; empty means none."""
+    items = raw.split(",") if isinstance(raw, str) else raw
+    return {str(c).strip() for c in items if str(c).strip()}
+
+
 def _coerce_optional_int(value: Any, default: Optional[int]) -> Optional[int]:
     """Coerce config/env values to a non-negative int; negative means unlimited."""
     if value is None:
@@ -1143,6 +1149,9 @@ class MnemosyneMemoryProvider(MemoryProvider):
     # giving up and letting the daemon thread continue in the background. Tests
     # may shorten this to keep the suite fast. Override via MNEMOSYNE_SESSION_END_TIMEOUT.
     SESSION_END_SLEEP_TIMEOUT_SECONDS = _parse_env_float("MNEMOSYNE_SESSION_END_TIMEOUT", 15)
+
+    # Class-level fallback for instances built via __new__ (tests); __init__ sets {"cron"}.
+    _passive_skip_contexts: Set[str] = frozenset()
 
     # Auto-sleep thread join timeout. Re-read from env once at class level so
     # it's not re-parsed on every _maybe_auto_sleep call.
@@ -1201,14 +1210,21 @@ class MnemosyneMemoryProvider(MemoryProvider):
         if _sync_env is not None:
             _parsed_roles = {r.strip().lower() for r in _sync_env.split(",") if r.strip()}
             self._sync_roles = _parsed_roles & self._VALID_SYNC_ROLES
-        self._skip_contexts = {"cron", "flush", "subagent", "background", "skill_loop"}  # Agent contexts to skip
+        self._skip_contexts = {"flush", "subagent", "background", "skill_loop"}  # Agent contexts to skip
         # Allow override via MNEMOSYNE_SKIP_CONTEXTS env var.
         # Set to empty string to skip nothing (enable all contexts).
         # Set to comma-separated names to customize which contexts skip.
         _skip_env = os.environ.get("MNEMOSYNE_SKIP_CONTEXTS")
         if _skip_env is not None:
-            _parsed = {c.strip() for c in _skip_env.split(",") if c.strip()}
-            self._skip_contexts = _parsed if _parsed else set()
+            self._skip_contexts = _parse_context_set(_skip_env)
+        # hermes-agent#251: passive contexts open the beam so explicit tool calls
+        # (mnemosyne_remember from a cron job) work, but nothing is recorded or
+        # recalled implicitly: no sync_turn, auto-sleep, session-end sleep or
+        # prefetch. skip_contexts wins when a context is in both (full skip).
+        self._passive_skip_contexts = {"cron"}
+        _passive_env = os.environ.get("MNEMOSYNE_PASSIVE_SKIP_CONTEXTS")
+        if _passive_env is not None:
+            self._passive_skip_contexts = _parse_context_set(_passive_env)
         # Prefetch profile selection (env; default "general" = prior behavior).
         self._prefetch_profile = (
             os.environ.get("MNEMOSYNE_PREFETCH_PROFILE", "general").strip() or "general"
@@ -1236,6 +1252,10 @@ class MnemosyneMemoryProvider(MemoryProvider):
         # negative count when shutdown is called on a never-activated
         # instance.
         self._is_active_in_module: bool = False
+
+    def _implicit_memory_off(self) -> bool:
+        """True for skip and passive contexts: no implicit recording/recall/consolidation."""
+        return self._agent_context in self._skip_contexts or self._agent_context in self._passive_skip_contexts
 
     def _activate_in_module(self) -> None:
         """Bump the module-level active-provider count exactly once per
@@ -1416,16 +1436,13 @@ class MnemosyneMemoryProvider(MemoryProvider):
         if shared_surface_path:
             self._shared_surface_path = Path(str(shared_surface_path)).expanduser()
 
-        # skip_contexts: kwargs > config.yaml > env var (already set in __init__)
-        _skip_raw = kwargs.get("skip_contexts")
-        if _skip_raw is None:
-            _skip_raw = self._read_config_key("skip_contexts")
-        if _skip_raw is not None:
-            if isinstance(_skip_raw, str):
-                _parsed = {c.strip() for c in _skip_raw.split(",") if c.strip()}
-                self._skip_contexts = _parsed if _parsed else set()
-            elif isinstance(_skip_raw, (list, tuple, set)):
-                self._skip_contexts = set(str(s).strip() for s in _skip_raw if str(s).strip())
+        # skip_contexts / passive_skip_contexts: kwargs > config.yaml > env var (already set in __init__)
+        for _key in ("skip_contexts", "passive_skip_contexts"):
+            _raw = kwargs.get(_key)
+            if _raw is None:
+                _raw = self._read_config_key(_key)
+            if isinstance(_raw, (str, list, tuple, set)):
+                setattr(self, f"_{_key}", _parse_context_set(_raw))
 
         # sync_roles: which conversation roles to autosave in sync_turn().
         # Default ["user", "assistant"] preserves existing behavior.
@@ -1554,7 +1571,8 @@ class MnemosyneMemoryProvider(MemoryProvider):
             {"key": "profile_isolation", "description": "Enable per-profile memory isolation via Mnemosyne banks. Each Hermes profile gets its own SQLite database under mnemosyne/data/banks/<profile>/. Default false for backward compatibility.", "default": False},
             {"key": "shared_surface_path", "description": "SQLite path for shared surface memories. Default is <mnemosyne>/data/shared/mnemosyne.db.", "default": "data/shared/mnemosyne.db"},
             {"key": "shared_surface_read", "description": "When true, mnemosyne_recall merges shared-surface results into private bank recall, tagging each result with its bank ('private' or 'surface'). Default false.", "default": False},
-            {"key": "skip_contexts", "description": "Agent contexts where Mnemosyne should skip initialization. Comma-separated list. Defaults to 'cron,flush,subagent,background,skill_loop'. Set to empty string to enable all contexts. Also configurable via MNEMOSYNE_SKIP_CONTEXTS env var.", "default": "cron,flush,subagent,background,skill_loop"},
+            {"key": "skip_contexts", "description": "Agent contexts where Mnemosyne should skip initialization. Comma-separated list. Defaults to 'flush,subagent,background,skill_loop'. Add 'cron' to fully skip cron runs. Set to empty string to enable all contexts. Also configurable via MNEMOSYNE_SKIP_CONTEXTS env var.", "default": "flush,subagent,background,skill_loop"},
+            {"key": "passive_skip_contexts", "description": "Agent contexts where explicit Mnemosyne tool calls work but nothing is recorded, recalled or consolidated implicitly (no sync_turn, prefetch, auto-sleep, session-end sleep). Comma-separated list. Defaults to 'cron'. Also configurable via MNEMOSYNE_PASSIVE_SKIP_CONTEXTS env var.", "default": "cron"},
             {"key": "sync_roles", "description": "Conversation roles to autosave in sync_turn(). List of role names: 'user', 'assistant'. Default ['user', 'assistant'] saves both. Set to ['user'] for user turns only, or [] to disable conversation autosave entirely. Does not affect explicit mnemosyne_remember calls. Identity signal capture is gated by user sync — excluding 'user' also disables identity extraction. Also configurable via MNEMOSYNE_SYNC_ROLES env var.", "default": ["user", "assistant"]},
             {"key": "default_scope", "description": "Default scope for remember() calls when not explicitly specified. 'session' (default) limits memories to the current session. 'global' persists memories across sessions.", "choices": ["session", "global"], "default": "session"},
         ]
@@ -1727,16 +1745,21 @@ class MnemosyneMemoryProvider(MemoryProvider):
         # becomes redundant -- but until then it's the conservative
         # choice (codex review #1).
         if self._beam is not None:
+            # beam.sleep() reads this to skip model-refresh mutation in cron.
+            self._beam.agent_context = self._agent_context
             self._activate_in_module()
             self._init_audit_log()
             # matrix-memory contract (v0.2): build Tier 1/wiki/safety, run the
             # one-time MEMORY.md/USER.md migration, and start the wiki poller.
             try:
                 self._ensure_contract()
-                self._tier1.migrate_once(
-                    lambda content, source="semantic": self._beam.remember(content=content, source=source)
-                )
-                self._wiki.start_polling()
+                # Migration and the wiki poller are passive writers; the
+                # primary instance owns them (a cron run must not claim them).
+                if not self._implicit_memory_off():
+                    self._tier1.migrate_once(
+                        lambda content, source="semantic": self._beam.remember(content=content, source=source)
+                    )
+                    self._wiki.start_polling()
             except Exception as exc:
                 logger.warning("matrix-memory contract init skipped: %s", exc)
 
@@ -1800,7 +1823,7 @@ class MnemosyneMemoryProvider(MemoryProvider):
         The profile selects which sources to merge (default: just the memory
         ``bank``), the recall knobs, and the filter/dedup toggles. The default
         ``general`` profile reproduces the prior single-source behavior exactly."""
-        if not self._beam or self._agent_context in self._skip_contexts:
+        if not self._beam or self._implicit_memory_off():
             return ""
         profile = _resolve_profile(self._prefetch_profile)
         blocks: List[str] = []
@@ -1990,7 +2013,7 @@ class MnemosyneMemoryProvider(MemoryProvider):
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
         """Persist the turn to Mnemosyne episodic memory."""
-        if not self._beam or self._agent_context in self._skip_contexts:
+        if not self._beam or self._implicit_memory_off():
             return
         try:
             if "user" in self._sync_roles and user_content and len(user_content) > 5 and not self._should_filter(user_content):
@@ -3135,7 +3158,7 @@ class MnemosyneMemoryProvider(MemoryProvider):
         # the daemon-thread pattern already used by _maybe_auto_sleep above:
         # the thread keeps running in the background if it overruns, but the
         # main shutdown path is freed after the join timeout.
-        if not self._beam:
+        if not self._beam or self._implicit_memory_off():
             return
         try:
             skip = self._reserve_reflection_budget("session_end")
@@ -3238,7 +3261,8 @@ class MnemosyneMemoryProvider(MemoryProvider):
         # process-global: only the last active primary instance clears it,
         # otherwise every gateway session end would pull it out from under
         # other sessions and any in-flight auto-sleep sweep (#252).
-        if self._agent_context not in self._skip_contexts and _active_provider_count == 0:
+        # Passive contexts (cron runs inside the gateway) never unregister it either.
+        if not self._implicit_memory_off() and _active_provider_count == 0:
             try:
                 from hermes_memory_provider.hermes_llm_adapter import unregister_hermes_host_llm
                 unregister_hermes_host_llm()

@@ -109,7 +109,8 @@ def test_initialize_skips_for_non_primary_context(monkeypatch):
     """
     provider = MnemosyneMemoryProvider()
     with patch("hermes_memory_provider.hermes_llm_adapter.register_hermes_host_llm") as mock_reg:
-        provider.initialize(session_id="x", agent_context="cron")
+        # cron is passive (beam opens) since hermes-agent#251; subagent is still fully skipped.
+        provider.initialize(session_id="x", agent_context="subagent")
     mock_reg.assert_called_once()  # Backend registered even in skip context
     assert provider._beam is None   # But no beam initialized
 
