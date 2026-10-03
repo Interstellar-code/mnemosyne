@@ -249,10 +249,10 @@ def test_on_session_end_logs_warning_on_timeout(caplog, monkeypatch):
     provider, _, created_beams = _make_provider_with_blocking_sleep(
         sleep_duration=5.0, timeout=0.5, monkeypatch=monkeypatch,
     )
-    with caplog.at_level("WARNING", logger="hermes_memory_provider"):
+    with caplog.at_level("INFO", logger="hermes_memory_provider"):
         provider.on_session_end(messages=[])
     msgs = [r.getMessage() for r in caplog.records]
-    assert any("timed out" in m for m in msgs), msgs
+    assert any("continuing in background" in m for m in msgs), msgs
 
 
 def test_session_end_timeout_default_matches_design(monkeypatch):

@@ -3187,15 +3187,18 @@ class MnemosyneMemoryProvider(MemoryProvider):
                     )
                     sleep_beam.sleep()
                 except Exception as inner:
-                    logger.debug("Mnemosyne session-end sleep failed: %s", inner)
+                    logger.warning("Mnemosyne session-end sleep failed: %s", inner)
 
             sleep_thread = threading.Thread(target=_sleep_with_logging, daemon=True)
             self._session_end_thread = sleep_thread
             sleep_thread.start()
             sleep_thread.join(timeout=timeout)
             if sleep_thread.is_alive():
-                logger.warning(
-                    "Mnemosyne session-end sleep timed out after %ss — consolidation deferred",
+                # Not abandoned: the daemon thread keeps consolidating; only
+                # the caller stops waiting. Lost only if the process exits
+                # first (claims are then reclaimed by the sweep).
+                logger.info(
+                    "Mnemosyne session-end sleep still running after %ss — continuing in background",
                     timeout,
                 )
         except Exception as e:
