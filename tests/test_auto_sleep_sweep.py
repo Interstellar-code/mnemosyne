@@ -227,6 +227,31 @@ def test_host_sweep_skips_maintenance_passes(temp_db, fake_host_llm, monkeypatch
     assert called == []
 
 
+def test_sweep_select_and_census_run_under_session_lock(temp_db, fake_host_llm, monkeypatch):
+    """The session select and the fleet census touch the shared DB too (#498)."""
+    import mnemosyne.core.beam as beam_mod
+
+    lock = threading.RLock()
+    seen = {"select": [], "census": []}
+    real_cutoff = beam_mod._retry_backoff_cutoff
+    monkeypatch.setattr(beam_mod, "_retry_backoff_cutoff",
+                        lambda: seen["select"].append(lock._is_owned()) or real_cutoff())
+    real_census = BeamMemory._attach_fleet_conflict_census
+    monkeypatch.setattr(BeamMemory, "_attach_fleet_conflict_census",
+                        lambda self, result, enabled=True: seen["census"].append(
+                            (enabled, lock._is_owned())) or real_census(self, result, enabled))
+    beam = BeamMemory(session_id="current", db_path=temp_db)
+
+    beam.sleep_all_sessions(require_host_llm=True, session_lock=lock)  # nothing to do
+    _insert(temp_db, [("a", "s1", 400)])
+    beam.sleep_all_sessions(require_host_llm=True, session_lock=lock)
+
+    # both selects, plus sleep()'s own backoff lookup inside the per-session lock
+    assert len(seen["select"]) >= 2 and all(seen["select"])
+    # the sweep's own census calls (enabled=True), not the per-session ones
+    assert [owned for enabled, owned in seen["census"] if enabled] == [True, True]
+
+
 # --- provider._maybe_auto_sleep ---------------------------------------------
 
 def test_auto_sleep_sweep_holds_beam_lock_per_session_only(temp_db, fake_host_llm, monkeypatch):

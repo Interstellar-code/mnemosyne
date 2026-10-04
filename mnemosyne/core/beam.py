@@ -12961,48 +12961,51 @@ class BeamMemory:
         from mnemosyne.core import local_llm
 
         started = time.monotonic()
-        cursor = self.conn.cursor()
-        _cutoff_raw = (
-            datetime.now(timezone.utc)
-            - timedelta(hours=WORKING_MEMORY_TTL_HOURS // 2)
-        ).isoformat()
-        if force:
-            _cutoff_raw = datetime.max.isoformat()
-        cutoff = _utc_cutoff_sql(_cutoff_raw)
-        # Mirror sleep()'s filter (consolidated_at, pinned, superseded_by,
-        # NULL->'default') so every selected session has rows sleep() will
-        # actually pick up -- otherwise a pinned-only session would occupy a
-        # max_sessions slot forever.
-        cursor.execute(f"""
-            SELECT COALESCE(session_id, 'default') AS session_id, COUNT(*) AS eligible
-            FROM working_memory
-            WHERE {_SQL_CHRONO_TS} < ?
-              AND {_SQL_PLACEABLE_TS}
-              AND consolidated_at IS NULL
-              AND (pinned IS NULL OR pinned = 0)
-              AND superseded_by IS NULL
-              AND (? = 0 OR consolidation_claimed_at IS NULL OR consolidation_claimed_at < ?)
-            GROUP BY COALESCE(session_id, 'default')
-            ORDER BY MIN({_SQL_CHRONO_TS}) ASC
-            LIMIT ?
-        """, (cutoff, int(require_host_llm), _retry_backoff_cutoff(),
-              -1 if max_sessions is None else max(0, int(max_sessions))))
-        session_rows = cursor.fetchall()
-        if not session_rows:
-            return self._attach_fleet_conflict_census({
-                "status": "no_op",
-                "message": "No old working memories to consolidate",
-                "conflicts_resolved": 0,
-                "conflicts_detected_only": 0,
-                "sessions_scanned": 0,
-                "sessions_consolidated": 0,
-                "items_consolidated": 0,
-                "summaries_created": 0,
-                "llm_used": 0,
-                "errors": 0,
-                "model_refresh": {"proposals": 0, "applied": 0},
-                "session_results": [],
-            })
+        # The select and the census below share the DB with the host's Beam:
+        # serialize them under session_lock too (#498).
+        with session_lock or contextlib.nullcontext():
+            cursor = self.conn.cursor()
+            _cutoff_raw = (
+                datetime.now(timezone.utc)
+                - timedelta(hours=WORKING_MEMORY_TTL_HOURS // 2)
+            ).isoformat()
+            if force:
+                _cutoff_raw = datetime.max.isoformat()
+            cutoff = _utc_cutoff_sql(_cutoff_raw)
+            # Mirror sleep()'s filter (consolidated_at, pinned, superseded_by,
+            # NULL->'default') so every selected session has rows sleep() will
+            # actually pick up -- otherwise a pinned-only session would occupy a
+            # max_sessions slot forever.
+            cursor.execute(f"""
+                SELECT COALESCE(session_id, 'default') AS session_id, COUNT(*) AS eligible
+                FROM working_memory
+                WHERE {_SQL_CHRONO_TS} < ?
+                  AND {_SQL_PLACEABLE_TS}
+                  AND consolidated_at IS NULL
+                  AND (pinned IS NULL OR pinned = 0)
+                  AND superseded_by IS NULL
+                  AND (? = 0 OR consolidation_claimed_at IS NULL OR consolidation_claimed_at < ?)
+                GROUP BY COALESCE(session_id, 'default')
+                ORDER BY MIN({_SQL_CHRONO_TS}) ASC
+                LIMIT ?
+            """, (cutoff, int(require_host_llm), _retry_backoff_cutoff(),
+                  -1 if max_sessions is None else max(0, int(max_sessions))))
+            session_rows = cursor.fetchall()
+            if not session_rows:
+                return self._attach_fleet_conflict_census({
+                    "status": "no_op",
+                    "message": "No old working memories to consolidate",
+                    "conflicts_resolved": 0,
+                    "conflicts_detected_only": 0,
+                    "sessions_scanned": 0,
+                    "sessions_consolidated": 0,
+                    "items_consolidated": 0,
+                    "summaries_created": 0,
+                    "llm_used": 0,
+                    "errors": 0,
+                    "model_refresh": {"proposals": 0, "applied": 0},
+                    "session_results": [],
+                })
 
         session_results = []
         sessions_consolidated = 0
@@ -13111,7 +13114,8 @@ class BeamMemory:
         }
         # One census for the whole maintenance pass: the per-session
         # beam.sleep() calls above ran with _fleet_census=False.
-        return self._attach_fleet_conflict_census(result)
+        with session_lock or contextlib.nullcontext():
+            return self._attach_fleet_conflict_census(result)
 
     def resolve_cross_session_conflicts(
         self,

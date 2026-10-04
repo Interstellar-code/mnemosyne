@@ -3021,10 +3021,16 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
     def _contract_graph_link_fn(self, source: str, target: str, relationship: str = "references"):
         """Adapter: wikilink -> episodic graph edge. Degrades gracefully when the
         KG backend is unavailable (spec §7.3 keeps the wikilink graph soft)."""
+        from mnemosyne.core.filters import write_policy_operation
+
         try:
-            return self._handle_graph_link(
-                {"source_id": source, "target_id": target, "relationship": relationship}
-            )
+            # Called from the wiki poll thread: serialize Beam access (#498).
+            with write_policy_operation(self._resolve_effective_write_policy()), self._ensure_beam_access_lock():
+                if not self._beam:
+                    return None
+                return self._handle_graph_link(
+                    {"source_id": source, "target_id": target, "relationship": relationship}
+                )
         except Exception as exc:
             logger.debug("wiki graph link skipped (%s -> %s): %s", source, target, exc)
             return None
@@ -4774,8 +4780,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                     "proceeding (daemon thread will be reaped on process exit)",
                     self.SHUTDOWN_DRAIN_TIMEOUT_SECONDS,
                 )
-        # An in-flight cross-session sweep (#252) also holds the Beam lock and
-        # is never joined; treat it like a timed-out drain.
+        # An in-flight cross-session sweep (#252) takes the Beam lock per
+        # session and is never joined; treat it like a timed-out drain.
         sweep_thread = getattr(self, "_sweep_thread", None)
         drain_timed_out = (thread is not None and thread.is_alive()) or (
             sweep_thread is not None and sweep_thread.is_alive())

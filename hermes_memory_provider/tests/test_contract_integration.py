@@ -119,3 +119,24 @@ def test_wiki_poller_remember_holds_beam_lock_and_write_policy(provider):
     t.start()
     t.join(10)
     assert seen == [(True, True)]
+
+
+def test_wiki_poller_graph_link_holds_beam_lock_and_write_policy(provider):
+    """The wiki poll thread's graph-link write must serialize too (#498)."""
+    import threading
+
+    from mnemosyne.core.filters import active_write_policy
+
+    lock = provider._ensure_beam_access_lock()
+    seen = []
+    provider._handle_graph_link = lambda args: seen.append(
+        (lock._is_owned(), active_write_policy() is not None)) or "{}"
+    t = threading.Thread(target=provider._contract_graph_link_fn, args=("a", "b"))
+    t.start()
+    t.join(10)
+    assert seen == [(True, True)]
+
+    provider._beam = None  # torn down mid-poll: no write, no crash
+    seen.clear()
+    assert provider._contract_graph_link_fn("a", "b") is None
+    assert seen == []
