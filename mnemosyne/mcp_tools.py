@@ -11,9 +11,12 @@ Usage:
 All imports are guarded — this module loads safely even if mcp is not installed.
 """
 
-from typing import Dict, Any, List, Optional
+from typing import TYPE_CHECKING, Dict, Any, List, TypeAlias
 import json
+import logging
+import math  # noqa: F401
 import os
+import sqlite3
 from pathlib import Path
 
 # Guarded import — MCP is optional
@@ -27,10 +30,46 @@ except ImportError:
     CallToolResult = None
     ErrorData = None
 
-from mnemosyne.core.memory import Mnemosyne
-from mnemosyne.core.beam import BeamMemory
+from mnemosyne.core.beam import (
+    BeamMemory,
+    _cross_session_enabled,
+    _guarded_transaction,
+    _session_scope_filter,
+    _session_scope_params,
+)
 
 from mnemosyne.tool_schemas import ALL_TOOL_SCHEMAS
+from mnemosyne.batch_tool import (
+    BatchValidationError,
+    apply_beam_batch,
+    batch_validation_error_payload,
+    dry_run_batch,
+    validate_batch_operations,
+)
+
+logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from mnemosyne.core.memory import Mnemosyne
+
+    MnemosyneInstance: TypeAlias = Mnemosyne
+else:
+    # Runtime type-hint resolution must not import core.memory.
+    MnemosyneInstance: TypeAlias = Any
+
+
+def __getattr__(name: str) -> Any:
+    """Lazily retain the historical public ``Mnemosyne`` export.
+
+    Importing ``mnemosyne.core.memory`` initializes legacy default-memory
+    state, so only an explicit compatibility access may trigger that import.
+    """
+    if name == "Mnemosyne":
+        from mnemosyne.core.memory import Mnemosyne
+
+        return Mnemosyne
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 # ---------------------------------------------------------------------------
 # Tool Definitions
@@ -39,8 +78,15 @@ from mnemosyne.tool_schemas import ALL_TOOL_SCHEMAS
 TOOLS: List[Dict[str, Any]] = []
 for _s in ALL_TOOL_SCHEMAS:
     _t = dict(_s)
-    if "parameters" in _t:
-        _t["inputSchema"] = _t.pop("parameters")
+    # ``mcp`` SDK 2.x renamed the wire field on ``Tool`` from the camelCase
+    # ``inputSchema`` (1.x) to the snake_case ``input_schema``. The
+    # canonical Python-side key matches the model field. Pydantic still
+    # accepts the camelCase alias on construction, but internal code that
+    # reads ``tool["input_schema"]`` is the only fully-supported path.
+    if "inputSchema" in _t:
+        _t["input_schema"] = _t.pop("inputSchema")
+    elif "parameters" in _t:
+        _t["input_schema"] = _t.pop("parameters")
     TOOLS.append(_t)
 
 # ---------------------------------------------------------------------------
@@ -48,10 +94,10 @@ for _s in ALL_TOOL_SCHEMAS:
 # ---------------------------------------------------------------------------
 
 def _get_schema(name: str) -> Dict[str, Any]:
-    """Extract inputSchema from TOOLS by tool name."""
+    """Extract input_schema from TOOLS by tool name."""
     for tool in TOOLS:
         if tool["name"] == name:
-            return tool["inputSchema"]
+            return tool["input_schema"]
     raise KeyError(f"Tool not found: {name}")
 
 class _SchemaProxy:
@@ -117,15 +163,48 @@ def _shared_db_path() -> Path:
 
 def _create_instance(session_id: str = None, author_id: str = None,
                      author_type: str = None, channel_id: str = None,
-                     bank: str = "default") -> Mnemosyne:
+                     bank: str = "default") -> MnemosyneInstance:
     """Create a fresh Mnemosyne instance for each MCP connection.
 
     Identity is resolved from:
-    1. Explicit args (from tool call or constructor)
-    2. Environment variables (MNEMOSYNE_AUTHOR_ID, etc.)
-    3. None (backward compatible, no identity tracking)
+    1. Authenticated multi-token SSE: the transport-bound token name
+       (authoritative -- issue #761); a conflicting client-supplied
+       author_id is rejected, not silently overridden
+    2. Explicit args (from tool call or constructor) -- only on
+       unauthenticated paths (stdio/local), for backward compatibility
+    3. Environment variables (MNEMOSYNE_AUTHOR_ID, etc.)
+    4. None (backward compatible, no identity tracking)
+
+    ``MnemosyneInstance`` resolves to ``Any`` at runtime so type-hint
+    resolution remains side-effect-free, while static checkers use the
+    TYPE_CHECKING Mnemosyne alias above.
     """
-    auth = author_id or os.environ.get("MNEMOSYNE_AUTHOR_ID")
+    # Importing core.memory initializes the legacy default database, so keep it
+    # on this mutation-capable construction path rather than at MCP import time.
+    from mnemosyne.core.memory import Mnemosyne
+    from mnemosyne.runtime_context import get_request_token_name
+
+    # Authenticated multi-token SSE (MNEMOSYNE_MCP_TOKENS): the matched
+    # token name is the authoritative author identity -- the client
+    # authenticates as that principal and cannot attribute writes to
+    # anyone else. A client-supplied author_id is accepted only when it
+    # agrees with the token name; any mismatch is a spoofing attempt and
+    # is rejected. Explicit author_id (and the env fallback) remain
+    # authoritative only on unauthenticated paths (stdio/local).
+    token_name = get_request_token_name()
+    if token_name:
+        if author_id and author_id != token_name:
+            raise ValueError(
+                f"author_id {author_id!r} conflicts with the authenticated "
+                f"identity {token_name!r}; omit author_id or match the "
+                "authenticated token name"
+            )
+        auth = token_name
+    else:
+        auth = (
+            author_id
+            or os.environ.get("MNEMOSYNE_AUTHOR_ID")
+        )
     auth_type = author_type or os.environ.get("MNEMOSYNE_AUTHOR_TYPE")
     chan = channel_id or os.environ.get("MNEMOSYNE_CHANNEL_ID") or session_id or "default"
     sess = session_id or f"mcp_{bank}"
@@ -178,6 +257,48 @@ def _serialize(obj):
 # Tool Handlers
 # ---------------------------------------------------------------------------
 
+class _WrapperBatchAdapter:
+    """Expose Mnemosyne wrapper mutations through the Beam batch interface."""
+
+    def __init__(self, mem: MnemosyneInstance):
+        """Adapt a Mnemosyne instance without resolving its import at runtime."""
+        self._mem = mem
+        self.conn = mem.beam.conn
+        self.wrapper_events = []
+
+    def remember(self, **kwargs):
+        return self._call_wrapper("remember", **kwargs)
+
+    def update_working(self, memory_id: str, *, content=None, importance=None):
+        wrapper_ok = self._call_wrapper("update", memory_id, content=content, importance=importance)
+        if wrapper_ok is not False:
+            return wrapper_ok
+        return self._mem.beam.update_working(memory_id, content=content, importance=importance)
+
+    def forget_working(self, memory_id: str):
+        return self._call_wrapper("forget", memory_id)
+
+    def invalidate(self, memory_id: str, *, replacement_id=None):
+        return self._call_wrapper("invalidate", memory_id, replacement_id=replacement_id)
+
+    def replay_wrapper_events(self) -> None:
+        for event_type, memory_id, kwargs in self.wrapper_events:
+            self._mem._emit_wrapper(event_type, memory_id, **kwargs)
+
+    def _call_wrapper(self, method_name: str, *args, **kwargs):
+        original_conn = self._mem.conn
+        original_emit = self._mem._emit_wrapper
+        self._mem.conn = self.conn
+        self._mem._emit_wrapper = lambda event_type, memory_id, **event_kwargs: self.wrapper_events.append(
+            (event_type, memory_id, event_kwargs)
+        )
+        try:
+            return getattr(self._mem, method_name)(*args, **kwargs)
+        finally:
+            self._mem.conn = original_conn
+            self._mem._emit_wrapper = original_emit
+
+
 def _handle_remember(arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Handle mnemosyne_remember tool call."""
     content = arguments["content"]
@@ -204,12 +325,52 @@ def _handle_remember(arguments: Dict[str, Any]) -> Dict[str, Any]:
         veracity=veracity,
     )
 
+    if memory_id is None:
+        return {"status": "filtered", "bank": bank}
+
     return {
         "status": "stored",
         "memory_id": memory_id,
         "content_preview": content[:100],
         "bank": bank
     }
+
+
+def _handle_batch(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle mnemosyne_batch tool call."""
+    try:
+        normalized = validate_batch_operations(arguments.get("operations"))
+    except BatchValidationError as exc:
+        return batch_validation_error_payload(exc)
+
+    if bool(arguments.get("dry_run", False)):
+        return dry_run_batch(normalized)
+
+    bank = _resolve_bank(arguments)
+    mem = _create_instance(
+        author_id=arguments.get("author_id"),
+        author_type=arguments.get("author_type"),
+        channel_id=arguments.get("channel_id"),
+        bank=bank,
+    )
+    audit_events = []
+    adapter = _WrapperBatchAdapter(mem)
+    result = apply_beam_batch(
+        adapter,
+        normalized,
+        default_scope=_resolve_default_scope(),
+        remember_source_default="mcp",
+        audit_event=lambda name, **kwargs: audit_events.append({"event": name, **kwargs}),
+    )
+    if result.get("status") == "ok":
+        try:
+            adapter.replay_wrapper_events()
+        except Exception:
+            logger.error("mnemosyne_batch wrapper replay failed")
+        result["bank"] = bank
+    if audit_events:
+        result["audit_events"] = audit_events
+    return result
 
 
 def _handle_recall(arguments: Dict[str, Any]) -> Dict[str, Any]:
@@ -219,6 +380,12 @@ def _handle_recall(arguments: Dict[str, Any]) -> Dict[str, Any]:
     bank = _resolve_bank(arguments)
     temporal_weight = arguments.get("temporal_weight", 0.0)
     query_time = arguments.get("query_time")
+    # "" (and whitespace) means "omitted" for callers built against the older
+    # schema (#555). Deliberately narrower than `or None`, which both misses
+    # whitespace-only strings (truthy) and swallows falsey non-strings such as
+    # 0/False/[] that must still reach _parse_query_time's TypeError.
+    if isinstance(query_time, str) and not query_time.strip():
+        query_time = None
     temporal_halflife = arguments.get("temporal_halflife", 24)
     vec_weight = arguments.get("vec_weight")
     fts_weight = arguments.get("fts_weight")
@@ -300,7 +467,11 @@ def _handle_shared_remember(arguments: Dict[str, Any]) -> Dict[str, Any]:
         metadata=meta,
         scope="global",
         memory_id=stable_id,
+        _write_policy_content=content,
     )
+
+    if memory_id is None:
+        return {"status": "filtered_shared", "kind": kind}
 
     return {
         "status": "stored_shared",
@@ -388,15 +559,39 @@ def _handle_invalidate(arguments: Dict[str, Any]) -> Dict[str, Any]:
         return {"error": "memory_id is required"}
     bank = _resolve_bank(arguments)
     mem = _create_instance(author_id=arguments.get("author_id"), author_type=arguments.get("author_type"), channel_id=arguments.get("channel_id"), bank=bank)
-    mem.invalidate(memory_id, replacement_id=replacement_id)
+    if not mem.invalidate(memory_id, replacement_id=replacement_id):
+        return {"status": "memory_not_found", "memory_id": memory_id}
     return {"status": "invalidated", "memory_id": memory_id}
+
+
+def _resolve_validate_target(arguments: Dict[str, Any]):
+    """Resolve (store, bank, deprecated_alias) for ``mnemosyne_validate``.
+
+    ``store`` selects ``private`` (the caller's own memory) or ``surface`` (the
+    shared cross-agent surface). ``bank`` is the tenant bank and only applies
+    to the private store. Before 4.0 the tool carried the store selector in
+    ``bank``; those two literal values are still honoured there as an alias
+    when ``store`` is not given, so an existing caller keeps working, and the
+    response says so. Any other ``bank`` value is a tenant bank.
+    """
+    store = arguments.get("store")
+    raw_bank = arguments.get("bank")
+    deprecated = False
+    if store is None and raw_bank in ("private", "surface"):
+        store, raw_bank, deprecated = raw_bank, None, True
+    if store is None:
+        store = "private"
+    bank = raw_bank or os.environ.get("MNEMOSYNE_MCP_BANK") or "default"
+    if store == "surface":
+        bank = None
+    return store, bank, deprecated
 
 
 def _handle_validate(arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Handle mnemosyne_validate tool call."""
     memory_id = arguments.get("memory_id", "")
     action = arguments.get("action", "")
-    bank = arguments.get("bank", "private")
+    store, bank, deprecated_alias = _resolve_validate_target(arguments)
     validator = arguments.get("validator") or os.environ.get("MNEMOSYNE_AUTHOR_ID") or "mcp"
     new_content = arguments.get("new_content", "")
     note = arguments.get("note", "")
@@ -405,15 +600,31 @@ def _handle_validate(arguments: Dict[str, Any]) -> Dict[str, Any]:
         return {"error": "memory_id is required"}
     if action not in ("attest", "update", "invalidate", "delete"):
         return {"error": f"unknown action: {action}"}
-    if bank not in ("private", "surface"):
-        return {"error": f"unknown bank: {bank}"}
+    if store not in ("private", "surface"):
+        return {"error": f"unknown store: {store}"}
     if action == "update" and not new_content:
         return {"error": "new_content is required for action='update'"}
+    from mnemosyne.core.filters import admit_memory_write, current_write_policy
 
-    if bank == "surface":
+    policy = current_write_policy()
+    persisted_inputs = (
+        validator,
+        new_content if action == "update" else None,
+        note,
+    )
+    if any(value and not admit_memory_write(value, policy=policy)[0]
+           for value in persisted_inputs):
+        return {
+            "status": "filtered",
+            "memory_id": memory_id,
+            "store": store,
+            "bank": bank,
+        }
+
+    if store == "surface":
         target_beam = _create_surface_instance()
     else:
-        mem = _create_instance()
+        mem = _create_instance(bank=bank)
         target_beam = mem.beam
 
     conn = target_beam.conn
@@ -422,58 +633,119 @@ def _handle_validate(arguments: Dict[str, Any]) -> Dict[str, Any]:
         (memory_id,),
     ).fetchone()
     if not existing:
-        return {"error": "memory_not_found", "memory_id": memory_id, "bank": bank}
+        return {"error": "memory_not_found", "memory_id": memory_id, "store": store, "bank": bank}
+
+    if action == "delete":
+        # Align the destructive path with BeamMemory.forget_working: a caller may
+        # only delete a memory its own session can see, honouring the configured
+        # cross-session setting. Resolved before the cascade so a foreign private
+        # id is memory_not_found rather than a partially applied delete (#930).
+        cross_session = _cross_session_enabled()
+        scope_sql = _session_scope_filter(cross_session=cross_session)
+        scope_params = _session_scope_params(
+            target_beam.session_id, cross_session=cross_session
+        )
+        visible = conn.execute(
+            f"SELECT 1 FROM working_memory WHERE id = ? AND {scope_sql}",
+            (memory_id, *scope_params),
+        ).fetchone()
+        if visible is None:
+            return {"error": "memory_not_found", "memory_id": memory_id, "store": store, "bank": bank}
 
     author_id = existing[1]
     prev_content = existing[2]
 
     try:
-        if action == "delete":
-            conn.execute("DELETE FROM working_memory WHERE id = ?", (memory_id,))
-        elif action == "update":
+        with _guarded_transaction(conn):
+            if action == "delete":
+                # Cascade delete child rows before removing parent.
+                conn.execute("DELETE FROM memory_embeddings WHERE memory_id = ?", (memory_id,))
+                conn.execute("DELETE FROM annotations WHERE memory_id = ?", (memory_id,))
+                # vec_working is optional (sqlite-vec may be unavailable).
+                row = conn.execute("SELECT rowid FROM working_memory WHERE id = ?", (memory_id,)).fetchone()
+                if row is not None:
+                    try:
+                        conn.execute("DELETE FROM vec_working WHERE rowid = ?", (row["rowid"],))
+                    except sqlite3.OperationalError as vec_err:
+                        if "no such table" not in str(vec_err).lower():
+                            raise
+                gists_table = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'gists'"
+                ).fetchone()
+                if gists_table is not None:
+                    conn.execute("DELETE FROM gists WHERE memory_id = ?", (memory_id,))
+                conn.execute("DELETE FROM working_memory WHERE id = ?", (memory_id,))
+            elif action == "update":
+                conn.execute(
+                    "UPDATE working_memory SET content = ?, validator = ?, "
+                    "validated_at = CURRENT_TIMESTAMP, "
+                    "validation_count = COALESCE(validation_count, 0) + 1 "
+                    "WHERE id = ?",
+                    (new_content, validator, memory_id),
+                )
+            elif action == "invalidate":
+                conn.execute(
+                    "UPDATE working_memory SET valid_until = CURRENT_TIMESTAMP, "
+                    "validator = ?, validated_at = CURRENT_TIMESTAMP, "
+                    "validation_count = COALESCE(validation_count, 0) + 1 "
+                    "WHERE id = ?",
+                    (validator, memory_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE working_memory SET validator = ?, "
+                    "validated_at = CURRENT_TIMESTAMP, "
+                    "validation_count = COALESCE(validation_count, 0) + 1 "
+                    "WHERE id = ?",
+                    (validator, memory_id),
+                )
             conn.execute(
-                "UPDATE working_memory SET content = ?, validator = ?, "
-                "validated_at = CURRENT_TIMESTAMP, "
-                "validation_count = COALESCE(validation_count, 0) + 1 "
-                "WHERE id = ?",
-                (new_content, validator, memory_id),
+                "INSERT INTO memory_validations "
+                "(memory_id, validator, action, new_content, note) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (memory_id, validator, action,
+                 new_content if action == "update" else None,
+                 note or None),
             )
-        elif action == "invalidate":
-            conn.execute(
-                "UPDATE working_memory SET valid_until = CURRENT_TIMESTAMP, "
-                "validator = ?, validated_at = CURRENT_TIMESTAMP, "
-                "validation_count = COALESCE(validation_count, 0) + 1 "
-                "WHERE id = ?",
-                (validator, memory_id),
-            )
-        else:
-            conn.execute(
-                "UPDATE working_memory SET validator = ?, "
-                "validated_at = CURRENT_TIMESTAMP, "
-                "validation_count = COALESCE(validation_count, 0) + 1 "
-                "WHERE id = ?",
-                (validator, memory_id),
-            )
-        conn.execute(
-            "INSERT INTO memory_validations "
-            "(memory_id, validator, action, new_content, note) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (memory_id, validator, action,
-             new_content if action == "update" else None,
-             note or None),
-        )
-        conn.commit()
     except Exception as exc:
         return {"error": "validation_failed", "reason": str(exc), "memory_id": memory_id}
 
-    return {
+    result = {
         "status": f"validation_{action}",
         "memory_id": memory_id,
+        "store": store,
         "bank": bank,
         "validator": validator,
         "author_id": author_id,
         "previous_content": prev_content[:200] if prev_content else None,
     }
+    if deprecated_alias:
+        result["deprecated"] = (
+            "bank='private'|'surface' is a deprecated alias for store; pass "
+            "store=... instead. The alias is removed in 5.0."
+        )
+    return result
+
+
+def _handle_remember_media(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle mnemosyne_remember_media tool call.
+
+    Validation and the tool-surface guards (allowed local paths, no internal
+    URLs, bounded inline payloads) live in ``core.media_tool`` so MCP and both
+    Hermes providers enforce the same rules.
+    """
+    from mnemosyne.core.media_tool import remember_media_tool
+
+    bank = _resolve_bank(arguments)
+    mem = _create_instance(
+        author_id=arguments.get("author_id"),
+        author_type=arguments.get("author_type"),
+        channel_id=arguments.get("channel_id"),
+        bank=bank,
+    )
+    payload = remember_media_tool(mem.beam, arguments, default_scope=_resolve_default_scope())
+    payload["bank"] = bank
+    return payload
 
 
 def _handle_get(arguments: Dict[str, Any]) -> Dict[str, Any]:
@@ -494,62 +766,79 @@ def _handle_triple_add(arguments: Dict[str, Any]) -> Dict[str, Any]:
 
     Routes annotation-flavored predicates (mentions, fact, occurred_on,
     has_source) to AnnotationStore; everything else to TripleStore.
-    For occurred_on, valid_from is forwarded to AnnotationStore (issue #111).
+    For occurred_on, valid_from is stored as the annotation value (issue #111).
     """
     import logging
     _log = logging.getLogger("mnemosyne.mcp.triple_add")
 
     from mnemosyne.core.annotations import ANNOTATION_KINDS, AnnotationStore
+    from mnemosyne.core.filters import (
+        admit_memory_write,
+        current_write_policy,
+        write_policy_operation,
+    )
     from mnemosyne.core.triples import TripleStore
 
-    predicate = arguments["predicate"]
+    policy = current_write_policy()
+    with write_policy_operation(policy):
+        predicate = arguments["predicate"]
+        annotation_path = isinstance(predicate, str) and predicate in ANNOTATION_KINDS
+        if any(
+            not admit_memory_write(arguments[field], policy=policy)[0]
+            for field in ("subject", "predicate", "object")
+        ):
+            return {
+                "status": "filtered",
+                "store": "annotations" if annotation_path else "triples",
+            }
 
-    if isinstance(predicate, str) and predicate in ANNOTATION_KINDS:
+        if annotation_path:
+            bank = _resolve_bank(arguments)
+            mem = _create_instance(bank=bank)
+            db_path = mem.beam.db_path if hasattr(mem.beam, "db_path") else mem.db_path
+            store = getattr(mem.beam, "annotations", None)
+            if store is None:
+                store = AnnotationStore(db_path=db_path, conn=mem.beam.conn)
+            valid_from = arguments.get("valid_from")
+            if predicate == "occurred_on" and valid_from:
+                row_id = store.add(
+                    memory_id=arguments["subject"],
+                    kind=predicate,
+                    value=valid_from,
+                    source=arguments.get("source", "conversation"),
+                    confidence=arguments.get("confidence", 1.0),
+                    _write_policy=policy,
+                )
+            else:
+                if valid_from:
+                    _log.warning(
+                        "mnemosyne_triple_add: valid_from=%r provided with "
+                        "predicate=%r (not occurred_on); valid_from discarded.",
+                        valid_from, predicate,
+                    )
+                row_id = store.add(
+                    memory_id=arguments["subject"],
+                    kind=predicate,
+                    value=arguments["object"],
+                    source=arguments.get("source", "conversation"),
+                    confidence=arguments.get("confidence", 1.0),
+                    _write_policy=policy,
+                )
+            return {"status": "added", "annotation_id": row_id, "store": "annotations"}
+
         bank = _resolve_bank(arguments)
         mem = _create_instance(bank=bank)
         db_path = mem.beam.db_path if hasattr(mem.beam, "db_path") else mem.db_path
-        store = getattr(mem.beam, "annotations", None)
-        if store is None:
-            store = AnnotationStore(db_path=db_path, conn=mem.beam.conn)
-        valid_from = arguments.get("valid_from")
-        if predicate == "occurred_on" and valid_from:
-            row_id = store.add(
-                memory_id=arguments["subject"],
-                kind=predicate,
-                value=arguments["object"],
-                source=arguments.get("source", "conversation"),
-                confidence=arguments.get("confidence", 1.0),
-                valid_from=valid_from,
-            )
-        else:
-            if valid_from:
-                _log.warning(
-                    "mnemosyne_triple_add: valid_from=%r provided with "
-                    "predicate=%r (not occurred_on); valid_from discarded.",
-                    valid_from, predicate,
-                )
-            row_id = store.add(
-                memory_id=arguments["subject"],
-                kind=predicate,
-                value=arguments["object"],
-                source=arguments.get("source", "conversation"),
-                confidence=arguments.get("confidence", 1.0),
-            )
-        return {"status": "added", "annotation_id": row_id, "store": "annotations"}
-
-    bank = _resolve_bank(arguments)
-    mem = _create_instance(bank=bank)
-    db_path = mem.beam.db_path if hasattr(mem.beam, "db_path") else mem.db_path
-    kg = TripleStore(db_path=db_path)
-    triple_id = kg.add(
-        subject=arguments["subject"],
-        predicate=predicate,
-        object=arguments["object"],
-        valid_from=arguments.get("valid_from"),
-        source=arguments.get("source", "conversation"),
-        confidence=arguments.get("confidence", 1.0),
-    )
-    return {"status": "added", "triple_id": triple_id, "store": "triples"}
+        kg = TripleStore(db_path=db_path)
+        triple_id = kg.add(
+            subject=arguments["subject"],
+            predicate=predicate,
+            object=arguments["object"],
+            valid_from=arguments.get("valid_from"),
+            source=arguments.get("source", "conversation"),
+            confidence=arguments.get("confidence", 1.0),
+        )
+        return {"status": "added", "triple_id": triple_id, "store": "triples"}
 
 
 def _handle_triple_query(arguments: Dict[str, Any]) -> Dict[str, Any]:
@@ -621,6 +910,8 @@ def _handle_remember_canonical(arguments: Dict[str, Any]) -> Dict[str, Any]:
         source=arguments.get("source", "canonical_tool"),
         confidence=arguments.get("confidence", 1.0),
     )
+    if row is None:
+        return {"status": "filtered", "store": "canonical"}
     status = row.pop("status", "stored")
     return {"status": status, "owner_id": owner_id, "category": category,
             "name": name, "version": row.get("version"), "store": "canonical"}
@@ -658,12 +949,58 @@ def _handle_recall_canonical(arguments: Dict[str, Any]) -> Dict[str, Any]:
                     "name": name, "results_count": len(results),
                     "results": results, "store": "canonical"}
         row = store.recall(owner_id, category, name)
-        return {"mode": "recall", "owner_id": owner_id, "category": category,
+        result = {"mode": "recall", "owner_id": owner_id, "category": category,
                 "name": name, "found": row is not None, "result": row,
                 "store": "canonical"}
+        if row is None:
+            # Diagnostic: check if the row exists under a different owner_id
+            try:
+                conn = store.conn if hasattr(store, "conn") else None
+                if conn is not None:
+                    cur = conn.execute(
+                        "SELECT owner_id FROM canonical_facts "
+                        "WHERE category=? AND name=? AND valid_until IS NULL LIMIT 1",
+                        (category, name),
+                    )
+                    alt = cur.fetchone()
+                    if alt:
+                        result["hint"] = (
+                            f"Row exists under owner_id '{alt[0]}' but you queried "
+                            f"with '{owner_id}'. Set MNEMOSYNE_DEFAULT_OWNER={alt[0]} "
+                            f"or check your profile/provider config."
+                        )
+            except Exception:
+                pass
+        return result
     results = store.list(owner_id, category=category or None)
     return {"mode": "list", "owner_id": owner_id, "category": category or None,
             "results_count": len(results), "results": results, "store": "canonical"}
+
+
+def _handle_forget_canonical(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle mnemosyne_forget_canonical tool call."""
+    from mnemosyne.core.canonical import CanonicalStore
+
+    category = arguments.get("category")
+    name = arguments.get("name")
+    if not isinstance(category, str) or not isinstance(name, str):
+        return {"error": "category and name are required"}
+    category = category.strip()
+    name = name.strip()
+    if not category or not name:
+        return {"error": "category and name are required"}
+
+    bank = _resolve_bank(arguments)
+    mem = _create_instance(bank=bank)
+    store = getattr(mem.beam, "canonical", None)
+    if store is None:
+        db_path = mem.beam.db_path if hasattr(mem.beam, "db_path") else mem.db_path
+        store = CanonicalStore(db_path=db_path, conn=mem.beam.conn)
+
+    owner_id = _canonical_owner(arguments)
+    retired = store.forget(owner_id, category, name)
+    return {"retired": retired, "owner_id": owner_id, "category": category,
+            "name": name, "store": "canonical"}
 
 
 def _handle_scratchpad_write(arguments: Dict[str, Any]) -> Dict[str, Any]:
@@ -674,6 +1011,8 @@ def _handle_scratchpad_write(arguments: Dict[str, Any]) -> Dict[str, Any]:
     bank = _resolve_bank(arguments)
     mem = _create_instance(author_id=arguments.get("author_id"), author_type=arguments.get("author_type"), channel_id=arguments.get("channel_id"), bank=bank)
     entry_id = mem.scratchpad_write(content)
+    if entry_id is None:
+        return {"status": "filtered", "store": "scratchpad"}
     return {"status": "written", "id": entry_id}
 
 
@@ -714,6 +1053,8 @@ def _handle_update(arguments: Dict[str, Any]) -> Dict[str, Any]:
     bank = _resolve_bank(arguments)
     mem = _create_instance(author_id=arguments.get("author_id"), author_type=arguments.get("author_type"), channel_id=arguments.get("channel_id"), bank=bank)
     ok = mem.update(memory_id, content=content, importance=importance)
+    if ok is None:
+        return {"status": "filtered", "memory_id": memory_id}
     return {"status": "updated" if ok else "not_found", "memory_id": memory_id}
 
 
@@ -762,26 +1103,40 @@ def _handle_import(arguments: Dict[str, Any]) -> Dict[str, Any]:
 
     if not input_path:
         return {"error": "Either input_path (for file import) or provider (for cross-provider import) is required"}
-    stats = mem.import_from_file(input_path, force=force)
-    return {"status": "imported", "stats": stats}
+    stats = mem.import_from_file(input_path, force=force, dry_run=dry_run)
+    return {"status": "dry_run" if dry_run else "imported", "stats": stats, "dry_run": dry_run}
 
 
 def _handle_diagnose(arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Handle mnemosyne_diagnose tool call."""
     from mnemosyne.diagnose import run_diagnostics
+
+    # ``run_diagnostics`` has always accepted a bank; this handler never passed
+    # one, so a caller diagnosing tenant_a was silently told about the default
+    # bank instead. Resolved without ``_resolve_bank`` on purpose: that helper
+    # collapses "unspecified" to the literal "default", while run_diagnostics
+    # distinguishes None (the profile-root DB) from a named bank. Passing
+    # "default" where None was meant would change which database an existing
+    # caller diagnoses, so unspecified stays None.
+    bank = arguments.get("bank") or os.environ.get("MNEMOSYNE_MCP_BANK") or None
+
     result = run_diagnostics(
         repair_vec_working=bool(arguments.get("repair_vec_working", False)),
         dry_run=bool(arguments.get("dry_run", False)),
+        bank=bank,
     )
     db_path = None
     try:
-        mem = _create_instance()
+        mem = _create_instance(bank=bank or "default")
         if hasattr(mem, "beam") and hasattr(mem.beam, "db_path"):
             db_path = str(mem.beam.db_path)
     except Exception:
         pass
     if db_path:
         result["active_provider_db_path"] = db_path
+    # Name the bank that was inspected so the report cannot be read as covering
+    # a bank the caller did not ask about.
+    result["bank"] = bank
     return _serialize(result)
 
 
@@ -842,11 +1197,110 @@ def _handle_graph_link(arguments: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Hygiene handlers (issue #428)
+# ---------------------------------------------------------------------------
+
+def _handle_hygiene_audit(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle mnemosyne_hygiene_audit tool call."""
+    from mnemosyne.core.banks import get_bank_db_path_read_only
+    from mnemosyne.core.hygiene import audit_noise
+    from mnemosyne.doctor import open_readonly_doctor_db
+
+    bank = _resolve_bank(arguments)
+    db_path = get_bank_db_path_read_only(bank)
+
+    limit = arguments.get("limit", 200)
+    min_score = arguments.get("min_score", 0.3)
+    tables = arguments.get("tables") or None
+    offset = arguments.get("offset", 0)
+    scan_all = arguments.get("scan_all", False)
+    batch_size = arguments.get("batch_size", 1000)
+
+    conn = open_readonly_doctor_db(db_path)
+    try:
+        report = audit_noise(
+            db_path=db_path,
+            limit=limit,
+            tables=tables,
+            min_score=min_score,
+            offset=offset,
+            scan_all=scan_all,
+            batch_size=batch_size,
+            conn=conn,
+        )
+    finally:
+        conn.close()
+    return {
+        "status": "audited",
+        "report": report.to_dict(),
+        "bank": bank,
+    }
+
+
+def _handle_hygiene_clean(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle mnemosyne_hygiene_clean tool call."""
+    from mnemosyne.core.hygiene import NoiseCandidate, clean_noise, validate_hygiene_candidate
+
+    candidates_json = arguments.get("candidates_json", "[]")
+    try:
+        raw_candidates = json.loads(candidates_json) if isinstance(candidates_json, str) else candidates_json
+    except json.JSONDecodeError:
+        return {"error": "candidates_json is not valid JSON"}
+
+    if not isinstance(raw_candidates, list):
+        return {"error": "candidates_json must be a list of valid hygiene candidates"}
+
+    candidates = []
+    for candidate_data in raw_candidates:
+        try:
+            validate_hygiene_candidate(candidate_data)
+        except ValueError:
+            return {"error": "candidates_json must be a list of valid hygiene candidates"}
+        candidates.append(
+            NoiseCandidate(
+                memory_id=candidate_data["memory_id"],
+                table_name=candidate_data["table_name"],
+                content_preview=candidate_data.get("content_preview", ""),
+                noise_score=candidate_data.get("noise_score", 0.0),
+                noise_reasons=candidate_data.get("noise_reasons", []),
+                secret_flags=candidate_data.get("secret_flags", []),
+                importance=candidate_data.get("importance", 0.5),
+                source=candidate_data.get("source", ""),
+                timestamp=candidate_data.get("timestamp", ""),
+                suggested_action=candidate_data.get("suggested_action", "keep"),
+                content_length=candidate_data.get("content_length", 0),
+            )
+        )
+
+    bank = _resolve_bank(arguments)
+    mem = _create_instance(bank=bank)
+    db_path = mem.beam.db_path if hasattr(mem.beam, "db_path") else mem.db_path
+
+    action = arguments.get("action", "keep")
+    confirm = arguments.get("confirm", False)
+    dry_run = not confirm
+
+    result = clean_noise(
+        db_path=db_path,
+        candidates=candidates,
+        action=action,
+        confirm=confirm,
+        dry_run=dry_run,
+    )
+    return {
+        "status": "dry_run" if dry_run else "applied",
+        "result": result.to_dict(),
+        "bank": bank,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
 
 _TOOL_HANDLERS = {
     "mnemosyne_remember": _handle_remember,
+    "mnemosyne_batch": _handle_batch,
     "mnemosyne_recall": _handle_recall,
     "mnemosyne_shared_remember": _handle_shared_remember,
     "mnemosyne_shared_recall": _handle_shared_recall,
@@ -857,10 +1311,12 @@ _TOOL_HANDLERS = {
     "mnemosyne_invalidate": _handle_invalidate,
     "mnemosyne_validate": _handle_validate,
     "mnemosyne_get": _handle_get,
+    "mnemosyne_remember_media": _handle_remember_media,
     "mnemosyne_triple_add": _handle_triple_add,
     "mnemosyne_triple_query": _handle_triple_query,
     "mnemosyne_remember_canonical": _handle_remember_canonical,
     "mnemosyne_recall_canonical": _handle_recall_canonical,
+    "mnemosyne_forget_canonical": _handle_forget_canonical,
     "mnemosyne_scratchpad_write": _handle_scratchpad_write,
     "mnemosyne_scratchpad_read": _handle_scratchpad_read,
     "mnemosyne_scratchpad_clear": _handle_scratchpad_clear,
@@ -871,6 +1327,8 @@ _TOOL_HANDLERS = {
     "mnemosyne_diagnose": _handle_diagnose,
     "mnemosyne_graph_query": _handle_graph_query,
     "mnemosyne_graph_link": _handle_graph_link,
+    "mnemosyne_hygiene_audit": _handle_hygiene_audit,
+    "mnemosyne_hygiene_clean": _handle_hygiene_clean,
 }
 
 
@@ -896,5 +1354,41 @@ def handle_tool_call(name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def get_tool_definitions() -> List[Dict[str, Any]]:
-    """Return all tool definitions for MCP server registration."""
-    return TOOLS
+    """Return tool definitions for MCP server registration.
+
+    Only tools with a dispatch handler are advertised. A schema without a
+    handler would be selectable in ``tools/list`` but would fail every
+    ``tools/call`` with ``Unknown tool``, so it is filtered out here (#728).
+    """
+    return [t for t in TOOLS if t["name"] in _TOOL_HANDLERS]
+
+
+# Keep the exact pre-lazy-import star-import surface.  ``Mnemosyne`` remains
+# lazy through ``__getattr__`` above, but star imports historically resolved it
+# because this module had no ``__all__`` and held the class in its globals.
+# New typing-only implementation details deliberately stay private to stars.
+__all__ = [
+    "ALL_TOOL_SCHEMAS",
+    "TOOLS",
+    "Any",
+    "BatchValidationError",
+    "BeamMemory",
+    "CallToolResult",
+    "Dict",
+    "ErrorData",
+    "List",
+    "Mnemosyne",
+    "Path",
+    "TextContent",
+    "Tool",
+    "apply_beam_batch",
+    "batch_validation_error_payload",
+    "dry_run_batch",
+    "get_tool_definitions",
+    "handle_tool_call",
+    "json",
+    "math",
+    "os",
+    "sqlite3",
+    "validate_batch_operations",
+]

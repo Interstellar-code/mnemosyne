@@ -25,7 +25,7 @@ import os
 import shutil
 import sqlite3
 from pathlib import Path
-from typing import List, Optional
+from typing import List
 
 # On Fly.io and other ephemeral VMs, only ~/.hermes is persisted.
 _DEFAULT_ROOT = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
@@ -100,6 +100,7 @@ class BankManager:
         Raises:
             ValueError: If trying to delete 'default' without force=True.
         """
+        self._validate_name(name)
         if name == "default" and not force:
             raise ValueError("Cannot delete 'default' bank without force=True")
         bank_dir = self.banks_dir / name
@@ -120,6 +121,7 @@ class BankManager:
 
     def bank_exists(self, name: str) -> bool:
         """Check if a bank exists."""
+        self._validate_name(name)
         if name == "default":
             return True
         return (self.banks_dir / name).is_dir()
@@ -131,8 +133,9 @@ class BankManager:
         The 'default' bank uses the legacy path (data_dir/mnemosyne.db).
         All other banks use banks_dir/<name>/mnemosyne.db.
         """
-        if name == "default" or not name:
+        if name == "default":
             return self.data_dir / "mnemosyne.db"
+        self._validate_name(name)
         return self.banks_dir / name / "mnemosyne.db"
 
     def rename_bank(self, old_name: str, new_name: str) -> Path:
@@ -149,6 +152,7 @@ class BankManager:
         Raises:
             ValueError: If old_name doesn't exist or new_name is taken.
         """
+        self._validate_name(old_name)
         if old_name == "default":
             raise ValueError("Cannot rename 'default' bank")
         self._validate_name(new_name)
@@ -178,15 +182,68 @@ class BankManager:
         }
 
     def _validate_name(self, name: str):
-        """Validate bank name format."""
-        if not name:
-            raise ValueError("Bank name cannot be empty")
-        if name == "default":
-            return  # 'default' is always valid
-        if not all(c.isalnum() or c in "-_" for c in name):
-            raise ValueError(f"Invalid bank name '{name}'. Use alphanumeric, hyphens, underscores only.")
-        if len(name) > 64:
-            raise ValueError(f"Bank name '{name}' exceeds 64 characters")
+        """Validate bank name format (delegates to module-level helper)."""
+        _validate_bank_name(name)
+
+
+# ---------------------------------------------------------------------------
+# Module-level helpers (side-effect-free)
+# ---------------------------------------------------------------------------
+
+def _validate_bank_name(name: str):
+    """Validate bank name format without touching the filesystem."""
+    if not name:
+        raise ValueError("Bank name cannot be empty")
+    if name == "default":
+        return  # 'default' is always valid
+    if not all(c.isalnum() or c in "-_" for c in name):
+        raise ValueError(
+            f"Invalid bank name '{name}'. Use alphanumeric, hyphens, underscores only."
+        )
+    if len(name) > 64:
+        raise ValueError(f"Bank name '{name}' exceeds 64 characters")
+
+
+def bank_exists_read_only(name: str, data_dir: Path = None) -> bool:
+    """Check whether a named bank exists WITHOUT creating any directories.
+
+    Unlike ``BankManager(name).bank_exists(name)``, this never calls
+    ``mkdir`` — ``BankManager.__init__`` eagerly creates ``banks/``. Use it
+    when rejecting unknown banks before any database initialization, so we never
+    silently materialize an empty bank directory or DB for invalid input.
+
+    Resolution follows the same authoritative rules as the rest of the module:
+    ``MNEMOSYNE_DATA_DIR`` wins, otherwise the cached ``DEFAULT_DATA_DIR``.
+    """
+    _validate_bank_name(name)
+    if name == "default":
+        return True
+    resolved: Path = data_dir or _default_data_dir()
+    banks_dir = resolved / "banks"
+    return (banks_dir / name).is_dir()
+
+
+def get_bank_db_path_read_only(name: str, data_dir: Path = None) -> Path:
+    """Resolve an existing bank database path without initializing bank state.
+
+    This is the read-only counterpart to ``BankManager.get_bank_db_path`` for
+    inspection paths. It validates bank names but never constructs a
+    ``BankManager`` (whose constructor creates ``banks/``). The default bank
+    retains its legacy location; named banks must already have both their bank
+    directory and database file on disk.
+    """
+    _validate_bank_name(name)
+    resolved: Path = data_dir or _default_data_dir()
+    if name == "default":
+        return resolved / "mnemosyne.db"
+
+    if not bank_exists_read_only(name, data_dir=resolved):
+        raise ValueError(f"Bank '{name}' does not exist")
+
+    db_path = resolved / "banks" / name / "mnemosyne.db"
+    if not db_path.is_file():
+        raise FileNotFoundError(f"Database for bank '{name}' does not exist")
+    return db_path
 
 
 # Module-level convenience functions

@@ -30,7 +30,7 @@ instead of the inline bonus shortcut.
 import os
 import sqlite3
 import tempfile
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -174,6 +174,46 @@ class TestE5FeatureFlag:
 
 
 class TestE5EnginePlumbing:
+
+    def test_diversity_hydrates_source_content(self, temp_db):
+        """Content Jaccard must use DB content, not a missing result attribute."""
+        from mnemosyne.core.polyphonic_recall import (
+            PolyphonicRecallEngine,
+            RecallResult,
+        )
+
+        beam = BeamMemory(session_id="e5-content", db_path=temp_db)
+        first_id = beam.remember("Alice deployed the auth service")
+        second_id = beam.remember("Bob fixed the billing dashboard")
+        engine = PolyphonicRecallEngine(db_path=temp_db, conn=beam.conn)
+        combined = engine._combine_voices([
+            RecallResult(first_id, 0.8, "vector", {}),
+            RecallResult(second_id, 0.7, "vector", {}),
+        ])
+
+        engine._hydrate_result_content(combined)
+        assert combined[first_id].content == "Alice deployed the auth service"
+        assert combined[second_id].content == "Bob fixed the billing dashboard"
+        assert engine._estimate_similarity(
+            combined[first_id], combined[second_id]
+        ) == pytest.approx(1 / 9)
+
+    def test_diversity_handles_unmapped_ids_without_shared_connection(self, temp_db):
+        """Standalone engines keep synthetic IDs harmless during reranking."""
+        from mnemosyne.core.polyphonic_recall import (
+            PolyphonicRecallEngine,
+            RecallResult,
+        )
+
+        engine = PolyphonicRecallEngine(db_path=temp_db)
+        combined = engine._combine_voices([
+            RecallResult("synthetic:missing", 0.8, "graph", {}),
+        ])
+        engine._hydrate_result_content(combined)
+
+        result = combined["synthetic:missing"]
+        assert result.content == ""
+        assert engine._estimate_similarity(result, result) == 0.0
 
     def test_engine_accepts_shared_connection(self, temp_db):
         """[E5 connection reuse] PolyphonicRecallEngine.__init__ must
@@ -349,6 +389,49 @@ class TestE5FilterEnforcement:
                 f"engine path ignored author_id filter: {r}"
             )
 
+    def test_engine_path_valid_until_aware_utc_under_non_utc_tz(
+        self, temp_db, monkeypatch, disable_llm
+    ):
+        """#525: engine-path validity filter uses aware UTC on a UTC+02 host.
+
+        A still-valid aware-UTC timestamp must be accepted even though the
+        host's local wall clock is two hours ahead.
+        """
+        import time as _time
+
+        monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "1")
+        if not hasattr(_time, "tzset"):
+            pytest.skip("time.tzset() unavailable on this platform")
+        original_tz = os.environ.get("TZ")
+        monkeypatch.setenv("TZ", "Europe/Copenhagen")
+        _time.tzset()
+        try:
+            beam = BeamMemory(session_id="s1", db_path=temp_db)
+            mid = beam.remember(
+                "Alice keeps her keys in the vault", source="conv", importance=0.9
+            )
+            # Still valid in two hours (aware UTC): must survive the filter.
+            future_utc = (
+                datetime.now(timezone.utc) + timedelta(hours=2)
+            ).isoformat()
+            beam.conn.execute(
+                "UPDATE working_memory SET valid_until = ? WHERE id = ?",
+                (future_utc, mid),
+            )
+            beam.conn.commit()
+
+            results = beam.recall("Alice vault keys", top_k=20)
+            assert mid in {r["id"] for r in results}, (
+                "polyphonic recall rejected a still-valid aware-UTC row; "
+                f"got: {[r['id'] for r in results]}"
+            )
+        finally:
+            if original_tz is None:
+                monkeypatch.delenv("TZ", raising=False)
+            else:
+                monkeypatch.setenv("TZ", original_tz)
+            _time.tzset()
+
 
 class TestE5MultiplierComposition:
     """[/review HIGH] E4 veracity multiplier + tier degradation
@@ -485,3 +568,72 @@ class TestE5ResultShape:
             assert r.get("content"), (
                 f"result has no content; engine didn't map row back: {r}"
             )
+
+    def test_polyphonic_results_expose_voice_provenance(
+        self, temp_db, monkeypatch, disable_llm
+    ):
+        """Flag ON: polyphonic results expose `voice_scores` provenance -- the
+        field the Hermes prefetch adapter keys its eligibility on -- instead of
+        the linear per-signal keyword/fts/dense fields. Stubbing the engine
+        makes this non-vacuous: the seeded row is returned and must carry
+        polyphonic voice keys so downstream adapters can detect it as an
+        engine-ranked result rather than dropping it for the missing fields."""
+        monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "1")
+        beam = BeamMemory(session_id="e5-voice", db_path=temp_db)
+        seed_id = beam.remember(
+            "[USER] carol discussed the voiceprovenancemarker deploy today",
+            source="conversation", importance=0.5,
+        )
+
+        from mnemosyne.core.polyphonic_recall import PolyphonicResult
+
+        class _StubEngine:
+            def recall(self, query, query_embedding=None, top_k=10, **kwargs):
+                return [PolyphonicResult(
+                    memory_id=seed_id, combined_score=0.035,
+                    voice_scores={"vector": 0.019, "temporal": 0.016},
+                    metadata={},
+                )]
+
+        monkeypatch.setattr(beam, "_get_polyphonic_engine", lambda: _StubEngine())
+        results = beam.recall("voiceprovenancemarker", top_k=10)
+        row = next((r for r in results if r["id"] == seed_id), None)
+        assert row is not None, f"stub row missing from recall: {results}"
+        vs = row.get("voice_scores", {})
+        assert vs == {"vector": 0.019, "temporal": 0.016}, (
+            "expected the exact polyphonic voice_scores mapping from the "
+            f"engine stub (not merely a supported key), got {vs}"
+        )
+
+    def test_recall_session_scope_excludes_foreign_row_sharing_query_terms(
+        self, temp_db, monkeypatch, disable_llm
+    ):
+        """Scope isolation: a foreign-session row that shares the query terms
+        under another session's scope is excluded by recall. Scope filtering is
+        engine-independent -- it is applied to the candidate queries inside
+        `BeamMemory.recall()` (session_id OR scope='global') -- so the Hermes
+        prefetch adapter, which consumes recall() output, can never see or
+        inject a foreign-session transcript that lexically matches a query.
+        Uses the deterministic linear path: polyphonic recall with embeddings
+        disabled returns no hits, which would make a real-engine scope test
+        vacuous. The scope predicate is identical for both engines."""
+        monkeypatch.delenv("MNEMOSYNE_POLYPHONIC_RECALL", raising=False)
+        beam_a = BeamMemory(session_id="scope-a", db_path=temp_db)
+        beam_b = BeamMemory(session_id="scope-b", db_path=temp_db)
+
+        marker = "scopezonemarkerx"
+        a_id = beam_a.remember(
+            f"[USER] carol discussed the {marker} deploy today",
+            source="conversation", importance=0.5,
+        )
+        b_id = beam_b.remember(
+            f"[USER] {marker} news marker is on page two",
+            source="conversation", importance=0.9,
+        )
+
+        results = beam_a.recall(marker, top_k=10)
+        ids = {r["id"] for r in results}
+        assert a_id in ids, "own-session row missing from recall -- test vacuous"
+        assert b_id not in ids, (
+            "foreign-session row sharing query terms leaked into session scope"
+        )

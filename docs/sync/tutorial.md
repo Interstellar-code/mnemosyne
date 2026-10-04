@@ -4,7 +4,7 @@ This guide walks you through setting up bidirectional memory sync between a loca
 
 **What you'll need:**
 
-- Two machines with Mnemosyne v3.7.0+ installed (local + remote)
+- Two machines with Mnemosyne v3.6.0+ installed (local + remote). Sync landed in 3.6.0.
 - Network connectivity between them
 - (Recommended) A domain with DNS pointing to your VPS
 
@@ -40,8 +40,8 @@ Save this. It's both your API key and (optionally) your encryption key.
 ### 2b: Start the sync server
 
 ```bash
-export MNEMOSYNE_SYNC_API_KEY="n4V8xL2qK7mW9pR3tY6bA1jF5cH0dG8e"
-mnemosyne sync-serve --host 0.0.0.0 --port 8765 --api-key "$MNEMOSYNE_SYNC_API_KEY"
+export MNEMOSYNE_SYNC_TOKEN="n4V8xL2qK7mW9pR3tY6bA1jF5cH0dG8e"
+mnemosyne sync-serve --host 0.0.0.0 --port 8765 --api-key "$MNEMOSYNE_SYNC_TOKEN"
 ```
 
 You should see:
@@ -87,7 +87,7 @@ server {
 }
 ```
 
-**Docker Compose:** Copy [deploy/sync/docker-compose.yml](https://github.com/AxDSan/mnemosyne/blob/main/deploy/sync/docker-compose.yml) and the Caddyfile. Edit the domain. `docker compose up -d`.
+**Docker Compose:** Copy [deploy/sync/docker-compose.yml](https://github.com/mnemosyne-oss/mnemosyne/blob/main/deploy/sync/docker-compose.yml) and the Caddyfile. Edit the domain. `docker compose up -d`.
 
 **Fly.io:** `fly launch --copy-config` then `fly deploy`.
 
@@ -98,7 +98,7 @@ server {
 ### Plaintext mode (TLS only)
 
 ```bash
-export MNEMOSYNE_SYNC_API_KEY="n4V8xL2qK7mW9pR3tY6bA1jF5cH0dG8e"
+export MNEMOSYNE_SYNC_TOKEN="n4V8xL2qK7mW9pR3tY6bA1jF5cH0dG8e"
 mnemosyne sync --remote https://memory.example.com
 ```
 
@@ -206,7 +206,7 @@ For scheduled sync, use cron:
 
 ```bash
 # Sync every 30 minutes
-*/30 * * * * MNEMOSYNE_SYNC_API_KEY="..." mnemosyne sync --remote https://memory.example.com --encrypt
+*/30 * * * * MNEMOSYNE_SYNC_TOKEN="..." mnemosyne sync --remote https://memory.example.com --encrypt
 ```
 
 ---

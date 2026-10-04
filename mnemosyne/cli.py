@@ -9,7 +9,8 @@ All commands use the v2 BEAM architecture (Mnemosyne/BeamMemory).
 import os
 import sys
 import json
-from pathlib import Path
+import importlib.metadata
+from pathlib import Path, PureWindowsPath
 from typing import NoReturn
 
 def _default_data_dir() -> str:
@@ -27,7 +28,14 @@ def _default_data_dir() -> str:
 
 
 DATA_DIR = _default_data_dir()
-os.makedirs(DATA_DIR, exist_ok=True)
+
+
+def _distribution_version(distribution: str) -> str:
+    """Return an installed distribution version without importing package globals."""
+    try:
+        return importlib.metadata.version(distribution)
+    except importlib.metadata.PackageNotFoundError:
+        return "unavailable"
 
 
 def _fail(message: str, exit_code: int = 2) -> NoReturn:
@@ -40,6 +48,17 @@ def _usage(message: str, exit_code: int = 2) -> NoReturn:
     """Print command usage for invalid invocations and exit."""
     print(message, file=sys.stderr)
     raise SystemExit(exit_code)
+
+
+def _require_value(rest, i, flag, parser):
+    """Extract a value for a CLI flag at position i. Returns (parsed_value, i+2).
+
+    Raises SystemExit if the flag is at the end of the argument list (missing
+    value). Used by hygiene audit/status/restore parsers.
+    """
+    if i + 1 >= len(rest) or rest[i + 1].startswith("--"):
+        _fail(f"{flag} requires a value")
+    return parser(rest[i + 1], flag.lstrip("-")), i + 2
 
 
 def _parse_float(value: str, name: str) -> float:
@@ -58,10 +77,77 @@ def _parse_int(value: str, name: str) -> int:
         _fail(f"{name} must be an integer: {value}")
 
 
+def _resolve_bank_name(bank_override: str | None = None) -> str:
+    """Resolve the selected memory bank from an override or MNEMOSYNE_BANK."""
+    value = bank_override if bank_override is not None else os.environ.get("MNEMOSYNE_BANK", "")
+    return value.strip() or "default"
+
+
+def _resolve_doctor_bank_db_path(bank_name: str) -> Path:
+    """Resolve an existing bank DB without constructing ``BankManager``.
+
+    ``BankManager`` eagerly creates ``data_dir/banks`` in its constructor,
+    which is correct for mutating CLI commands but violates doctor's strict
+    read-only contract.  Keep this small lookup local to the doctor command:
+    validation and path inspection are the only filesystem operations.
+    """
+
+    from mnemosyne.core.banks import _validate_bank_name
+
+    _validate_bank_name(bank_name)
+    data_dir = Path(DATA_DIR)
+    if bank_name == "default":
+        return data_dir / "mnemosyne.db"
+    bank_dir = data_dir / "banks" / bank_name
+    if not bank_dir.is_dir():
+        _fail(f"Bank '{bank_name}' does not exist", exit_code=1)
+    return bank_dir / "mnemosyne.db"
+
+
+def _doctor_output_target_is_database(output_path: Path, db_path: Path) -> bool:
+    """Return whether an existing output target is the inspected DB itself.
+
+    Path resolution protects aliases for absent targets and symlinks, but it
+    cannot identify a hardlink. For an existing directory entry, compare
+    filesystem identity and fail closed if that comparison is unavailable.
+    """
+    try:
+        output_path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        _fail(f"Unable to safely inspect Doctor output path {output_path}: {error}")
+
+    try:
+        return os.path.samefile(output_path, db_path)
+    except OSError as error:
+        _fail(
+            "Unable to determine filesystem identity for existing Doctor "
+            f"output path {output_path}: {error}"
+        )
+
+
 def _get_memory():
-    """Get a Mnemosyne v2 instance."""
+    """Get a Mnemosyne v2 instance, honoring MNEMOSYNE_BANK."""
     from mnemosyne.core.memory import Mnemosyne
-    return Mnemosyne(db_path=os.path.join(DATA_DIR, "mnemosyne.db"))
+    from mnemosyne.core.banks import BankManager
+
+    bank = _resolve_bank_name()
+    bm = BankManager(Path(DATA_DIR))
+    try:
+        db_path = bm.get_bank_db_path(bank)
+    except ValueError as e:
+        _fail(str(e))
+
+    return Mnemosyne(db_path=str(db_path), bank=bank)
+
+
+def _resolve_default_scope() -> str:
+    """Resolve the default scope for CLI store calls."""
+    raw = os.environ.get("MNEMOSYNE_DEFAULT_SCOPE", "").strip().lower()
+    if raw in ("session", "global"):
+        return raw
+    return "session"
 
 
 def cmd_store(args):
@@ -77,6 +163,7 @@ def cmd_store(args):
         content,
         source=source,
         importance=importance,
+        scope=_resolve_default_scope(),
         extract_entities=True,
     )
     print(f"Stored: {memory_id}")
@@ -125,8 +212,77 @@ def cmd_recall(args):
         print(f"  Content: {content[:150]}{'...' if len(content) > 150 else ''}")
         print(f"  Score: {score:.3f}")
         if r.get("entity_match"):
-            print(f"  [entity match]")
+            print("  [entity match]")
         print()
+
+
+def cmd_media(args):
+    """Remember a piece of media and, if understanding is enabled, describe it."""
+    usage = ("Usage: mnemosyne media <path|url|data:uri> [--modality image|video|audio|document] "
+             "[--title T] [--hint H] [--max-moments N] [--mime TYPE] [--json]")
+    if not args or any(arg in ("--help", "-h") for arg in args):
+        print(usage)
+        print("  <path>                            Local file path to ingest")
+        print("  <url>                             HTTP(S) URL of remote media")
+        print("  <data:uri>                        Inline data: URI payload")
+        print("  --modality image|video|audio|document   Force modality instead of inferring from path/URL")
+        print("  --title T                         Human-readable title for the asset")
+        print("  --hint H                          Free-form context passed to the understanding model")
+        print("  --max-moments N                   Cap the number of derived moments (default: model default)")
+        print("  --mime TYPE                       Override MIME type detection")
+        print("  --json                            Emit a machine-readable JSON summary on stdout")
+        return
+    options = {"modality": None, "title": None, "hint": None, "max-moments": None, "mime": None}
+    json_output = False
+    positionals = []
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--json":
+            json_output = True
+        elif arg.startswith("--") and arg[2:] in options:
+            if i + 1 >= len(args):
+                _usage(usage)
+            options[arg[2:]] = args[i + 1]
+            i += 1
+        elif arg.startswith("-") and arg != "-":
+            _usage(f"{usage}\nUnknown media option: {arg}")
+        else:
+            positionals.append(arg)
+        i += 1
+    if len(positionals) != 1:
+        _usage(usage)
+    ref = positionals[0]
+    if "://" not in ref and not ref.startswith("data:") and os.path.exists(os.path.expanduser(ref)):
+        ref = os.path.abspath(os.path.expanduser(ref))
+    max_moments = _parse_int(options["max-moments"], "max-moments") if options["max-moments"] else None
+
+    mem = _get_memory()
+    try:
+        result = mem.beam.remember_media(
+            ref,
+            modality=options["modality"],
+            mime=options["mime"],
+            title=options["title"],
+            hint=options["hint"],
+            max_moments=max_moments,
+            scope=_resolve_default_scope(),
+        )
+    except ValueError as exc:
+        _fail(str(exc))
+
+    if json_output:
+        from dataclasses import asdict
+
+        print(json.dumps(asdict(result), ensure_ascii=False, default=str))
+        return
+    print(f"Asset: {result.asset_id}")
+    print(f"Status: {result.status}")
+    print(f"Memories: {len(result.memory_ids)} from {len(result.moment_ids)} moment(s)")
+    for warning in result.warnings:
+        print(f"Warning: {warning}")
+    if result.status == "unavailable":
+        print("Registered by reference only. Set MNEMOSYNE_MODALITY_ENABLED=1 and a model to describe it.")
 
 
 def cmd_update(args):
@@ -139,7 +295,9 @@ def cmd_update(args):
 
     mem = _get_memory()
     success = mem.update(memory_id, content=content, importance=importance)
-    if success:
+    if success is None:
+        _fail(f"Update filtered by write policy: {memory_id}", exit_code=1)
+    elif success:
         print(f"Updated: {memory_id}")
     else:
         _fail(f"Memory not found: {memory_id}", exit_code=1)
@@ -192,7 +350,6 @@ def cmd_diagnose(args):
     fix_mode = "--fix" in args
     dry_run = "--dry-run" in args
     repair_vec_working = "--repair-vec-working" in args
-    clean_args = [a for a in args if not a.startswith("--")]
 
     try:
         from mnemosyne.diagnose import run_diagnostics, auto_fix
@@ -208,21 +365,255 @@ def cmd_diagnose(args):
 
         if repair_vec_working:
             print("\n  vec_working repair requested")
+            repair_statuses = [
+                entry.get("status")
+                for entry in result.get("entries", [])
+                if entry.get("check") == "vec_working_repair_status"
+            ]
+            repair_succeeded = bool(repair_statuses) and all(
+                status == "repaired" for status in repair_statuses
+            )
+            if not dry_run and not repair_succeeded:
+                _fail("vec_working repair failed; inspect diagnostics above", exit_code=1)
 
         if fix_mode or (dry_run and not repair_vec_working):
             print("\n--- Auto-fix ---")
             fix_result = auto_fix(result.get("entries", []), dry_run=dry_run)
             if fix_result["fixed"]:
-                label = "Would fix" if dry_run else "Fixed"
                 for item in fix_result["fixed"]:
-                    print(f"  ✅ {item}")
+                    if dry_run:
+                        print(f"  ℹ {item}")
+                    else:
+                        print(f"  ✅ Fixed: {item}")
             if fix_result["failed"]:
                 for item in fix_result["failed"]:
                     print(f"  ❌ {item['label']}: {item['error']}")
             if not fix_result["fixed"] and not fix_result["failed"]:
                 print("  Nothing to fix - all dependencies are healthy.")
-    except Exception as e:
-        print(f"Diagnostic failed: {e}")
+    except Exception:
+        _fail("diagnose_failed", exit_code=1)
+
+
+def cmd_doctor(args):
+    """Render a bounded, read-only health report for one existing database."""
+
+    usage = (
+        "Usage: mnemosyne doctor [--db PATH | --bank NAME] "
+        "[--format json|markdown|both] [--json-out PATH] [--markdown-out PATH] "
+        "[--scan-limit N] [--sample-limit N] [--all] [--include-candidates]"
+    )
+    db_override = None
+    bank_override = None
+    output_format = "both"
+    json_out = None
+    markdown_out = None
+    scan_limit = 200
+    sample_limit = 20
+    scan_all = False
+    include_candidates = False
+    scan_limit_set = False
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--db":
+            db_override, i = _require_value(args, i, "--db", lambda value, _name: value)
+        elif arg == "--bank":
+            bank_override, i = _require_value(args, i, "--bank", lambda value, _name: value)
+        elif arg == "--format":
+            output_format, i = _require_value(args, i, "--format", lambda value, _name: value)
+        elif arg == "--json-out":
+            json_out, i = _require_value(args, i, "--json-out", lambda value, _name: value)
+        elif arg == "--markdown-out":
+            markdown_out, i = _require_value(args, i, "--markdown-out", lambda value, _name: value)
+        elif arg == "--scan-limit":
+            scan_limit, i = _require_value(args, i, "--scan-limit", _parse_int)
+            scan_limit_set = True
+        elif arg == "--sample-limit":
+            sample_limit, i = _require_value(args, i, "--sample-limit", _parse_int)
+        elif arg == "--all":
+            scan_all = True
+            i += 1
+        elif arg == "--include-candidates":
+            include_candidates = True
+            i += 1
+        else:
+            _usage(f"{usage}\nUnknown doctor option: {arg}")
+
+    if db_override is not None and bank_override is not None:
+        _fail("--db and --bank cannot be used together")
+    if output_format not in {"json", "markdown", "both"}:
+        _fail("--format must be one of: json, markdown, both")
+    if not isinstance(scan_limit, int) or scan_limit < 1:
+        _fail("--scan-limit must be a positive integer")
+    if not isinstance(sample_limit, int) or sample_limit < 0:
+        _fail("--sample-limit must be a non-negative integer")
+    if scan_limit > 10_000:
+        _fail("--scan-limit must not exceed 10000")
+    if sample_limit > 100:
+        _fail("--sample-limit must not exceed 100")
+    if output_format == "json" and markdown_out is not None:
+        _fail("--markdown-out requires --format markdown or both")
+    if output_format == "markdown" and json_out is not None:
+        _fail("--json-out requires --format json or both")
+
+    # ``--all`` remains bounded: it requests the largest safe report scan
+    # budget unless the operator selected an explicit, smaller/larger limit.
+    if scan_all and not scan_limit_set:
+        scan_limit = 10_000
+
+    if db_override is not None:
+        db_path = Path(db_override).expanduser()
+        bank_name = "default"
+    else:
+        bank_name = _resolve_bank_name(bank_override)
+        try:
+            db_path = _resolve_doctor_bank_db_path(bank_name)
+        except ValueError as error:
+            _fail(str(error))
+    if not db_path.is_file():
+        _fail(f"Database not found: {db_path}", exit_code=1)
+
+    resolved_db = db_path.resolve()
+    resolved_json_path = (
+        Path(json_out).expanduser() if json_out else Path.cwd() / "mnemosyne-doctor.json"
+    )
+    resolved_markdown_path = (
+        Path(markdown_out).expanduser() if markdown_out else Path.cwd() / "mnemosyne-doctor.md"
+    )
+    if output_format == "both":
+        output_paths = [resolved_json_path, resolved_markdown_path]
+    elif output_format == "json" and json_out:
+        output_paths = [resolved_json_path]
+    elif output_format == "markdown" and markdown_out:
+        output_paths = [resolved_markdown_path]
+    else:
+        output_paths = []
+    if output_format == "both" and resolved_json_path.resolve() == resolved_markdown_path.resolve():
+        _fail("JSON and Markdown output paths must be different")
+    if any(path.resolve() == resolved_db for path in output_paths):
+        _fail("Doctor output path must not overwrite the inspected database")
+    if any(_doctor_output_target_is_database(path, db_path) for path in output_paths):
+        _fail("Doctor output path must not overwrite the inspected database")
+
+    from mnemosyne.doctor import (
+        build_doctor_report,
+        doctor_report_payload,
+        render_doctor_json,
+        render_doctor_markdown,
+        write_doctor_artifact_atomically,
+        write_doctor_artifacts_atomically,
+    )
+
+    try:
+        report = build_doctor_report(
+            bank_name,
+            db_path,
+            scan_limit=scan_limit,
+            candidate_limit=sample_limit if include_candidates else 0,
+        )
+        payload = doctor_report_payload(report, include_candidates=include_candidates)
+        json_text = render_doctor_json(payload)
+        markdown_text = render_doctor_markdown(payload)
+        if output_format == "both":
+            write_doctor_artifacts_atomically(
+                json_path=resolved_json_path,
+                json_text=json_text,
+                markdown_path=resolved_markdown_path,
+                markdown_text=markdown_text,
+            )
+            print(f"Doctor JSON: {resolved_json_path}")
+            print(f"Doctor Markdown: {resolved_markdown_path}")
+        elif output_format == "json":
+            if json_out:
+                write_doctor_artifact_atomically(path=resolved_json_path, text=json_text)
+                print(f"Doctor JSON: {resolved_json_path}")
+            else:
+                print(json_text, end="")
+        elif markdown_out:
+            write_doctor_artifact_atomically(path=resolved_markdown_path, text=markdown_text)
+            print(f"Doctor Markdown: {resolved_markdown_path}")
+        else:
+            print(markdown_text, end="")
+    except Exception:
+        _fail("doctor_report_failed", exit_code=1)
+
+
+def cmd_repair(args):
+    """Apply one narrow, explicitly selected doctor-gated repair action."""
+
+    usage = (
+        "Usage: mnemosyne repair --report REPORT.json --select working_memory:ID "
+        "[--select working_memory:ID ...] [--db PATH | --bank NAME] "
+        "[--action backfill-vec-working|expire] [--dry-run|--apply] [--backup PATH]"
+    )
+    db_override = None
+    bank_override = None
+    report_path = None
+    selections = []
+    action = "backfill-vec-working"
+    apply = False
+    dry_run_seen = False
+    backup_path = None
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--db":
+            db_override, i = _require_value(args, i, "--db", lambda value, _name: value)
+        elif arg == "--bank":
+            bank_override, i = _require_value(args, i, "--bank", lambda value, _name: value)
+        elif arg == "--report":
+            report_path, i = _require_value(args, i, "--report", lambda value, _name: value)
+        elif arg == "--select":
+            selection, i = _require_value(args, i, "--select", lambda value, _name: value)
+            selections.append(selection)
+        elif arg == "--action":
+            action, i = _require_value(args, i, "--action", lambda value, _name: value)
+        elif arg == "--backup":
+            backup_path, i = _require_value(args, i, "--backup", lambda value, _name: value)
+        elif arg == "--apply":
+            apply = True
+            i += 1
+        elif arg == "--dry-run":
+            dry_run_seen = True
+            i += 1
+        else:
+            _usage(f"{usage}\nUnknown repair option")
+
+    if db_override is not None and bank_override is not None:
+        _fail("--db and --bank cannot be used together")
+    if apply and dry_run_seen:
+        _fail("--apply and --dry-run cannot be used together")
+    if report_path is None:
+        _fail("--report is required")
+    if not selections:
+        _fail("At least one complete --select working_memory:ID is required")
+    if db_override is not None:
+        db_path = Path(db_override).expanduser()
+        bank_name = "default"
+    else:
+        bank_name = _resolve_bank_name(bank_override)
+        try:
+            db_path = _resolve_doctor_bank_db_path(bank_name)
+        except ValueError:
+            _fail("Invalid bank name")
+    if not db_path.is_file():
+        _fail("Database not found", exit_code=1)
+
+    from mnemosyne.repair import RepairError, render_repair_json, run_repair
+
+    try:
+        result = run_repair(
+            db_path=db_path,
+            bank_name=bank_name,
+            report_path=report_path,
+            selections=selections,
+            action=action,
+            apply=apply,
+            backup_path=backup_path,
+        )
+    except RepairError as error:
+        _fail(str(error), exit_code=1)
+    print(render_repair_json(result), end="")
 
 
 def cmd_export(args):
@@ -248,7 +639,25 @@ def cmd_export(args):
     sync_count = result.get("sync_events_count", 0)
     if sync_count:
         print(f"  + {sync_count} sync events")
+    if result.get("complete") is False:
+        omitted = result.get("omitted_surfaces", [])
+        partial = result.get("partial_surfaces", [])
+        details = [f"{surface.get('table')} ({surface.get('row_count')})" for surface in omitted]
+        details.extend(
+            f"{surface.get('section')} missing {', '.join(_format_partial_omitted_field(field) for field in surface.get('omitted_fields', []))}"
+            for surface in partial
+        )
+        print(f"  WARNING: portable export is partial; {'; '.join(details)}")
     print(f"  to {output_path}")
+
+
+def _format_partial_omitted_field(field):
+    """Render a partial-export field and its valid affected-row count."""
+    name = field.get("field", "")
+    affected_rows = field.get("affected_rows")
+    if isinstance(affected_rows, int) and not isinstance(affected_rows, bool) and affected_rows >= 0:
+        return f"{name} ({affected_rows})"
+    return name
 
 
 def cmd_import(args):
@@ -280,6 +689,7 @@ def cmd_import(args):
         renumbered = stats.get("imported_renumbered", 0)
         skipped = stats.get("skipped", 0)
         overwritten = stats.get("overwritten", 0)
+        bad_ts = stats.get("imported_bad_timestamp", 0)
         parts = []
         if new:
             parts.append(f"{new} new")
@@ -289,14 +699,19 @@ def cmd_import(args):
             parts.append(f"{overwritten} overwritten")
         if skipped:
             parts.append(f"{skipped} skipped")
+        if bad_ts:
+            # Quarantined rows are pinned with epoch timestamps: surface
+            # them so an operator knows to re-date instead of assuming a
+            # clean restore.
+            parts.append(f"{bad_ts} bad-timestamp quarantined")
         if not parts:
             return f"0 {label}"
         return f"{' + '.join(parts)} {label}"
 
     print(
         f"Imported "
-        f"{beam_stats.get('working_memory', {}).get('inserted', 0)} working, "
-        f"{beam_stats.get('episodic_memory', {}).get('inserted', 0)} episodic, "
+        f"{_format_store_stats(beam_stats.get('working_memory', {}), 'working')}, "
+        f"{_format_store_stats(beam_stats.get('episodic_memory', {}), 'episodic')}, "
         f"{result.get('legacy', {}).get('inserted', 0)} legacy, "
         f"{_format_store_stats(result.get('triples', {}), 'triples')}, "
         f"{_format_store_stats(result.get('annotations', {}), 'annotations')}"
@@ -308,6 +723,14 @@ def cmd_import(args):
             f"        "
             f"{_format_store_stats(se_stats, 'sync events')}"
         )
+    if result.get("restore_complete") is False:
+        print(
+            "        WARNING: imported supported data only; source export reported "
+            f"{len(result.get('omitted_surfaces', []))} omitted and "
+            f"{len(result.get('partial_surfaces', []))} partial surface(s)"
+        )
+    elif result.get("restore_complete") is None:
+        print("        NOTE: source export predates completeness reporting")
     print(f"        from {args[0]}")
 
 
@@ -338,29 +761,162 @@ def cmd_mcp(args):
         sys.exit(1)
 
 
+def _read_secret_file(path: str, label: str) -> str:
+    """Read a secret through one no-follow file descriptor."""
+    import stat
+    from pathlib import Path
+
+    secret_path = Path(path).expanduser()
+    flags = os.O_RDONLY
+    if os.name != "nt" and hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    elif secret_path.is_symlink():
+        raise ValueError(f"{label} file must not be a symlink: {secret_path}")
+    try:
+        fd = os.open(secret_path, flags)
+    except OSError as exc:
+        raise ValueError(f"cannot securely open {label} file: {secret_path}") from exc
+    try:
+        stat_result = os.fstat(fd)
+        if not stat.S_ISREG(stat_result.st_mode):
+            raise ValueError(f"{label} path is not a regular file: {secret_path}")
+        if os.name != "nt" and stat_result.st_mode & 0o077:
+            raise PermissionError(
+                f"{label} file must not be accessible by group/others: {secret_path}"
+            )
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            fd = -1
+            value = handle.read().strip()
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    if not value:
+        raise ValueError(f"{label} file is empty: {secret_path}")
+    return value
+
+
+_DEFAULT_SYNC_SESSION_ID = "hermes_shared_surface"
+
+
+def cmd_sync_init(args):
+    """Explicitly initialize or migrate a dedicated shared-surface DB."""
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="mnemosyne sync-init")
+    parser.add_argument("--db-path", required=True, help="Dedicated shared-surface DB")
+    parser.add_argument(
+        "--session-id",
+        default=_DEFAULT_SYNC_SESSION_ID,
+        help="Stable session ID used by the shared-surface Beam",
+    )
+    parser.add_argument(
+        "--claim-existing",
+        action="store_true",
+        help="Claim existing global rows after validation",
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirm mutation of an existing non-empty dedicated DB",
+    )
+    parsed = parser.parse_args(args)
+
+    from mnemosyne.core.memory import Mnemosyne
+    from mnemosyne.core.sync import SyncEngine
+
+    mem = Mnemosyne(db_path=parsed.db_path, session_id=parsed.session_id)
+    existing_rows = mem.beam.conn.execute(
+        "SELECT COUNT(*) FROM working_memory"
+    ).fetchone()[0]
+    invalid_rows = mem.beam.conn.execute(
+        """SELECT COUNT(*) FROM working_memory
+           WHERE scope != 'global' OR session_id != ?""",
+        (parsed.session_id,),
+    ).fetchone()[0]
+    preview = {
+        "db_path": str(parsed.db_path),
+        "session_id": parsed.session_id,
+        "existing_rows": existing_rows,
+        "invalid_rows": invalid_rows,
+    }
+    if invalid_rows:
+        raise SystemExit(
+            "Refusing migration: DB contains non-global or foreign-session rows"
+        )
+    if existing_rows and not (parsed.claim_existing and parsed.yes):
+        preview["status"] = "confirmation_required"
+        preview["required_flags"] = ["--claim-existing", "--yes"]
+        print(json.dumps(preview, sort_keys=True))
+        return
+
+    SyncEngine(
+        mem,
+        surface_only=True,
+        initialize_surface=True,
+        claim_existing_surface=bool(existing_rows),
+    )
+    preview["status"] = "initialized"
+    preview["claimed_rows"] = existing_rows
+    print(json.dumps(preview, sort_keys=True))
+
+
 def cmd_sync(args):
     """Sync memories with a remote Mnemosyne instance."""
     import argparse
     parser = argparse.ArgumentParser(prog="mnemosyne sync")
     parser.add_argument("--remote", required=True, help="Remote sync server URL (e.g. http://192.168.1.50:8765)")
+    parser.add_argument(
+        "--db-path",
+        required=True,
+        help="Explicit SQLite DB to sync; use the dedicated shared-surface DB, not a private DB",
+    )
+    parser.add_argument(
+        "--session-id",
+        default=_DEFAULT_SYNC_SESSION_ID,
+        help="Stable session ID used by the shared-surface Beam",
+    )
     parser.add_argument("--mode", choices=["push", "pull", "bidirectional"], default="bidirectional",
                         help="Sync direction (default: bidirectional)")
-    parser.add_argument("--encrypt", help="Encryption key (base64) or path to key file")
-    parser.add_argument("--api-key", help="API key for remote server auth")
-    parser.add_argument("--insecure", action="store_true", help="Skip TLS verification (not implemented in stdlib impl)")
+    encryption_group = parser.add_mutually_exclusive_group()
+    encryption_group.add_argument(
+        "--encrypt", help="Encryption key (visible in process arguments)"
+    )
+    encryption_group.add_argument(
+        "--encrypt-key-file", help="Private file containing the encryption key"
+    )
+    auth_group = parser.add_mutually_exclusive_group()
+    auth_group.add_argument("--api-key", help="API key (visible in process arguments)")
+    auth_group.add_argument("--api-key-file", help="Private file containing the API key")
     parser.add_argument("--interval", type=float, default=0, help="Sync interval in seconds (repeat mode)")
+    parser.add_argument(
+        "--initialize-surface",
+        action="store_true",
+        help="Explicitly mark/claim this dedicated DB as a shared surface on first run",
+    )
 
     # Parse known flags from args; remaining are for internal use
     parsed, _ = parser.parse_known_args(args)
 
-    mem = _get_memory()
+    from mnemosyne.core.memory import Mnemosyne
     from mnemosyne.core.sync import SyncEngine, SyncEncryption
 
-    encryption = None
-    if parsed.encrypt:
-        encryption = SyncEncryption.from_config(parsed.encrypt)
+    mem = Mnemosyne(db_path=parsed.db_path, session_id=parsed.session_id)
 
-    engine = SyncEngine(mem, encryption=encryption)
+    encryption_source = parsed.encrypt
+    if parsed.encrypt_key_file:
+        encryption_source = _read_secret_file(parsed.encrypt_key_file, "encryption key")
+    encryption = SyncEncryption.from_config(encryption_source) if encryption_source else None
+    api_key = parsed.api_key
+    if parsed.api_key_file:
+        api_key = _read_secret_file(parsed.api_key_file, "API key")
+
+    engine = SyncEngine(
+        mem,
+        encryption=encryption,
+        require_encryption=encryption_source is not None,
+        surface_only=True,
+        initialize_surface=parsed.initialize_surface,
+    )
 
     if parsed.interval > 0:
         # Repeating sync
@@ -374,7 +930,7 @@ def cmd_sync(args):
                 result = engine.sync_with(
                     remote_url=parsed.remote,
                     mode=parsed.mode,
-                    api_key=parsed.api_key,
+                    api_key=api_key,
                 )
                 _print_sync_result(result)
                 time.sleep(parsed.interval)
@@ -384,7 +940,7 @@ def cmd_sync(args):
         result = engine.sync_with(
             remote_url=parsed.remote,
             mode=parsed.mode,
-            api_key=parsed.api_key,
+            api_key=api_key,
         )
         _print_sync_result(result)
 
@@ -398,14 +954,14 @@ def _print_sync_result(result: dict) -> None:
 
     push = result.get("push")
     if push is not None:
-        print(f"  Push:")
+        print("  Push:")
         print(f"    Accepted:   {push.get('accepted', 0)}")
         print(f"    Duplicates: {push.get('duplicates', 0)}")
         print(f"    Conflicts:  {push.get('conflicts', 0)}")
 
     pull = result.get("pull")
     if pull is not None:
-        print(f"  Pull:")
+        print("  Pull:")
         print(f"    Events fetched: {pull.get('events_fetched', 0)}")
         print(f"    Accepted:       {pull.get('accepted', 0)}")
         print(f"    Duplicates:     {pull.get('duplicates', 0)}")
@@ -424,27 +980,60 @@ def cmd_sync_serve(args):
     parser = argparse.ArgumentParser(prog="mnemosyne sync-serve")
     parser.add_argument("--port", type=int, default=8765, help="Server port (default: 8765)")
     parser.add_argument("--host", default="127.0.0.1", help="Bind address (default: 127.0.0.1)")
-    parser.add_argument("--api-key", help="API key for bearer-token auth")
-    parser.add_argument("--jwt-secret", help="JWT secret for token auth")
+    parser.add_argument(
+        "--db-path",
+        required=True,
+        help="Explicit relay SQLite DB path",
+    )
+    parser.add_argument(
+        "--initialize-surface",
+        action="store_true",
+        help="Explicitly initialize a new dedicated relay DB",
+    )
+    parser.add_argument(
+        "--behind-tls-proxy",
+        action="store_true",
+        help="Allow non-loopback cleartext only behind a trusted TLS proxy",
+    )
+    api_group = parser.add_mutually_exclusive_group()
+    api_group.add_argument(
+        "--api-key", help="API key for bearer-token auth (visible in process arguments)"
+    )
+    api_group.add_argument("--api-key-file", help="Private file containing the API key")
+    jwt_group = parser.add_mutually_exclusive_group()
+    jwt_group.add_argument("--jwt-secret", help="JWT secret (visible in process arguments)")
+    jwt_group.add_argument(
+        "--jwt-secret-file", help="Private file containing the JWT secret"
+    )
     parser.add_argument("--tls-cert", help="TLS certificate file path")
     parser.add_argument("--tls-key", help="TLS key file path")
     parser.add_argument("--device-id", help="Custom device identifier")
 
     parsed = parser.parse_args(args)
 
-    mem = _get_memory()
-    from mnemosyne.core.sync import SyncEngine as _SyncEngine
+    api_key = parsed.api_key
+    if parsed.api_key_file:
+        api_key = _read_secret_file(parsed.api_key_file, "API key")
+    jwt_secret = parsed.jwt_secret
+    if parsed.jwt_secret_file:
+        jwt_secret = _read_secret_file(parsed.jwt_secret_file, "JWT secret")
+
+    from mnemosyne.core.memory import Mnemosyne
     from mnemosyne.core.sync_server import run_sync_server as _run_server
+
+    mem = Mnemosyne(db_path=parsed.db_path)
 
     _run_server(
         host=parsed.host,
         port=parsed.port,
         beam_instance=mem,
         device_id=parsed.device_id,
-        api_key=parsed.api_key,
-        jwt_secret=parsed.jwt_secret,
+        api_key=api_key,
+        jwt_secret=jwt_secret,
         tls_cert=parsed.tls_cert,
         tls_key=parsed.tls_key,
+        initialize_surface=parsed.initialize_surface,
+        behind_tls_proxy=parsed.behind_tls_proxy,
     )
 
 
@@ -452,19 +1041,32 @@ def cmd_sync_status(args):
     """Show sync status and statistics."""
     import argparse
     parser = argparse.ArgumentParser(prog="mnemosyne sync-status")
+    parser.add_argument(
+        "--db-path",
+        required=True,
+        help="Explicit shared-surface SQLite DB path",
+    )
     parser.add_argument("--remote", help="Remote sync server URL to check")
-    parser.add_argument("--api-key", help="API key for remote server auth")
+    auth_group = parser.add_mutually_exclusive_group()
+    auth_group.add_argument("--api-key", help="API key (visible in process arguments)")
+    auth_group.add_argument("--api-key-file", help="Private file containing the API key")
     parser.add_argument("--json", action="store_true", help="Output as JSON")
 
     parsed = parser.parse_args(args)
+    api_key = parsed.api_key
+    if parsed.api_key_file:
+        api_key = _read_secret_file(parsed.api_key_file, "API key")
 
-    mem = _get_memory()
+    from mnemosyne.core.memory import Mnemosyne
     from mnemosyne.core.sync import SyncEngine
 
-    engine = SyncEngine(mem)
+    mem = Mnemosyne(db_path=parsed.db_path)
+    engine = SyncEngine(mem, surface_only=True, claim_surface_rows=False)
 
-    # Log a heartbeat event so we have data to show
-    status = engine.get_status(remote_url=parsed.remote if parsed.remote else None)
+    status = engine.get_status(
+        remote_url=parsed.remote if parsed.remote else None,
+        api_key=api_key,
+    )
 
     if parsed.json:
         print(json.dumps(status, indent=2, default=str))
@@ -483,7 +1085,7 @@ def cmd_sync_status(args):
 
     op_breakdown = status.get("operation_breakdown", {})
     if op_breakdown:
-        print(f"\n  Operations breakdown:")
+        print("\n  Operations breakdown:")
         for op, cnt in sorted(op_breakdown.items(), key=lambda x: -x[1]):
             print(f"    {op}: {cnt}")
 
@@ -501,7 +1103,7 @@ def cmd_sync_status(args):
                 print(f"  Remote events:    {pull_info.get('events_fetched', 'N/A')}")
             errors = remote_st.get("errors", [])
             if errors:
-                print(f"  Remote errors:")
+                print("  Remote errors:")
                 for err in errors:
                     print(f"    - {err}")
 
@@ -511,21 +1113,67 @@ def cmd_sync_generate_key(args):
     from mnemosyne.core.sync import SyncEncryption as _Enc
     key = _Enc.generate_key()
     print(key)
-    print(f"\nStore this key securely. It is the only way to decrypt synced payloads.", file=sys.stderr)
+    print("\nStore this key securely. It is the only way to decrypt synced payloads.", file=sys.stderr)
+
+
+def _normalize_backup_output_dir_arg(value: str, *, windows: bool | None = None) -> str:
+    """Normalize an explicit backup directory at the CLI boundary.
+
+    Git Bash/MSYS passes Windows drive paths as ``/c/...``. Passing that raw
+    spelling to ``pathlib.Path`` on Windows creates a drive-relative ``\\c\\...``
+    path, so a successful backup can land somewhere other than the directory the
+    user named. Convert only the unambiguous MSYS drive form. Other POSIX-rooted
+    paths are rejected before the backup backend runs instead of being silently
+    redirected.
+    """
+    if windows is None:
+        windows = os.name == "nt"
+    if not windows or not value.startswith("/"):
+        return value
+
+    unc_parts = value[2:].split("/") if value.startswith("//") else []
+    if (
+        value.startswith("//")
+        and not value.startswith("///")
+        and len(unc_parts) >= 2
+        and unc_parts[0]
+        and unc_parts[1]
+        and PureWindowsPath(value).is_absolute()
+    ):
+        return value
+
+    if (
+        len(value) >= 2
+        and value[1].isascii()
+        and value[1].isalpha()
+        and (len(value) == 2 or value[2] in "/\\")
+    ):
+        remainder = value[2:].replace("\\", "/") if len(value) > 2 else "/"
+        return f"{value[1].upper()}:{remainder}"
+
+    raise ValueError(
+        "On Windows, backup paths beginning with '/' must use an MSYS drive path "
+        "such as /c/backups, or a native absolute path such as C:/backups."
+    )
 
 
 def cmd_backup(args):
     """Create a compressed backup of the database."""
     from mnemosyne.dr.recovery import create_backup
-    output_dir = Path(args[0]) if args else None
+    try:
+        output_dir = Path(_normalize_backup_output_dir_arg(args[0])) if args else None
+    except ValueError as e:
+        # Rejected at the CLI boundary before the backend runs: keep the
+        # caller-visible message (arg-validation contract, exit 2).
+        _fail(str(e))
     try:
         result = create_backup(backup_dir=output_dir)
         print(f"Backup created: {result['backup_path']}")
         print(f"  Original size: {result['original_size']:,} bytes")
         print(f"  Backup size:   {result['backup_size']:,} bytes")
         print(f"  Checksum:      {result['db_checksum']}")
-    except Exception as e:
-        _fail(str(e))
+    except Exception:
+        _fail("backup_failed", exit_code=1)
 
 
 def cmd_restore(args):
@@ -536,13 +1184,13 @@ def cmd_restore(args):
     try:
         result = restore_backup(Path(args[0]))
         status = "valid" if result["integrity_check"] else "corrupt"
+        if not result["integrity_check"]:
+            _fail("restore_failed", exit_code=1)
         print(f"Restored from: {result['backup_used']}")
         print(f"  Database:     {result['database_path']}")
         print(f"  Integrity:    {status}")
-        if not result["integrity_check"]:
-            _fail("Restored database failed integrity check. Emergency backup preserved.")
-    except FileNotFoundError as e:
-        _fail(str(e))
+    except Exception:
+        _fail("restore_failed", exit_code=1)
 
 
 def cmd_verify(args):
@@ -567,8 +1215,8 @@ def cmd_verify(args):
         else:
             print("Database is corrupt. Run 'mnemosyne restore' from a backup.")
             raise SystemExit(1)
-    except Exception as e:
-        _fail(str(e))
+    except Exception:
+        _fail("verify_failed", exit_code=1)
 
 
 def cmd_backups_list(args):
@@ -603,6 +1251,13 @@ def cmd_bank(args):
     try:
         if subcmd == "list":
             banks = bm.list_banks()
+            # CLI output should reflect on-disk state: if the default
+            # bank file does not exist yet, suppress the phantom
+            # virtual 'default' entry here while keeping BankManager's
+            # core virtual-default contract unchanged.
+            default_db = bm.get_bank_db_path("default")
+            if not default_db.exists():
+                banks = [b for b in banks if b != "default"]
             print("\nMemory Banks:\n")
             for b in banks:
                 print(f"  - {b}")
@@ -624,34 +1279,100 @@ def cmd_bank(args):
         _fail(str(e))
 
 
+def _resolve_reindex_target(db_override, bank_override):
+    """Resolve the database path reindex should open, honoring --db/--bank.
+
+    An explicit ``--db`` or ``--bank`` target must already exist. It is
+    looked up without touching the filesystem, so a typo exits before any
+    store, bank directory or backup is created. Without a target this mirrors
+    ``_get_memory()``'s ambient bank resolution.
+    """
+    if db_override is not None:
+        db_path = Path(db_override).expanduser()
+    elif bank_override is not None:
+        from mnemosyne.core.banks import get_bank_db_path_read_only
+
+        try:
+            db_path = get_bank_db_path_read_only(
+                _resolve_bank_name(bank_override), data_dir=Path(DATA_DIR)
+            )
+        except (ValueError, FileNotFoundError) as error:
+            _fail(str(error))
+    else:
+        from mnemosyne.core.banks import BankManager
+
+        bm = BankManager(Path(DATA_DIR))
+        try:
+            return bm.get_bank_db_path(_resolve_bank_name())
+        except ValueError as error:
+            _fail(str(error))
+    if not db_path.is_file():
+        _fail(f"Database not found: {db_path}")
+    return db_path
+
+
 def cmd_reindex(args):
     """Rebuild vector indexes from source text with the active embedding model.
 
-    Usage: mnemosyne reindex [--model NAME] [--dry-run] [--yes] [--no-backup]
+    Usage: mnemosyne reindex [--db PATH | --bank NAME] [--model NAME]
+                              [--dry-run] [--yes] [--no-backup]
 
     Use after changing the embedding model/dimension. Synchronous and blocking —
     re-embeds working + episodic memory, so it can take minutes on a large DB.
     Run it with any provider/gateway stopped.
     """
-    dry_run = "--dry-run" in args
-    assume_yes = "--yes" in args or "-y" in args
-    no_backup = "--no-backup" in args
+    usage = (
+        "Usage: mnemosyne reindex [--db PATH | --bank NAME] [--model NAME] "
+        "[--dry-run] [--yes] [--no-backup]"
+    )
+    db_override = None
+    bank_override = None
+    model_override = None
+    dry_run = False
+    assume_yes = False
+    no_backup = False
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--db":
+            db_override, i = _require_value(args, i, "--db", lambda value, _name: value)
+        elif arg == "--bank":
+            bank_override, i = _require_value(args, i, "--bank", lambda value, _name: value)
+        elif arg == "--model":
+            model_override, i = _require_value(args, i, "--model", lambda value, _name: value)
+        elif arg == "--dry-run":
+            dry_run = True
+            i += 1
+        elif arg in ("--yes", "-y"):
+            assume_yes = True
+            i += 1
+        elif arg == "--no-backup":
+            no_backup = True
+            i += 1
+        else:
+            _usage(f"{usage}\nUnknown reindex option: {arg}")
+
+    if db_override is not None and bank_override is not None:
+        _fail("--db and --bank cannot be used together")
+
+    db_path = _resolve_reindex_target(db_override, bank_override)
 
     # --model has to win before the embedding module is imported: it freezes the
     # model + dimension from the env at import time.
-    if "--model" in args:
-        try:
-            os.environ["MNEMOSYNE_EMBEDDING_MODEL"] = args[args.index("--model") + 1]
-        except IndexError:
-            _usage("Usage: mnemosyne reindex [--model NAME] [--dry-run] [--yes] [--no-backup]")
+    if model_override is not None:
+        os.environ["MNEMOSYNE_EMBEDDING_MODEL"] = model_override
 
     from mnemosyne.core import embeddings as _emb
+    # Open the target through BeamMemory, not Mnemosyne: importing
+    # mnemosyne.core.memory runs init_db() on the ambient default database,
+    # which a targeted reindex must leave untouched.
+    from mnemosyne.core.beam import BeamMemory, reindex_vectors
 
-    mem = _get_memory()
+    beam = BeamMemory(db_path=str(db_path))
 
     if dry_run:
-        plan = mem.reindex_vectors(dry_run=True)
-        print("Reindex plan (dry run -- nothing written):")
+        plan = reindex_vectors(beam.conn, dry_run=True)
+        print(f"Reindex plan (dry run -- nothing written), db: {db_path}")
         for key in ("model", "dim", "vec_type", "sqlite_vec",
                     "working_memory", "episodic_memory"):
             if key in plan:
@@ -676,7 +1397,7 @@ def cmd_reindex(args):
     if not no_backup:
         try:
             from mnemosyne.dr.recovery import create_backup
-            backup = create_backup()
+            backup = create_backup(db_path=db_path)
             print(f"Backup created: {backup['backup_path']}")
         except Exception as e:
             _fail(f"Backup failed (use --no-backup to skip): {e}")
@@ -688,7 +1409,7 @@ def cmd_reindex(args):
         print(f"  {store}: {done}/{total}", flush=True)
 
     try:
-        result = mem.reindex_vectors(progress=_progress)
+        result = reindex_vectors(beam.conn, progress=_progress)
     except Exception as e:
         _fail(str(e))
 
@@ -699,10 +1420,533 @@ def cmd_reindex(args):
     print(f"  sqlite-vec tables recreated at dim {result['dim']}")
 
 
+def cmd_hygiene(args):
+    """hygiene audit|clean|restore — noise detection and safe cleanup (issue #428)."""
+
+    from mnemosyne.core.hygiene import (
+        NoiseCandidate,
+        audit_noise,
+        clean_noise,
+        hygiene_status,
+        restore_archived,
+        validate_hygiene_candidate,
+    )
+    from mnemosyne.doctor import open_readonly_doctor_db
+
+    if not args or any(arg in ("--help", "-h") for arg in args):
+        print("Usage: mnemosyne hygiene audit|status|clean|restore [options]")
+        print("  audit [--limit N] [--offset N] [--all [--batch-size N]] [--min-score F] [--json]")
+        print("                                          Scan for noise (dry-run; --batch-size only affects --all)")
+        print("  status [--limit N] [--json]             Show PII-safe hygiene status")
+        print("  clean --action delete|archive|flag [--confirm] [--dry-run] <candidates.json>")
+        print("  restore [--limit N]                     Restore archived memories")
+        return
+
+    sub = args[0]
+    rest = args[1:]
+
+    if sub == "audit":
+        limit = 200
+        min_score = 0.3
+        offset = 0
+        batch_size = 1000
+        scan_all = False
+        as_json = False
+        i = 0
+        while i < len(rest):
+            if rest[i] == "--limit":
+                limit, i = _require_value(rest, i, "--limit", _parse_int)
+            elif rest[i] == "--offset":
+                offset, i = _require_value(rest, i, "--offset", _parse_int)
+            elif rest[i] == "--batch-size":
+                batch_size, i = _require_value(rest, i, "--batch-size", _parse_int)
+            elif rest[i] == "--min-score":
+                min_score, i = _require_value(rest, i, "--min-score", _parse_float)
+            elif rest[i] == "--all":
+                scan_all = True
+                i += 1
+            elif rest[i] == "--json":
+                as_json = True
+                i += 1
+            else:
+                _fail(f"Unknown hygiene audit option: {rest[i]}")
+
+        db_path = Path(DATA_DIR) / "mnemosyne.db"
+        if not db_path.exists():
+            _fail("hygiene_audit_failed", exit_code=1)
+
+        conn = None
+        try:
+            conn = open_readonly_doctor_db(db_path)
+            report = audit_noise(
+                db_path=db_path,
+                limit=limit,
+                min_score=min_score,
+                offset=offset,
+                scan_all=scan_all,
+                batch_size=batch_size,
+                conn=conn,
+            )
+        except Exception:
+            _fail("hygiene_audit_failed", exit_code=1)
+        finally:
+            if conn is not None:
+                conn.close()
+
+        if as_json:
+            print(json.dumps(report.to_dict(), indent=2))
+        else:
+            mode = "all rows" if scan_all else f"limit={limit} offset={offset}"
+            print(f"Audited {report.total_scanned} rows across {report.tables_scanned} ({mode})")
+            print(f"Found {len(report.candidates)} noise candidates")
+            print(f"  with secrets: {report.summary.get('with_secrets', 0)}")
+            for table, count in report.summary.get("by_table", {}).items():
+                print(f"  candidates in {table}: {count}")
+            for action, count in report.summary.get("by_action", {}).items():
+                print(f"  suggested {action}: {count}")
+            print()
+            for c in report.candidates[:20]:
+                print(f"  [{c.noise_score:.2f}] {c.suggested_action:8} {c.table_name}:{c.memory_id[:12]}")
+                print(f"         {c.content_preview[:80]}")
+                if c.secret_flags:
+                    print(f"         SECRETS: {', '.join(c.secret_flags)}")
+            if len(report.candidates) > 20:
+                print(f"  ... and {len(report.candidates) - 20} more (use --json for full list)")
+
+    elif sub == "status":
+        as_json = False
+        limit = 200
+        i = 0
+        while i < len(rest):
+            if rest[i] == "--json":
+                as_json = True
+                i += 1
+            elif rest[i] == "--limit":
+                limit, i = _require_value(rest, i, "--limit", _parse_int)
+            else:
+                _fail(f"Unknown hygiene status option: {rest[i]}")
+        db_path = Path(DATA_DIR) / "mnemosyne.db"
+        if not db_path.exists():
+            _fail("hygiene_status_failed", exit_code=1)
+        conn = None
+        try:
+            conn = open_readonly_doctor_db(db_path)
+            status = hygiene_status(db_path=db_path, limit=limit, conn=conn)
+        except Exception:
+            _fail("hygiene_status_failed", exit_code=1)
+        finally:
+            if conn is not None:
+                conn.close()
+        if as_json:
+            print(json.dumps(status, indent=2))
+        else:
+            audit_log = status.get("audit_log", {})
+            print("Hygiene status")
+            print(f"  audit log present: {audit_log.get('present', False)}")
+            print(f"  audit log entries: {audit_log.get('total_entries', 0)}")
+            if audit_log.get("by_action"):
+                for action, count in audit_log["by_action"].items():
+                    print(f"  logged {action}: {count}")
+            noise = status.get("noise_summary", {})
+            print(f"  scanned rows: {noise.get('total_scanned', 0)}")
+            print(f"  noise candidates: {noise.get('total_candidates', 0)}")
+            print(f"  candidate ratio: {noise.get('candidate_ratio', 0.0)}")
+            print(f"  with secrets: {noise.get('with_secrets', 0)}")
+
+    elif sub == "clean":
+        action = "keep"
+        confirm = False
+        dry_run = True
+        candidates_file = None
+
+        i = 0
+        while i < len(rest):
+            if rest[i] == "--action" and i + 1 < len(rest):
+                action = rest[i + 1]
+                i += 2
+            elif rest[i] == "--confirm":
+                confirm = True
+                dry_run = False
+                i += 1
+            elif rest[i] == "--dry-run":
+                dry_run = True
+                i += 1
+            else:
+                candidates_file = rest[i]
+                i += 1
+
+        if not candidates_file:
+            _fail("candidates JSON file required: mnemosyne hygiene clean <candidates.json>")
+
+        try:
+            with open(candidates_file, encoding="utf-8") as f:
+                raw = json.load(f)
+        except Exception:
+            _fail("hygiene_clean_failed", exit_code=1)
+
+        # audit --json emits an envelope {"total_scanned": N, "candidates": [...]};
+        # clean expects the candidates array.
+        if isinstance(raw, dict):
+            if "candidates" not in raw:
+                _fail("Candidates envelope is missing the 'candidates' field")
+            raw = raw["candidates"]
+
+        if not isinstance(raw, list):
+            _fail("Candidates file must contain a JSON array or an audit envelope with a 'candidates' array")
+
+        candidates = []
+        for idx, c in enumerate(raw):
+            try:
+                validate_hygiene_candidate(c)
+            except ValueError as e:
+                _fail(f"Candidate #{idx}: {e}")
+            try:
+                candidates.append(NoiseCandidate(
+                    memory_id=c["memory_id"],
+                    table_name=c["table_name"],
+                    content_preview=c.get("content_preview", ""),
+                    noise_score=c.get("noise_score", 0.0),
+                    noise_reasons=c.get("noise_reasons", []),
+                    secret_flags=c.get("secret_flags", []),
+                    importance=c.get("importance", 0.5),
+                    source=c.get("source", ""),
+                    timestamp=c.get("timestamp", ""),
+                    suggested_action=c.get("suggested_action", "keep"),
+                    content_length=c.get("content_length", 0),
+                ))
+            except KeyError as e:
+                _fail(f"Missing required field {e} in candidate #{idx}")
+
+        db_path = Path(DATA_DIR) / "mnemosyne.db"
+        if not db_path.exists():
+            _fail("hygiene_clean_failed", exit_code=1)
+
+        try:
+            result = clean_noise(
+                db_path=db_path,
+                candidates=candidates,
+                action=action,
+                confirm=confirm,
+                dry_run=dry_run,
+            )
+        except Exception:
+            _fail("hygiene_clean_failed", exit_code=1)
+
+        if result.errors:
+            _fail("hygiene_clean_failed", exit_code=1)
+
+        mode = "DRY RUN" if dry_run else "APPLIED"
+        print(f"[{mode}] deleted={result.deleted} archived={result.archived} "
+              f"flagged={result.flagged} kept={result.kept}")
+
+    elif sub == "restore":
+        restore_limit = 100
+        i = 0
+        while i < len(rest):
+            if rest[i] == "--limit":
+                restore_limit, i = _require_value(rest, i, "--limit", _parse_int)
+            else:
+                _fail(f"Unknown hygiene restore option: {rest[i]}")
+
+        db_path = Path(DATA_DIR) / "mnemosyne.db"
+        if not db_path.exists():
+            _fail("hygiene_restore_failed", exit_code=1)
+
+        try:
+            restored = restore_archived(db_path=db_path, limit=restore_limit)
+        except Exception:
+            _fail("hygiene_restore_failed", exit_code=1)
+        print(f"Restored {restored} archived memories.")
+
+    else:
+        _fail(f"Unknown hygiene subcommand: {sub}. Use 'audit', 'status', 'clean', or 'restore'.")
+
+
+def cmd_profile(args):
+    """profile list|apply|show|create — gamified config templates."""
+    from mnemosyne.core.profiles import list_profiles, get_profile, apply_profile, create_profile
+
+    if not args or any(arg in ("--help", "-h") for arg in args):
+        print("Usage: mnemosyne profile <list|apply|show|create> [options]")
+        print("  list                           Show all available profiles")
+        print("  apply <name> [--dry-run]       Apply a profile to config.yaml")
+        print("  show <name>                    Inspect a profile's settings")
+        print("  create <name> [description]    Save current config as a profile")
+        return
+
+    sub = args[0]
+    rest = args[1:]
+
+    if sub == "list":
+        profiles = list_profiles()
+        print(f"\n{'Name':15s} {'Description'}")
+        print("-" * 70)
+        for name, meta in profiles.items():
+            print(f"{name:15s} {meta.description}")
+            # Rating bars
+            ratings_str = "  "
+            for label, val in meta.ratings.items():
+                bar = "█" * (val // 2) + "░" * (10 - val // 2)
+                ratings_str += f"  {label:15s} {bar} {val:2d}/20"
+            print(ratings_str)
+            print(f"{'':15s} Use case: {meta.use_case}")
+            print()
+
+    elif sub == "apply":
+        if len(rest) < 1:
+            _fail("Profile name required: mnemosyne profile apply <name> [--dry-run]")
+        name = rest[0]
+        dry_run = "--dry-run" in rest
+        config_path_arg = None
+        if "--config" in rest:
+            idx = rest.index("--config")
+            if idx + 1 < len(rest):
+                config_path_arg = rest[idx + 1]
+
+        # Captured before the write so the vec_type notice below can tell
+        # whether the value actually changed.
+        try:
+            from mnemosyne.core.config import MnemosyneConfig
+            if config_path_arg:
+                _prev_cfg = MnemosyneConfig(config_path=Path(config_path_arg))
+            else:
+                _prev_cfg = MnemosyneConfig.get_instance()
+            _prev_vec_type = _prev_cfg.get("vec_type")
+        except Exception:
+            _prev_vec_type = None
+
+        success, errors = apply_profile(name, config_path=config_path_arg, dry_run=dry_run)
+        if not success:
+            print(f"Failed to apply profile '{name}':", file=sys.stderr)
+            for e in errors:
+                print(f"  {e}", file=sys.stderr)
+            raise SystemExit(1)
+        mode = "DRY RUN" if dry_run else "APPLIED"
+        applied = get_profile(name) or {}
+        print(f"[{mode}] Profile '{name}' — {len(applied)} settings")
+        if not dry_run:
+            print("Run 'mnemosyne config reload' to apply changes to a running process.")
+            # vec_type is the one REQUIRES_RESTART key in TEMPLATE_KEYS, and
+            # every profile sets it. 'config reload' cannot apply it, and the
+            # sqlite-vec tables are locked to the type they were created with,
+            # so a change here needs a restart plus a reindex. Saying only
+            # "run config reload" is misleading whenever it changed.
+            try:
+                if applied.get("vec_type") and applied["vec_type"] != _prev_vec_type:
+                    print(
+                        f"\nvec_type changed {_prev_vec_type or '(unset)'} -> "
+                        f"{applied['vec_type']}. This one needs more than a reload:\n"
+                        "  1. restart the process (vec_type is read at startup)\n"
+                        "  2. run 'mnemosyne reindex' to rebuild the vector tables\n"
+                        "Existing vectors are not converted in place."
+                    )
+            except Exception:
+                pass
+
+    elif sub == "show":
+        if len(rest) < 1:
+            _fail("Profile name required: mnemosyne profile show <name>")
+        name = rest[0]
+        settings = get_profile(name)
+        if settings is None:
+            _fail(f"Unknown profile: '{name}'. Run 'mnemosyne profile list' for options.")
+        print(f"\nProfile: {name}\n")
+        for key in sorted(settings.keys()):
+            print(f"  {key:45s} = {settings[key]}")
+
+    elif sub == "create":
+        if len(rest) < 1:
+            _fail("Profile name required: mnemosyne profile create <name> [description]")
+        name = rest[0]
+        desc = " ".join(rest[1:]) if len(rest) > 1 else ""
+        success = create_profile(name, description=desc)
+        if success:
+            print(f"Created profile '{name}' from current configuration.")
+        else:
+            _fail(f"Failed to create profile '{name}' — validation failed.")
+
+    else:
+        _fail(f"Unknown profile subcommand: {sub}. Use 'list', 'apply', 'show', or 'create'.")
+
+
+def cmd_config(args):
+    """config reload|get|set|migrate — manage config.yaml."""
+    if not args or any(arg in ("--help", "-h") for arg in args):
+        print("Usage: mnemosyne config <reload|get|set|migrate> [options]")
+        print("  reload                         Re-read config.yaml (hot-reload)")
+        print("  get <key>                      Read a single config value")
+        print("  set <key> <value>              Write a value to config.yaml")
+        print("  migrate                        Export current env vars to config.yaml")
+        return
+
+    sub = args[0]
+    rest = args[1:]
+    from mnemosyne.core.config import get_config
+
+    if sub == "reload":
+        config = get_config()
+        changed = config.reload()
+        if changed:
+            print(f"Reloaded config.yaml — {len(changed)} key(s) changed:")
+            for key in sorted(changed):
+                print(f"  {key}")
+        else:
+            print("Config unchanged.")
+
+    elif sub == "get":
+        if len(rest) < 1:
+            _fail("Key required: mnemosyne config get <key>")
+        key = rest[0]
+        config = get_config()
+        val = config.get(key)
+        if val is None:
+            print("(not set)")
+        else:
+            print(f"{key} = {val}")
+
+    elif sub == "set":
+        if len(rest) < 2:
+            _fail("Key and value required: mnemosyne config set <key> <value>")
+        key = rest[0]
+        value = rest[1]
+        config = get_config()
+        config.set(key, value)
+        print(f"Set {key} = {value}")
+        from mnemosyne.core.config import REQUIRES_RESTART
+        if key in REQUIRES_RESTART:
+            print(f"  ⚠ {key} requires restart to take effect.")
+
+    elif sub == "migrate":
+        config = get_config()
+        migrated = config.migrate_from_env()
+        print(f"Migrated {len(migrated)} env vars to config.yaml:")
+        for key in migrated:
+            print(f"  {key}")
+
+    else:
+        _fail(f"Unknown config subcommand: {sub}. Use 'reload', 'get', 'set', or 'migrate'.")
+
+
+def cmd_migrate(args):
+    """Bring an existing bank up to the packaged schema.
+
+    Applies the 3.11.1 tables (E7) and the order-normalized conflicts pair
+    key (E8), bank-scoped. Bank selection: ``--bank <name>`` flag, else
+    ``$MNEMOSYNE_BANK``, else the default bank. ``--dry-run`` reports
+    pending DDL without writing.
+
+    E8 is index-only. When pre-existing duplicate conflict pairs make the
+    unique index impossible, the pairs are reported and a real run exits
+    non-zero with the bank's rows untouched — choosing a winner per pair
+    is adjudication, not migration.
+    """
+    usage = "Usage: mnemosyne migrate [--bank <name>] [--dry-run]"
+    bank_override = None
+    dry_run = False
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--bank":
+            if i + 1 >= len(args) or args[i + 1].startswith("--"):
+                _usage(usage)
+            bank_override = args[i + 1]
+            i += 2
+        elif arg == "--dry-run":
+            dry_run = True
+            i += 1
+        else:
+            _usage(usage)
+
+    bank = _resolve_bank_name(bank_override)
+
+    from mnemosyne.core.banks import BankManager
+    from mnemosyne.migrations.e7_311_tables import migrate_311_tables
+    from mnemosyne.migrations.e8_conflict_pair_key import (
+        ConflictSchemaUnreadableError,
+        IndexDefinitionMismatchError,
+        migrate_conflict_pair_key,
+    )
+
+    bm = BankManager(Path(DATA_DIR))
+    try:
+        db_path = bm.get_bank_db_path(bank)
+    except ValueError as e:
+        _fail(str(e))
+
+    if not db_path.exists():
+        _fail(f"Bank '{bank}' does not exist (no db at {db_path})", exit_code=1)
+
+    try:
+        report = migrate_311_tables(db_path, dry_run=dry_run)
+    except Exception:
+        _fail("migrate_failed", exit_code=1)
+
+    mode = "DRY RUN" if dry_run else "APPLIED"
+    print(f"migrate 311 [{mode}]: bank={bank} db={db_path}")
+    if "tables_would_add" in report:
+        print(
+            f"  would add tables: {', '.join(report['tables_would_add']) or '(none)'}"
+        )
+        if "columns_would_add" in report:
+            print(
+                "  would add columns: "
+                f"{', '.join(report['columns_would_add']) or '(none)'}"
+            )
+        print(f"  would add indices: {report['indices_would_add']}")
+    else:
+        print(f"  tables added: {', '.join(report['tables_added']) or '(none)'}")
+        print(
+            "  tables already present: "
+            f"{', '.join(report['tables_already_present']) or '(none)'}"
+        )
+        if "columns_added" in report:
+            print(
+                "  columns added: "
+                f"{', '.join(report['columns_added']) or '(none)'}"
+            )
+        print(f"  indices added: {report['indices_added']}")
+
+    # E8: order-normalized unique pair key on conflicts, bank-scoped.
+    # Existing banks only ever received the 311 tables above; without this
+    # call the pair constraint was unreachable through `mnemosyne migrate`.
+    try:
+        e8_report = migrate_conflict_pair_key(db_path, dry_run=dry_run)
+    except (
+        IndexDefinitionMismatchError,
+        ConflictSchemaUnreadableError,
+    ) as e:
+        _fail(f"migrate_failed: {e}", exit_code=1)
+    except Exception:
+        _fail("migrate_failed: e8", exit_code=1)
+
+    print(f"migrate e8 [{mode}]: bank={bank} db={db_path}")
+    if e8_report["conflicts_table_missing"]:
+        print("  conflicts table absent — nothing to index")
+    elif e8_report["index_already_present"]:
+        print("  index already present (definition validated): "
+              "idx_conflicts_pair_norm")
+    elif e8_report["duplicate_pairs"]:
+        pairs = e8_report["duplicate_pairs"]
+        print(
+            f"  NOT APPLIED — {len(pairs)} duplicate normalized pair(s) "
+            f"block the unique index: {', '.join(pairs)}"
+        )
+        print("  rows left untouched; adjudicate a winner per pair, "
+              "then re-run migrate")
+        if not dry_run:
+            _fail("migrate_incomplete: conflicts pair key (E8) not applied",
+                  exit_code=1)
+    elif dry_run:
+        print("  would add index: idx_conflicts_pair_norm")
+    else:
+        print("  index added: idx_conflicts_pair_norm")
+
+
 COMMANDS = {
     "store": cmd_store,
     "remember": cmd_store,
     "recall": cmd_recall,
+    "media": cmd_media,
     "search": cmd_recall,
     "update": cmd_update,
     "edit": cmd_update,
@@ -712,7 +1956,8 @@ COMMANDS = {
     "sleep": cmd_sleep,
     "consolidate": cmd_sleep,
     "diagnose": cmd_diagnose,
-    "doctor": cmd_diagnose,
+    "doctor": cmd_doctor,
+    "repair": cmd_repair,
     "export": cmd_export,
     "import": cmd_import,
     "import-hindsight": cmd_import_hindsight,
@@ -724,51 +1969,89 @@ COMMANDS = {
     "verify": cmd_verify,
     "backups": cmd_backups_list,
     "sync": cmd_sync,
+    "sync-init": cmd_sync_init,
     "sync-serve": cmd_sync_serve,
     "sync-server": cmd_sync_serve,
     "sync-status": cmd_sync_status,
     "sync-generate-key": cmd_sync_generate_key,
+    "migrate": cmd_migrate,
+    "hygiene": cmd_hygiene,
+    "profile": cmd_profile,
+    "config": cmd_config,
 }
 
 
 def run_cli():
     """Main CLI entry point."""
+    # Force UTF-8 output: on Windows, stdout/stderr default to cp1252 when piped
+    # (e.g. by agent tooling spawning this CLI), and printing memory content that
+    # contains non-cp1252 characters (e.g. '\u20b1') raises UnicodeEncodeError and
+    # kills the command. See docs/integrations/pi.md tooling which pipes output.
+    for stream in (sys.stdout, sys.stderr):
+        if stream is not None and hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+    if len(sys.argv) >= 2 and sys.argv[1] in ("--version", "version"):
+        print(f"Mnemosyne {_distribution_version('mnemosyne-memory')}")
+        return
+
     if len(sys.argv) < 2 or sys.argv[1] in ("--help", "-h", "help"):
+        # Help/version paths are side-effect-free; command setup is guarded below.
         print("Mnemosyne - Local AI Memory System\n")
         print("Usage: mnemosyne <command> [args]\n")
         print("Commands:")
+        print("  version                                Show installed version")
         print("  store <content> [source] [importance]  Store a memory")
         print("  recall <query> [top_k]                 Search memories")
+        print("  media <path|url> [--modality M] [--json]  Remember an image, audio, video or document")
         print("  update <id> <content> [importance]     Update a memory")
         print("  delete <id>                            Delete a memory")
         print("  stats                                  Show statistics")
         print("  sleep                                  Run consolidation")
         print("  diagnose [--fix] [--dry-run] [--repair-vec-working]  Run diagnostics / optional repairs")
+        print("  doctor [--db PATH|--bank NAME] [--format json|markdown|both]  Read-only report")
+        print("  repair --report REPORT.json --select working_memory:ID [--apply]  Narrow doctor-gated repair")
         print("  export [--include-sync-events] [file.json]    Export memories")
         print("  import <file.json>                     Import memories")
         print("  import-hindsight <file|url> [bank]     Import Hindsight memories")
         print("  bank list|create|delete [name]         Manage memory banks")
-        print("  reindex [--model NAME] [--dry-run] [--yes] [--no-backup]")
+        print("  reindex [--db PATH|--bank NAME] [--model NAME] [--dry-run] [--yes] [--no-backup]")
         print("                                      Rebuild vector indexes with the active model")
         print("  backup [output_dir]                    Create database backup")
         print("  restore <backup.db.gz>                 Restore from backup")
         print("  verify [db_path] [--quick]             Verify database integrity")
         print("  backups [backup_dir]                   List available backups")
-        print("  mcp [--transport sse] [--port 8080]    Start MCP server")
-        print("  sync --remote <url> [--mode push|pull|bidirectional]")
+        print("  mcp [--transport stdio|sse|streamable-http|http] [--port 8080] [--path /mcp] [--json-response]")
+        print("                                        Start MCP server")
+        print("  sync --db-path <path> --remote <url> [--mode push|pull|bidirectional]")
         print("                                      Sync with remote server")
-        print("  sync-serve [--port 8765] [--host 0.0.0.0]")
+        print("  sync-init --db-path <path> [--claim-existing --yes]")
+        print("                                      Initialize/migrate a dedicated surface DB")
+        print("  sync-serve --db-path <path> [--port 8765] [--host 0.0.0.0]")
         print("                                      Start sync server")
-        print("  sync-status [--remote <url>] [--json]")
+        print("  sync-status --db-path <path> [--remote <url>] [--json]")
         print("                                      Show sync status")
         print("  sync-generate-key                    Generate encryption key")
+        print("  migrate [--bank <name>]                Add 3.11.1 schema tables to an existing bank")
+        print("  hygiene audit|clean                  Noise audit and safe cleanup")
+        print("  profile list|apply|show|create       Config templates (gamified)")
+        print("  config reload|get|set|migrate         Manage config.yaml")
         return
 
     command = sys.argv[1]
     handler = COMMANDS.get(command)
 
     if handler:
-        handler(sys.argv[2:])
+        # Error containment: unexpected failures must surface as a static
+        # machine-readable code, never a traceback (which leaks absolute
+        # paths and library internals into logs).
+        try:
+            if command not in {"doctor", "repair", "reindex"}:
+                os.makedirs(DATA_DIR, exist_ok=True)
+            handler(sys.argv[2:])
+        except SystemExit:
+            raise
+        except Exception:
+            _fail("cli_unexpected_failure", exit_code=1)
     else:
         print(f"Unknown command: {command}", file=sys.stderr)
         print("Run 'mnemosyne --help' for usage.", file=sys.stderr)

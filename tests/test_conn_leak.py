@@ -4,7 +4,9 @@ Every ``sqlite3.Connection`` is cyclic garbage — CPython builds the statement
 cache as ``lru_cache(...)(connection)``, so the connection references itself
 and refcounting can never free it. The memory layer caches one connection per
 thread, so a daemon serving short-lived threads leaked handles until ``open()``
-failed with EMFILE. ``conn_sweep`` periodically runs a cyclic collection.
+failed with EMFILE. Upstream ``_connection_gc.collect_connection_cycles``
+(#747) periodically runs a cyclic collection; it superseded the fork's
+``conn_sweep`` module, and this file is kept as the fork's end-to-end guard.
 """
 
 import gc
@@ -70,12 +72,12 @@ def test_sqlite_connections_are_self_referential():
 @pytest.mark.skipif(sys.platform == "win32", reason="lsof is POSIX-only")
 def test_handles_stay_bounded_across_many_threads(memory):
     """Handle count must not scale with the number of threads served."""
-    from mnemosyne.core import conn_sweep
+    from mnemosyne.core import _connection_gc
 
-    serve_on_threads(memory, conn_sweep._SWEEP_EVERY * 2)
+    serve_on_threads(memory, _connection_gc._CONNECTIONS_PER_COLLECTION * 2)
     after_first = mnemosyne_db_handles()
 
-    serve_on_threads(memory, conn_sweep._SWEEP_EVERY * 6)
+    serve_on_threads(memory, _connection_gc._CONNECTIONS_PER_COLLECTION * 6)
     after_second = mnemosyne_db_handles()
 
     growth = after_second - after_first
@@ -85,16 +87,6 @@ def test_handles_stay_bounded_across_many_threads(memory):
     )
 
 
-def test_sweep_only_fires_once_per_interval():
-    from mnemosyne.core import conn_sweep
-
-    conn_sweep._since_sweep = 0
-    fired = [conn_sweep.note_connection_opened()
-             for _ in range(conn_sweep._SWEEP_EVERY)]
-    assert fired.count(True) == 1, "expected exactly one sweep per interval"
-    assert fired[-1] is True, "expected the sweep on the interval boundary"
-
-
 def test_sweep_does_not_close_a_referenced_connection(memory, tmp_path):
     """A connection someone still holds must survive a sweep.
 
@@ -102,14 +94,13 @@ def test_sweep_does_not_close_a_referenced_connection(memory, tmp_path):
     connections are opened check_same_thread=False and legitimately outlive
     the thread that created them.
     """
-    from mnemosyne.core import conn_sweep
+    from mnemosyne.core import _connection_gc
 
     held = memory.Mnemosyne(session_id="holder")
     other = memory.Mnemosyne(session_id="other", db_path=tmp_path / "other.db")
 
-    conn_sweep._since_sweep = 0
-    for _ in range(conn_sweep._SWEEP_EVERY):
-        conn_sweep.note_connection_opened()
+    for _ in range(_connection_gc._CONNECTIONS_PER_COLLECTION):
+        _connection_gc.collect_connection_cycles()
 
     assert held.conn.execute("SELECT 1").fetchone()[0] == 1
     assert other.conn.execute("SELECT 1").fetchone()[0] == 1

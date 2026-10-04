@@ -4,8 +4,6 @@ Tests for Mnemosyne Structured Fact Extraction (Phase 2)
 
 import os
 import sys
-import json
-import sqlite3
 import tempfile
 from pathlib import Path
 
@@ -18,9 +16,9 @@ from mnemosyne.core.extraction import (
     _build_extraction_prompt,
     _call_local_extraction_llm,
     _parse_facts,
-    EXTRACTION_PROMPT_TEMPLATE,
 )
 from mnemosyne.core.triples import init_triples
+from mnemosyne.extraction.diagnostics import get_diagnostics, reset_extraction_stats
 
 
 class MockLLM:
@@ -61,6 +59,121 @@ def test_parse_facts_with_numbering():
     assert len(facts) == 4
     assert all(not fact.startswith(("1.", "2.", "-", "*")) for fact in facts)
     print("PASS: test_parse_facts_with_numbering")
+
+
+def test_parse_facts_json_dedupes_across_categories():
+    """A statement filed under several categories is returned once."""
+    import json as _json
+    raw = _json.dumps({
+        "facts": [
+            "Servers must clock out through the tablet",
+            "The POS system goes live October 1st",
+        ],
+        # Correct categorisation: the first is also an instruction, the second
+        # is also a timeline. Both belong in more than one bucket.
+        "instructions": ["Servers must clock out through the tablet"],
+        "preferences": [],
+        "timelines": ["The POS system goes live October 1st"],
+    })
+    facts = _parse_facts(raw)
+    assert len(facts) == 2, facts
+    assert len({f.casefold() for f in facts}) == 2, facts
+    # First-seen order is preserved, so 'facts' entries keep their position.
+    assert facts[0] == "Servers must clock out through the tablet"
+    assert facts[1] == "The POS system goes live October 1st"
+    print("PASS: test_parse_facts_json_dedupes_across_categories")
+
+
+def test_parse_facts_json_dedupe_ignores_case_and_padding():
+    """Dedupe compares trimmed, case-folded text."""
+    import json as _json
+    raw = _json.dumps({
+        "facts": ["The user prefers dark mode"],
+        "instructions": ["  the user prefers DARK MODE  "],
+        "preferences": [],
+        "timelines": [],
+    })
+    facts = _parse_facts(raw)
+    assert len(facts) == 1, facts
+    # The surviving copy keeps its original text, untrimmed variants dropped.
+    assert facts[0] == "The user prefers dark mode"
+    print("PASS: test_parse_facts_json_dedupe_ignores_case_and_padding")
+
+
+def test_parse_facts_json_keeps_distinct_items():
+    """Dedupe must not collapse genuinely different statements."""
+    import json as _json
+    raw = _json.dumps({
+        "facts": ["The user works evenings"],
+        "instructions": ["Always use tabs"],
+        "preferences": ["The user likes dark mode"],
+        "timelines": ["Release on 2026-12-01"],
+    })
+    facts = _parse_facts(raw)
+    assert facts == [
+        "The user works evenings",
+        "Always use tabs",
+        "The user likes dark mode",
+        "Release on 2026-12-01",
+    ], facts
+    print("PASS: test_parse_facts_json_keeps_distinct_items")
+
+
+def test_parse_facts_json_empty_categories_yield_no_facts():
+    """A supported payload with nothing to extract returns no facts.
+
+    Falling through to the partial-JSON fallback would hand the raw text to a
+    regex matching any quoted run of ten or more characters, which the schema's
+    own key names satisfy — 'instructions' and 'preferences' would be stored.
+    """
+    import json as _json
+    for payload in (
+        {"facts": [], "instructions": [], "preferences": [], "timelines": []},
+        {"facts": ["   "], "instructions": [], "preferences": [], "timelines": []},
+        {"facts": [], "instructions": [], "preferences": [], "timelines": [], "kg": []},
+    ):
+        facts = _parse_facts(_json.dumps(payload))
+        assert facts == [], facts
+    print("PASS: test_parse_facts_json_empty_categories_yield_no_facts")
+
+
+def test_parse_facts_json_unusable_supported_values_yield_no_key_names():
+    """A supported key present but unusable still suppresses the fallback.
+
+    A model that answers `"facts": null` rather than `[]` reaches the same
+    trap as an empty payload: the partial-JSON regex matches the schema's own
+    key names. Presence of the category is what marks the document complete,
+    not whether its value happened to be a list.
+    """
+    import json as _json
+    for payload in (
+        {"facts": None, "instructions": None, "preferences": None, "timelines": None},
+        {"facts": {}, "instructions": None, "preferences": None, "timelines": None},
+        {"facts": 0, "instructions": None, "preferences": None, "timelines": None},
+    ):
+        facts = _parse_facts(_json.dumps(payload))
+        assert facts == [], facts
+
+    # A scalar where a list belongs is unusable too. It yields nothing rather
+    # than smuggling the key names in beside its content: the schema promises a
+    # list, and coercing a bare string into a fact would invent a contract the
+    # prompt never stated.
+    scalar = _parse_facts(_json.dumps({
+        "facts": "the user works evenings",
+        "instructions": None, "preferences": None, "timelines": None,
+    }))
+    assert scalar == [], scalar
+    print("PASS: test_parse_facts_json_unusable_supported_values_yield_no_key_names")
+
+
+def test_parse_facts_json_without_supported_categories_falls_back():
+    """No supported category present still falls through to the fallback."""
+    import json as _json
+    raw = _json.dumps({"kg": ["user prefers vim", "project uses fastapi"]})
+    facts = _parse_facts(raw)
+    assert "user prefers vim" in facts, facts
+    assert "project uses fastapi" in facts, facts
+    print("PASS: test_parse_facts_json_without_supported_categories_falls_back")
 
 
 def test_parse_facts_no_facts():
@@ -219,7 +332,6 @@ def test_extraction_prompt_configurable():
         
         # Re-import to pick up new env var
         # (In real usage, you'd restart; here we test the constant directly)
-        from mnemosyne.core.extraction import EXTRACTION_PROMPT_TEMPLATE as ep
         # Note: module-level constants are set at import time, so this tests
         # that the code structure supports it. The actual override requires
         # re-import or setting before import.
@@ -281,7 +393,7 @@ if __name__ == "__main__":
 # Host LLM backend integration (decisions A1, A3, C2)
 # ---------------------------------------------------------------------------
 
-from unittest.mock import patch  # noqa: E402
+from unittest.mock import MagicMock, patch  # noqa: E402
 
 from mnemosyne.core import extraction as _extraction_mod, local_llm  # noqa: E402
 from mnemosyne.core.llm_backends import (  # noqa: E402
@@ -368,6 +480,60 @@ def test_host_extract_facts_preserves_bulleted_output(monkeypatch):
     assert any("example.com" in f for f in facts)
     # And the bullet prefix should be gone (parse_facts strips it).
     assert not any(f.startswith("-") for f in facts)
+
+
+def test_host_extract_facts_rejects_token_truncated_reasoning(monkeypatch):
+    """Malformed reasoning must not fall through to another extraction tier."""
+    _enable_host(monkeypatch)
+    set_host_llm_backend(CallableLLMBackend(
+        "test", lambda *a, **k: "<think>reasoning truncated by max_tokens"
+    ))
+
+    with patch.object(local_llm, "_call_remote_llm") as remote, \
+         patch.object(local_llm, "_load_llm") as local:
+        assert extract_facts("Denis prefers dark mode.") == []
+    remote.assert_not_called()
+    local.assert_not_called()
+
+
+def test_remote_extract_facts_rejects_token_truncated_reasoning(monkeypatch):
+    """Malformed remote output records its tier and returns no facts."""
+    reset_extraction_stats()
+    monkeypatch.setattr(local_llm, "LLM_ENABLED", True)
+    monkeypatch.setattr(local_llm, "HOST_LLM_ENABLED", False)
+    monkeypatch.setattr(local_llm, "LLM_BASE_URL", "http://remote/v1")
+    remote = MagicMock(return_value="<think>truncated")
+    local = MagicMock()
+    parse = MagicMock()
+    monkeypatch.setattr(local_llm, "_call_remote_llm", remote)
+    monkeypatch.setattr(local_llm, "_load_llm", local)
+    monkeypatch.setattr(_extraction_mod, "_parse_facts", parse)
+
+    assert extract_facts("Denis prefers dark mode.") == []
+    remote.assert_called_once()
+    local.assert_not_called()
+    parse.assert_not_called()
+    samples = get_diagnostics().snapshot()["by_tier"]["remote"]["error_samples"]
+    assert samples[-1]["reason"] == "malformed_reasoning_trace"
+
+
+def test_local_extract_facts_rejects_token_truncated_reasoning(monkeypatch):
+    """Malformed local output records its tier and returns no facts."""
+    reset_extraction_stats()
+    monkeypatch.setattr(local_llm, "LLM_ENABLED", True)
+    monkeypatch.setattr(local_llm, "HOST_LLM_ENABLED", False)
+    monkeypatch.setattr(local_llm, "LLM_BASE_URL", "")
+    monkeypatch.setattr(local_llm, "llm_available", lambda: True)
+    local = MagicMock(return_value="<think>truncated")
+    parse = MagicMock()
+    monkeypatch.setattr(local_llm, "_load_llm", lambda: local)
+    monkeypatch.setattr(_extraction_mod, "_parse_facts", parse)
+
+    assert extract_facts("Denis prefers dark mode.") == []
+    local.assert_called_once()
+    parse.assert_not_called()
+    samples = get_diagnostics().snapshot()["by_tier"]["local"]["error_samples"]
+    assert samples[-1]["reason"] == "malformed_reasoning_trace"
 
 
 def test_host_extract_facts_remote_path_uses_temperature_zero(monkeypatch):

@@ -5,7 +5,9 @@ Import from this module rather than defining schemas inline:
     from mnemosyne.tool_schemas import ALL_TOOL_SCHEMAS
 
 Every schema dict uses the key "parameters" (JSON Schema style).
-The MCP server layer renames it to "inputSchema" at registration time.
+The MCP server layer renames it to "input_schema" at registration time
+(matching the ``mcp`` SDK 2.x ``Tool.input_schema`` model field — was
+``inputSchema`` on the wire in SDK 1.x).
 """
 
 from typing import Dict, Any, List
@@ -47,7 +49,8 @@ RECALL_SCHEMA = {
         "Search Mnemosyne for relevant memories. Uses hybrid ranking: by default "
         "50% vector similarity + 30% FTS5 text rank + 20% importance + optional "
         "temporal boost. Tune the per-query weights via vec_weight, fts_weight, "
-        "importance_weight (omit to use environment defaults). Returns ranked results."
+        "importance_weight (omit or pass null to resolve config.yaml, then environment variables, "
+        "then built-in defaults). Returns ranked results."
     ),
     "parameters": {
         "type": "object",
@@ -61,8 +64,7 @@ RECALL_SCHEMA = {
             },
             "query_time": {
                 "type": "string",
-                "description": "ISO timestamp to treat as 'now' for temporal scoring. Default is current time.",
-                "default": "",
+                "description": "ISO timestamp to treat as 'now' for temporal scoring. Omit to use the current time.",
             },
             "temporal_halflife": {
                 "type": "number",
@@ -70,16 +72,16 @@ RECALL_SCHEMA = {
                 "default": 24,
             },
             "vec_weight": {
-                "type": "number",
-                "description": "Vector similarity weight in hybrid scoring. Omit (or pass null) to use MNEMOSYNE_VEC_WEIGHT env var or built-in default 0.5.",
+                "type": ["number", "null"],
+                "description": "Vector similarity weight in hybrid scoring. Omit (or pass null) to resolve config.yaml, then MNEMOSYNE_VEC_WEIGHT, then built-in default 0.5.",
             },
             "fts_weight": {
-                "type": "number",
-                "description": "Full-text search weight in hybrid scoring. Omit (or pass null) to use MNEMOSYNE_FTS_WEIGHT env var or built-in default 0.3.",
+                "type": ["number", "null"],
+                "description": "Full-text search weight in hybrid scoring. Omit (or pass null) to resolve config.yaml, then MNEMOSYNE_FTS_WEIGHT, then built-in default 0.3.",
             },
             "importance_weight": {
-                "type": "number",
-                "description": "Importance score weight in hybrid scoring. Omit (or pass null) to use MNEMOSYNE_IMPORTANCE_WEIGHT env var or built-in default 0.2.",
+                "type": ["number", "null"],
+                "description": "Importance score weight in hybrid scoring. Omit (or pass null) to resolve config.yaml, then MNEMOSYNE_IMPORTANCE_WEIGHT, then built-in default 0.2.",
             },
             "explain": {
                 "type": "boolean",
@@ -182,7 +184,9 @@ INVALIDATE_SCHEMA = {
     "name": "mnemosyne_invalidate",
     "description": (
         "Mark a memory as expired or superseded. Provide memory_id from recall results. "
-        "Optionally provide replacement_id to chain old to new."
+        "Optionally provide a replacement_id that must resolve to a working-memory or episodic-memory "
+        "record that is accessible in the current session or global scope to chain old to new. "
+        "An unknown or out-of-scope target or replacement returns status: memory_not_found."
     ),
     "parameters": {
         "type": "object",
@@ -229,16 +233,71 @@ VALIDATE_SCHEMA = {
                 "description": "Optional reason or evidence for this validation.",
                 "default": "",
             },
-            "bank": {
+            "store": {
                 "type": "string",
                 "enum": ["private", "surface"],
-                "description": "Which bank holds the memory. Default 'private'.",
+                "description": "Which store holds the memory: 'private' (the caller's own memory, tenant bank selectable via 'bank') or 'surface' (the shared cross-agent surface, one global store). Default 'private'.",
                 "default": "private",
+            },
+            "bank": {
+                "type": "string",
+                "description": (
+                    "Memory bank to operate on when store is 'private'. Banks are "
+                    "separate stores: memories written to one are not visible to "
+                    "another, which is how a single MCP server serves more than one "
+                    "tenant. Defaults to the server's MNEMOSYNE_MCP_BANK, or 'default'. "
+                    "Deprecated: the values 'private' and 'surface' are still accepted "
+                    "here as an alias for 'store' and will stop being accepted in 5.0."
+                ),
             },
         },
         "required": ["memory_id", "action"],
     },
 }
+
+REMEMBER_MEDIA_SCHEMA = {
+    "name": "mnemosyne_remember_media",
+    "description": (
+        "Remember a piece of media: an image, audio clip, video or document. It is "
+        "registered by reference and, when media understanding is enabled, turned into "
+        "located text memories (captions, timed transcript lines, timed video shots, "
+        "document passages by page) that mnemosyne_recall finds like any other memory. "
+        "Pass an https:// URL, a data: URI, a blob:// reference, or an absolute local "
+        "path inside MNEMOSYNE_MEDIA_ALLOWED_PATHS. Status 'unavailable' is a success: "
+        "the media was registered but nothing described it (no model configured, or "
+        "understanding is off)."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "ref": {
+                "type": "string",
+                "description": "https:// URL, data: URI, blob://sha256/... reference, or an absolute local path inside MNEMOSYNE_MEDIA_ALLOWED_PATHS.",
+            },
+            "modality": {
+                "type": "string",
+                "enum": ["image", "video", "audio", "document"],
+                "description": "Override the modality inferred from the extension or mime type.",
+            },
+            "mime": {"type": "string", "description": "Media type, e.g. image/png. Optional."},
+            "title": {"type": "string", "description": "Short human title for the media. Optional."},
+            "hint": {
+                "type": "string",
+                "description": "Guidance for the describer: what to look for, or names and jargon to expect in speech.",
+            },
+            "max_moments": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+                "description": "Cap on memories created from this media. Default from MNEMOSYNE_MODALITY_MAX_MOMENTS.",
+            },
+            "importance": {"type": "number", "minimum": 0, "maximum": 1, "default": 0.5},
+            "scope": {"type": "string", "enum": ["session", "global"], "description": "Defaults to the configured scope."},
+        },
+        "required": ["ref"],
+    },
+}
+
 
 GET_SCHEMA = {
     "name": "mnemosyne_get",
@@ -261,6 +320,8 @@ TRIPLE_ADD_SCHEMA = {
     "description": (
         "Add a temporal fact triple (subject, predicate, object) to the knowledge graph. "
         "Example: ('user', 'prefers', 'neovim'). Use for structured relationships. "
+        "For predicate='occurred_on', when valid_from is provided, valid_from is stored "
+        "as the annotation value and the supplied object is intentionally discarded. "
         "By default a new triple supersedes any prior fact with the same subject+predicate; "
         "set supersede=false for multi-valued facts that should coexist "
         "(e.g. ('user','speaks','English') and ('user','speaks','Spanish'))."
@@ -362,6 +423,25 @@ RECALL_CANONICAL_SCHEMA = {
     },
 }
 
+FORGET_CANONICAL_SCHEMA = {
+    "name": "mnemosyne_forget_canonical",
+    "description": (
+        "Retire a CANONICAL self-fact slot for the resolved owner in the selected "
+        "local bank. This operation is private to that owner. Stamps valid_until "
+        "on the current row, preserving it as local SQLite history. "
+        "Returns whether a current row was retired. Nothing is deleted. "
+        "Use this to remove a canonical fact (e.g. a stale preference or identity)."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "category": {"type": "string", "description": "Slot group, e.g. 'identity', 'voice', 'preference'"},
+            "name": {"type": "string", "description": "Slot key within the category, e.g. 'name', 'pronouns'"},
+        },
+        "required": ["category", "name"],
+    },
+}
+
 SCRATCHPAD_WRITE_SCHEMA = {
     "name": "mnemosyne_scratchpad_write",
     "description": "Write a temporary note to the Mnemosyne scratchpad.",
@@ -424,6 +504,50 @@ FORGET_SCHEMA = {
             "memory_id": {"type": "string", "description": "ID of the memory to delete"},
         },
         "required": ["memory_id"],
+    },
+}
+
+BATCH_SCHEMA = {
+    "name": "mnemosyne_batch",
+    "description": (
+        "Apply multiple Mnemosyne memory mutations atomically in one tool call. "
+        "Supported v1 actions: remember, update, forget, invalidate. "
+        "All operations are validated before mutation; on failure the whole batch rolls back. "
+        "Destructive actions require exact memory IDs. Recall/search/canonical/persona/shared-surface operations are not included in v1."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "operations": {
+                "type": "array",
+                "maxItems": 50,
+                "description": "Ordered mutation operations to apply atomically.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["remember", "update", "forget", "invalidate"]},
+                        "content": {"type": "string"},
+                        "memory_id": {"type": "string"},
+                        "importance": {"type": "number"},
+                        "source": {"type": "string"},
+                        "scope": {"type": "string"},
+                        "valid_until": {"type": "string"},
+                        "metadata": {"type": "object"},
+                        "extract_entities": {"type": "boolean"},
+                        "extract": {"type": "boolean"},
+                        "veracity": {"type": "string"},
+                        "replacement_id": {"type": "string"},
+                    },
+                    "required": ["action"],
+                },
+            },
+            "dry_run": {"type": "boolean", "default": False},
+            "bank": {"type": "string"},
+            "author_id": {"type": "string"},
+            "author_type": {"type": "string"},
+            "channel_id": {"type": "string"},
+        },
+        "required": ["operations"],
     },
 }
 
@@ -598,11 +722,14 @@ SYNC_STATUS_SCHEMA = {
 PERSONA_PROMOTE_SCHEMA = {
     "name": "mnemosyne_persona_promote",
     "description": (
-        "Promote a working or episodic memory into the L3 persona tier. "
-        "Persona facts are always auto-injected into the system prompt regardless "
-        "of semantic relevance. Tier values: 'permanent' (never evicted, requires "
-        "explicit demotion), 'long_term' (default; reinforcement-driven decay), "
-        "'working' (transient). Returns the new persona id."
+        "Promote a working or episodic memory into the L3 persona store "
+        "(the memoria_persona table). Tier values: 'permanent', 'long_term' "
+        "(default), 'working'. Tier is a classification label: it orders "
+        "mnemosyne_persona_list output (permanent first) and affects nothing "
+        "else. No automatic eviction or decay is implemented, and a fact "
+        "leaves the store only by explicit demotion. Persona facts are not "
+        "read by the system prompt path, which uses the opt-in persona.md "
+        "file. Returns the new persona id."
     ),
     "parameters": {
         "type": "object",
@@ -615,7 +742,7 @@ PERSONA_PROMOTE_SCHEMA = {
                 "type": "string",
                 "enum": ["permanent", "long_term", "working"],
                 "default": "long_term",
-                "description": "Retention tier for the promoted persona fact.",
+                "description": "Classification tier for the promoted persona fact; affects mnemosyne_persona_list ordering only.",
             },
             "reason": {
                 "type": "string",
@@ -679,7 +806,8 @@ PERSONA_REINFORCE_SCHEMA = {
     "description": (
         "Bump the reinforcement_count and last_reinforced_at on a persona fact. "
         "Use when the persona rule was just applied -- signals 'this rule is in "
-        "active use' to the decay logic."
+        "active use'. Reinforcement count breaks ties in mnemosyne_persona_list "
+        "ordering; it does not feed any decay logic, because none is implemented."
     ),
     "parameters": {
         "type": "object",
@@ -693,16 +821,192 @@ PERSONA_REINFORCE_SCHEMA = {
     },
 }
 
+# ---------------------------------------------------------------------------
+# Hygiene tools (issue #428)
+# ---------------------------------------------------------------------------
+
+HYGIENE_AUDIT_SCHEMA = {
+    "name": "mnemosyne_hygiene_audit",
+    "description": (
+        "Audit the memory database for noise: terminal spam, command output, "
+        "heartbeats, stack traces, secrets. Returns ranked candidates sorted "
+        "by noise score. Dry-run only — does not modify the database. "
+        "Use mnemosyne_hygiene_clean to act on the results."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "limit": {
+                "type": "integer",
+                "description": "Max rows to scan per table (default 200, ignored when scan_all is true).",
+                "default": 200,
+            },
+            "offset": {
+                "type": "integer",
+                "description": "Row offset per table for paginated audits (default 0).",
+                "default": 0,
+            },
+            "scan_all": {
+                "type": "boolean",
+                "description": "Scan all rows in each selected table using batches instead of a single limit.",
+                "default": False,
+            },
+            "batch_size": {
+                "type": "integer",
+                "description": "Batch size when scan_all is true (default 1000).",
+                "default": 1000,
+            },
+            "min_score": {
+                "type": "number",
+                "description": "Minimum noise score to include (0.0-1.0, default 0.3).",
+                "default": 0.3,
+            },
+            "tables": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "enum": ["working_memory", "memories", "episodic_memory", "scratchpad"],
+                },
+                "description": "Tables to scan. Default: working_memory + memories + episodic_memory.",
+            },
+            "bank": {
+                "type": "string",
+                "description": "Memory bank to audit (default: 'default').",
+            },
+        },
+    },
+}
+
+HYGIENE_CLEAN_SCHEMA = {
+    "name": "mnemosyne_hygiene_clean",
+    "description": (
+        "Clean noise candidates identified by mnemosyne_hygiene_audit. "
+        "Actions: 'delete' (hard delete), 'archive' (decay importance to 0 + "
+        "flag metadata, reversible), 'flag' (mark for review, no change). "
+        "Requires confirm=true for any modification. Writes a full audit log "
+        "to the hygiene_audit_log table."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "candidates_json": {
+                "type": "string",
+                "description": "JSON array of candidate objects from audit_noise() output.",
+            },
+            "action": {
+                "type": "string",
+                "enum": ["delete", "archive", "flag", "keep"],
+                "description": "Override action for all candidates. If 'keep', uses each candidate's suggested_action.",
+                "default": "keep",
+            },
+            "confirm": {
+                "type": "boolean",
+                "description": "Must be true for any modification. If false, performs dry-run only.",
+                "default": False,
+            },
+            "bank": {
+                "type": "string",
+                "description": "Memory bank (default: 'default').",
+            },
+        },
+        "required": ["candidates_json"],
+    },
+}
+
 ALL_TOOL_SCHEMAS: List[Dict[str, Any]] = [
     REMEMBER_SCHEMA, RECALL_SCHEMA,
     SHARED_REMEMBER_SCHEMA, SHARED_RECALL_SCHEMA, SHARED_FORGET_SCHEMA, SHARED_STATS_SCHEMA,
     SLEEP_SCHEMA, STATS_SCHEMA,
     INVALIDATE_SCHEMA, VALIDATE_SCHEMA, GET_SCHEMA,
     TRIPLE_ADD_SCHEMA, TRIPLE_QUERY_SCHEMA, TRIPLE_END_SCHEMA,
-    REMEMBER_CANONICAL_SCHEMA, RECALL_CANONICAL_SCHEMA,
+    REMEMBER_CANONICAL_SCHEMA, RECALL_CANONICAL_SCHEMA, FORGET_CANONICAL_SCHEMA,
     SCRATCHPAD_WRITE_SCHEMA, SCRATCHPAD_READ_SCHEMA, SCRATCHPAD_CLEAR_SCHEMA,
-    EXPORT_SCHEMA, UPDATE_SCHEMA, FORGET_SCHEMA, IMPORT_SCHEMA, DIAGNOSE_SCHEMA,
+    EXPORT_SCHEMA, UPDATE_SCHEMA, FORGET_SCHEMA, BATCH_SCHEMA, IMPORT_SCHEMA, DIAGNOSE_SCHEMA,
     GRAPH_QUERY_SCHEMA, GRAPH_LINK_SCHEMA,
     SYNC_PUSH_SCHEMA, SYNC_PULL_SCHEMA, SYNC_STATUS_SCHEMA,
     PERSONA_PROMOTE_SCHEMA, PERSONA_DEMOTE_SCHEMA, PERSONA_LIST_SCHEMA, PERSONA_REINFORCE_SCHEMA,
+    HYGIENE_AUDIT_SCHEMA, HYGIENE_CLEAN_SCHEMA,
+    REMEMBER_MEDIA_SCHEMA,
 ]
+
+
+# ---------------------------------------------------------------------------
+# Tenant bank declaration
+# ---------------------------------------------------------------------------
+#
+# ``_resolve_bank()`` in ``mcp_tools`` has always read ``arguments["bank"]``
+# before falling back to ``MNEMOSYNE_MCP_BANK``, so nearly every tool already
+# honours a per-call bank at runtime. Almost none of them said so in their
+# schema, which left the capability undiscoverable: a conforming MCP client
+# has no way to learn about a parameter that is not declared, and a client
+# that validates arguments against the advertised schema may strip it.
+#
+# Declaring it here rather than editing each schema literal keeps the property
+# wording identical across tools and means a tool added later cannot silently
+# forget it. Membership is decided by an explicit exemption set, so adding a
+# tool that must not take a tenant bank is a deliberate edit rather than an
+# omission.
+
+BANK_PROPERTY: Dict[str, Any] = {
+    "type": "string",
+    "description": (
+        "Memory bank to operate on. Banks are separate stores: memories written "
+        "to one are not visible to another, which is how a single MCP server "
+        "serves more than one tenant. Defaults to the server's "
+        "MNEMOSYNE_MCP_BANK, or 'default'."
+    ),
+}
+
+# Tools that must not receive a tenant bank.
+#
+# ``mnemosyne_validate`` declares its own ``bank``: it is the tenant bank, as
+# everywhere else, but its description also documents the deprecated alias
+# where ``bank`` carried ``private``/``surface`` (now ``store``). Because the
+# schema already spells ``bank`` out, ``_declare_bank`` leaves it alone.
+#
+# The ``mnemosyne_shared_*`` tools operate on the shared surface database,
+# which is a single global store by design. A tenant bank has no meaning
+# there, and accepting one would imply an isolation guarantee that does not
+# exist.
+#
+# The persona, sync and ``mnemosyne_triple_end`` schemas are defined here for
+# the Hermes provider, which pins its own copies to these definitions. The MCP
+# dispatcher in ``mcp_tools`` does not serve them, so no per-call bank is ever
+# read for them; the provider resolves its bank per Hermes profile instead.
+# Declaring ``bank`` on them would advertise a parameter nothing honours.
+BANK_EXEMPT_TOOLS: frozenset = frozenset({
+    "mnemosyne_shared_remember",
+    "mnemosyne_shared_recall",
+    "mnemosyne_shared_forget",
+    "mnemosyne_shared_stats",
+    "mnemosyne_triple_end",
+    "mnemosyne_sync_push",
+    "mnemosyne_sync_pull",
+    "mnemosyne_sync_status",
+    "mnemosyne_persona_promote",
+    "mnemosyne_persona_demote",
+    "mnemosyne_persona_list",
+    "mnemosyne_persona_reinforce",
+})
+
+
+def _declare_bank(schemas: List[Dict[str, Any]]) -> None:
+    """Add ``bank`` to every non-exempt schema that does not already declare it.
+
+    Mutates in place, at import, so ``ALL_TOOL_SCHEMAS`` and everything built
+    from it observe the same objects. Schemas that already spell out their own
+    ``bank`` are left untouched.
+    """
+    for schema in schemas:
+        if schema.get("name") in BANK_EXEMPT_TOOLS:
+            continue
+        container = schema.get("parameters") or schema.get("inputSchema")
+        if not isinstance(container, dict):
+            continue
+        properties = container.setdefault("properties", {})
+        if not isinstance(properties, dict) or "bank" in properties:
+            continue
+        properties["bank"] = dict(BANK_PROPERTY)
+
+
+_declare_bank(ALL_TOOL_SCHEMAS)

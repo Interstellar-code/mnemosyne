@@ -9,9 +9,12 @@ store proposals or apply them.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
+
+from mnemosyne.core.filters import _SYSTEM_DERIVED_WRITE_CAPABILITY
 
 
 DEFAULT_MODEL_CATEGORIES: Set[str] = {
@@ -76,6 +79,34 @@ def _coerce_evidence_ids(value: Any) -> List[str]:
     return ids
 
 
+def coerce_confidence(value: Any, default: float) -> float:
+    """Return value as a finite float clamped to [0.0, 1.0], or default.
+
+    Confidence reaches this module from two unhardened directions: LLM
+    JSON (json.loads round-trips NaN and Infinity, so a model can emit
+    them as literals) and persisted metadata_json on legacy banks (any
+    JSON type, including strings). Non-numeric and non-finite values
+    degrade to the caller's default instead of raising. NaN in
+    particular must never survive as a float: it compares False against
+    every threshold, so downstream gates of the form
+    ``confidence < minimum`` silently pass it. bool is rejected before
+    the float attempt: it subclasses int, so ``float(True)`` would
+    silently read a JSON ``true`` as full confidence. Finite values are
+    clamped to the confidence domain: a persisted ``2.0`` must not
+    outrank every in-range proposal or reach the canonical store
+    unbounded.
+    """
+    if isinstance(value, bool):
+        return default
+    try:
+        value = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    if not math.isfinite(value):
+        return default
+    return max(0.0, min(1.0, value))
+
+
 def parse_model_update_proposals(
     raw: str,
     *,
@@ -104,13 +135,9 @@ def parse_model_update_proposals(
             continue
         if category not in allowed:
             continue
-        try:
-            confidence = float(item.get("confidence", 0.0))
-        except (TypeError, ValueError):
-            confidence = 0.0
+        confidence = coerce_confidence(item.get("confidence", 0.0), 0.0)
         if confidence <= 0.0:
             continue
-        confidence = max(0.0, min(1.0, confidence))
         evidence_ids = _coerce_evidence_ids(item.get("evidence_ids") or item.get("evidence") or [])
         if not evidence_ids:
             continue
@@ -223,9 +250,19 @@ def auto_apply_enabled() -> bool:
     This defaults ON because model refresh is a sleep-time automation, not a
     human approval queue. Operators can disable it as an emergency brake with
     MNEMOSYNE_SLEEP_MODEL_REFRESH_AUTO_APPLY=false.
-    """
 
-    return _env_bool("MNEMOSYNE_SLEEP_MODEL_REFRESH_AUTO_APPLY", True)
+    Resolved through the central hot-reload config (config.yaml > env > default)
+    so a maintenance operation observes one consistent value at its boundary.
+    When verified Dream mode is active (``dream_active``), auto-apply is forced
+    off: Dream owns canonical mutations and the sleep path must not race it by
+    applying model-refresh proposals directly.
+    """
+    from mnemosyne.core.config import get_config
+
+    config = get_config()
+    if config.get_bool("dream_active", False):
+        return False
+    return config.get_bool("sleep_model_refresh_auto_apply", True)
 
 
 def auto_apply_min_confidence() -> float:
@@ -367,7 +404,8 @@ def apply_model_refresh_proposal(
         metadata["name"],
         metadata["body"],
         source="sleep_model_refresh",
-        confidence=float(metadata.get("confidence") or 0.5),
+        confidence=coerce_confidence(metadata.get("confidence"), 0.5),
+        _write_kind=_SYSTEM_DERIVED_WRITE_CAPABILITY,
     )
     metadata["status"] = "applied"
     metadata["applied_by"] = validator or "system"
@@ -426,10 +464,7 @@ def maybe_auto_apply_model_refresh_proposal(
             validator="sleep_model_refresh_auto_validation",
         )
         return False
-    try:
-        confidence = float(metadata.get("confidence") or 0.0)
-    except (TypeError, ValueError):
-        confidence = 0.0
+    confidence = coerce_confidence(metadata.get("confidence"), 0.0)
 
     evidence_ids = [str(x) for x in (metadata.get("evidence_ids") or []) if str(x).strip()]
     source_wm_ids = {str(x) for x in (metadata.get("source_wm_ids") or []) if str(x).strip()}

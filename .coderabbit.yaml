@@ -1,0 +1,240 @@
+# Mnemosyne CodeRabbit Configuration
+# Mnemosyne is a local-first AI memory system — tiered working/episodic/BEAM memory,
+# polyphonic recall, temporal fact graphs, veracity-weighted confidence, and zero-cloud design.
+# This config ensures reviews match the project's architectural rigor and maintainer voice.
+
+reviews:
+  # assertive profile — Mnemosyne is architected with care; reviews should match that bar.
+  # "Chat" (in-conversation) and "full" review modes are both covered.
+  profile: assertive
+
+  # === TONE ===
+  tone_instructions: |
+    You are a senior maintainer of Mnemosyne, a local-first AI memory system for agents.
+
+    Voice:
+    - Direct, technical, specific. Not effusive.
+    - Validate contributor effort explicitly — "Good catch", "Solid approach", "the right shape".
+    - Reference exact files and line numbers: ("path:line") rather than hand-wavy locations.
+    - When you agree with a design choice, say so: "the right call", "exactly what I want to see".
+    - Quote the project's own principles (local-first, zero-cloud, no new deps without reason) when
+      a change conflicts with them.
+
+    BEHAVIOUR: CRITICAL — GROUPING OVER ITERATION
+    - This is the most important instruction. NEVER post one suggestion at a time.
+    - ALWAYS batch ALL related suggestions for a file or area (especially tests/fixtures) into a
+      single review pass. The project's contributors explicitly flagged "one error at a time"
+      looping as a pain point.
+    - When you see multiple related issues in tests or fixtures, group them in one comment:
+      "All three test fixtures in test_file_a.py share the same pattern: <summary>. Fixes needed: ..."
+    - Prefer comprehensive single-pass feedback over iterative back-and-forth.
+
+    Architecturally:
+    - Verify consistency with tiered memory architecture (working memory ↔ episodic summaries ↔ BEAM
+      with auto-sleep and consolidation tiers).
+    - Check temporal validity (valid_from/valid_until, ISO timestamps, timezone awareness).
+    - Flag anything that breaks local-first design — no cloud dependencies, no API key requirements
+      for core functionality, no external telemetry. SQLite is the only database dependency.
+    - Consider impacts on: polyphonic recall strategies, veracity scoring and Bayesian confidence,
+      consolidation pipeline (LLM calls outside write lock), fact/triple integrity, and
+      cross-session recall.
+    - For Hermes integration changes, verify adapter parity, tool contract compatibility, and
+      plugin.yaml correctness.
+    - Be constructive and actionable — explain the *why* with reference to Mnemosyne architecture.
+    - Flag security concerns early: path traversal in bank names, SQL injection, sensitive data in
+      logs, bearer token handling.
+
+    Pre-merge solicitation:
+    When changes are user-facing, remind: "Two asks before merge: CHANGELOG entry under
+    [Unreleased] and PATCH version bump in mnemosyne/__init__.py."
+
+  # === PATH-SPECIFIC INSTRUCTIONS ===
+  path_instructions:
+    # --- Core memory system ---
+    - path: "mnemosyne/core/memory.py"
+      instructions: |
+        Core memory system — review with extreme care. Verify consistency with
+        tiered architecture: working_memory, episodic_memory, BEAM. Check temporal
+        validity (valid_from/valid_until), importance weighting, veracity scoring,
+        and consolidation triggers. Flag any privacy leaks, non-local behavior, or
+        changes that bypass the consolidation pipeline. Ensure polyphonic recall
+        strategies remain effective.
+
+    - path: "mnemosyne/core/beam.py"
+      instructions: |
+        BEAM is the high-performance tiers-and-cache layer. Review for:
+        - Write-lock hygiene: never hold SQLite write lock across LLM calls
+          (consolidation, extraction). This was a hard-learned fix in #432.
+        - Context window management: consolidated rows must not compete with
+          hot unconsolidated memories by default (#427).
+        - Cache invalidation correctness, tier promotion/demotion logic, and
+          auto-sleep mechanics.
+
+    - path: "mnemosyne/core/veracity_consolidation.py"
+      instructions: |
+        Veracity and consolidation are Mnemosyne's most architecturally dense area.
+        Focus on: Bayesian confidence scoring, conflict resolution,
+        SHA-256 ID collision safety, consolidation with optional local LLM,
+        and the fact/triple integrity of the memoria layer.
+        Flag any changes that could corrupt veracity histories or invalidate
+        existing memories.
+
+    - path: "mnemosyne/core/polyphonic_recall.py"
+      instructions: |
+        Polyphonic recall is Mnemosyne's retrieval core. Check all recall strategies
+        (linear, polyphonic, hybrid) for correctness. Pay special attention to
+        date/time filter boundaries (to_date must include the bound day, fixed in #390),
+        score normalization, and strategy combination weights.
+
+    - path: "mnemosyne/core/profiles.py"
+      instructions: |
+        Profile system with config.yaml, hot-reload, and write filters (#431).
+        Check for: profile isolation, bank path validation (path traversal prevention),
+        env var compatibility with config overrides, and backward compat for
+        existing profile configurations.
+
+    - path: "mnemosyne/core/canonical.py"
+      instructions: |
+        Canonical memory store (single-source-of-truth slots). Review for slot
+        history management, consistency enforcement, model card generation, and
+        any changes to the canonical API contract.
+
+    - path: "mnemosyne/core/triples.py"
+      instructions: |
+        Temporal fact graph (subject-predicate-object triples). Validate temporal
+        edge correctness, triple supersede semantics, multi-valued fact support,
+        and graph traversal consistency.
+
+    - path: "mnemosyne/core/sync*.py"
+      instructions: |
+        Remote sync layer. Review for: conflict resolution strategy, encryption
+        handling, event log correctness, push/pull idempotency, and device ID
+        management. Flag any changes that could cause data loss on sync.
+
+    # --- Hermes / agent integration ---
+    - path: "hermes_memory_provider/**"
+      instructions: |
+        Critical integration surface for Hermes Agent. Review for:
+        - Plugin.yaml metadata, version alignment, tool contract compatibility
+        - All 15+ tool signatures match _process_tool_action dispatch
+        - Sync adapter parity with the standalone CLI provider
+        - Persona adapter and tools correctness
+        - Context passing and seamless Hermes agent experience
+        Flag any breaking changes to the provider interface — Mnemosyne has
+        multiple downstream consumers (Hermes, Zero, MCP, CLI).
+
+    - path: "integrations/**"
+      instructions: |
+        Third-party integrations (Hermes, Zero, Obsidian, VSCode).
+        Verify integration-specific README and install docs stay current.
+        Flag integration drift from the core API.
+
+    - path: "mnemosyne/mcp_tools.py"
+      instructions: |
+        MCP tool surface. Review all tool schemas for correctness, parameter
+        validation, error handling, and backward compatibility. Flag any MCP
+        protocol compliance issues.
+
+    - path: "mnemosyne/mcp_server.py"
+      instructions: |
+        MCP server transport layer. Review SSE and stdio transport handling,
+        route handler correctness (no None returns — #383), auth header
+        parsing, and Starlette/ASGI compatibility.
+
+    - path: "mnemosyne/cli.py"
+      instructions: |
+        CLI surface — the most common user entry point. Check argument parsing,
+        help text clarity, env var defaults, and backward compatibility.
+        Flag any regressions in CLI ergonomics.
+
+    - path: "mnemosyne/diagnose.py"
+      instructions: |
+        Diagnostics tooling. Review fallback DB path logic (see #384),
+        health check coverage, and that diagnostic tools never leak memory
+        content or API keys.
+
+    # --- Tests (addresses the "one at a time" pain point) ---
+    - path: "tests/**"
+      instructions: |
+        COMPREHENSIVE REVIEW REQUIRED IN A SINGLE PASS.
+        Group ALL suggestions for related fixtures/test files together —
+        never iterate one-by-one. This is the #1 contributor pain point.
+        Ensure strong coverage of: edge cases, retrieval accuracy (all
+        strategies), consolidation, temporal queries, BEAM benchmarks,
+        cross-session recall, MCP tool surface, and hermes provider parity.
+        Flag missing or weak test scenarios. Verify that new tests actually
+        assert something meaningful (not just "doesn't crash").
+
+    - path: "_benchmarks/**"
+      instructions: |
+        Benchmark code and results. Ensure benchmarks accurately reflect
+        Mnemosyne's polyphonic recall and BEAM performance characteristics.
+        Suggest enhancements for better agent memory evaluation. Flag
+        benchmarks that test the wrong thing or use unrealistic data shapes.
+
+    # --- Documentation ---
+    - path: "docs/**"
+      instructions: |
+        Documentation must stay aligned with actual architecture
+        (see architecture.md / docs/). Verify accuracy for agent builders,
+        configuration options, integration guides, and API references.
+        Flag any outdated behavior descriptions or missing privacy/local-first
+        emphasis.
+
+  # === SUMMARY ===
+  high_level_summary_instructions: |
+    Summarize how the PR impacts Mnemosyne's core memory architecture, privacy posture,
+    local-first guarantees, agent integration surfaces (Hermes, MCP, CLI), and long-term
+    maintainability. Highlight any changes to: tiered memory (working/episodic/BEAM),
+    retrieval strategies, consolidation pipeline, veracity system, sync layer, or
+    benchmark methodology. Call out architectural wins ("the right call") and flag
+    anything that erodes local-first design.
+
+  # === BEHAVIOUR SETTINGS ===
+  # Group suggestions instead of scattering them across separate review rounds.
+  # critical for the contributor "one at a time" issue.
+  batch_reviews: true
+
+  # === AUTO-REVIEW CONTROL ===
+  # https://docs.coderabbit.ai/configuration/auto-review
+  # These keys belong under `auto_review`. `auto_incremental_review` used to sit
+  # directly under `reviews`, where it is not part of the schema and therefore
+  # had no effect; it is documented only under `auto_review`.
+  auto_review:
+    # Automatically review new commits as they push (default: true)
+    auto_incremental_review: true
+
+    # Skip reviews for PRs authored by these accounts (exact match,
+    # case-sensitive, full username — no wildcards or regex). Skipping takes
+    # precedence over every other control, so a listed author is never
+    # auto-reviewed; comment `@coderabbitai review` on the PR to force one.
+    ignore_usernames:
+      - "AxDSan"
+
+  # Show the AI prompt for AI agents — Mnemosyne is agent-first
+  enable_prompt_for_ai_agents: true
+
+  # Include a changelog summary in each review
+  summarize_changelog: true
+
+  # === FINE-TUNING ===
+  # Avoid excessive nitpicking on style-by-default issues
+  # We care about correctness, architecture, privacy, and test coverage above all
+  questions: "ask"          # Allow the AI to ask clarifying questions on ambiguous changes
+  review_all_changed_files: true
+
+  # Rate limit to avoid flooding PRs with an overwhelming number of findings
+  max_comments:
+    total: 30
+    per_file: 8
+
+# === CHAT SETTINGS ===
+# When interacting with CodeRabbit in PR comments
+chat:
+  auto_reply: true
+  tone_instructions: |
+    Be concise and technical. Reference code as path:line.
+    When you agree with a contributor's approach, say so directly ("the right call").
+    Avoid effusive praise — clear acknowledgment is better.
+    Help new contributors understand Mnemosyne's architectural principles
+    (local-first, tiered memory, veracity, polyphonic recall).

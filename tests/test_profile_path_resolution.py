@@ -15,6 +15,8 @@ def test_mnemosyne_default_data_dir_resolves_dynamically(tmp_path, monkeypatch):
     p1.mkdir()
     p2.mkdir()
 
+    # MNEMOSYNE_DATA_DIR outranks HERMES_HOME; clear it so the run is hermetic.
+    monkeypatch.delenv("MNEMOSYNE_DATA_DIR", raising=False)
     monkeypatch.setenv("HERMES_HOME", str(p1))
     assert memory_default_dir() == p1 / "mnemosyne" / "data"
     assert beam_default_dir() == p1 / "mnemosyne" / "data"

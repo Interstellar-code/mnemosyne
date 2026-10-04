@@ -1,6 +1,6 @@
 # Security & Privacy Model
 
-**Last updated:** June 2026 &middot; Mnemosyne v3.7.0
+**Last updated:** June 2026 &middot; Mnemosyne v3.15.1
 
 > **You are solely responsible for the content stored in Mnemosyne.**
 > Mnemosyne Sync supports optional client-side encryption. When disabled, memory content travels over TLS and is stored according to your infrastructure's security settings.
@@ -12,7 +12,7 @@
 Mnemosyne is built on three security principles:
 
 1. **User sovereignty** &mdash; You own your data. Mnemosyne has no telemetry, no tracking, no cloud dependency. The database file is yours.
-2. **Privacy by design** &mdash; The default configuration stores everything locally. No data ever leaves your machine unless you explicitly enable sync.
+2. **Privacy by design** &mdash; The default configuration stores everything locally. No data ever leaves your machine unless you explicitly enable sync or use remote embedding or LLM services; remote embeddings (a custom non-OpenRouter `MNEMOSYNE_EMBEDDING_API_URL`, an API-shaped model, or `MNEMOSYNE_EMBEDDINGS_VIA_API`) send the text of your memories and recall queries for vectorization, to the OpenRouter endpoint when no custom URL is set.
 3. **Minimal trust in remote infrastructure** &mdash; When sync is enabled, optional client-side encryption ensures that even the remote server cannot read your memory contents. The remote side sees only routing metadata (timestamps, event IDs, device IDs).
 
 ---
@@ -97,9 +97,10 @@ The encryption key never leaves the local instance. The remote instance stores a
 | **File path** | `--encrypt /path/to/keyfile` | Medium (file perms) | CLI, Hermes adapter |
 | **Raw key string** | `--encrypt <base64-key>` | Low (visible in ps) | CLI, Hermes adapter |
 | **OS keyring** | `MNEMOSYNE_SYNC_KEY_SOURCE=keyring` | High (OS keychain) | Hermes adapter only |
-| **Derived from passphrase** | `MNEMOSYNE_SYNC_PASSPHRASE=<phrase>` | Medium (Argon2id derived) | Hermes adapter only |
+| **Interactive prompt** | `MNEMOSYNE_SYNC_KEY_SOURCE=prompt` | High (never stored) | Hermes adapter only |
+| **Key file** | `MNEMOSYNE_SYNC_KEY_SOURCE=file:<path>` | Medium (file perms) | Hermes adapter only |
 
-Core `SyncEncryption.from_config()` reads from `$MNEMOSYNE_SYNC_KEY`, a file path, or a raw key string. The Hermes sync adapter adds keyring and passphrase support.
+Core `SyncEncryption.from_config()` reads from `$MNEMOSYNE_SYNC_KEY`, a file path, or a raw key string. The Hermes sync adapter adds `keyring`, `prompt`, and `file:<path>` sources via `MNEMOSYNE_SYNC_KEY_SOURCE`.
 
 ### Key Derivation
 
@@ -112,7 +113,7 @@ Note: `from_config()` does not currently call `derive_key()` — passphrases req
 
 ```bash
 # Generate a random key
-mnemosyne sync generate-key
+mnemosyne sync-generate-key
 # Output: 7A8B3C... (base64, 32 bytes)
 
 # Use with CLI
@@ -171,7 +172,7 @@ They **cannot** learn the content or meaning of those memories when encryption i
 >
 > Mnemosyne Sync supports optional client-side encryption. When disabled, memory content travels over TLS and is stored according to your infrastructure's security settings. Even with encryption enabled, metadata (event counts, timestamps, device IDs) is visible to the remote server for routing purposes.
 >
-> See the [LICENSE](LICENSE) file for the full terms.
+> See the [LICENSE](../LICENSE) file for the full terms.
 
 ---
 
@@ -221,7 +222,7 @@ Mnemosyne is the only memory system with **client-side encryption of sync payloa
 3. **Rotate sync keys periodically** (e.g., every 90 days).
 4. **Back up your encryption keys** separately from your Mnemosyne database. Losing the key means losing access to encrypted memories.
 5. **Use environment-specific keys** &mdash; separate keys for development, staging, and production.
-6. **Monitor sync events** with `mnemosyne sync status --remote <url>` to verify no unexpected sync activity.
+6. **Monitor sync events** with `mnemosyne sync-status --remote <url>` to verify no unexpected sync activity.
 
 ---
 

@@ -21,9 +21,11 @@ Field mapping:
 
 import json
 from datetime import datetime
-from typing import List, Dict, Optional, Any
+from typing import List, Dict
 
+from mnemosyne.core.filters import _RESTORE_WRITE_CAPABILITY
 from mnemosyne.core.importers.base import BaseImporter, ImporterResult
+from mnemosyne.core.user_agent import application_user_agent
 
 
 class Mem0Importer(BaseImporter):
@@ -136,7 +138,9 @@ class Mem0Importer(BaseImporter):
         if params:
             url += "?" + urllib.parse.urlencode(params)
 
-        req = urllib.request.Request(url)
+        req = urllib.request.Request(
+            url, headers={"User-Agent": application_user_agent()}
+        )
         if self.api_key:
             req.add_header("Authorization", f"Bearer {self.api_key}")
 
@@ -298,12 +302,6 @@ class Mem0Importer(BaseImporter):
                     if ts:
                         meta["imported_at_original"] = ts
 
-                    # Override session_id if specified
-                    if session_id:
-                        sid = session_id
-                    else:
-                        sid = None  # Let Mnemosyne use its own session
-
                     mid = mnemosyne.remember(
                         content=mem_dict["content"],
                         source=mem_dict.get("source", self.provider_name),
@@ -311,7 +309,11 @@ class Mem0Importer(BaseImporter):
                         metadata=meta,
                         valid_until=mem_dict.get("valid_until"),
                         scope=mem_dict.get("scope", "session"),
+                        _write_kind=_RESTORE_WRITE_CAPABILITY,
                     )
+                    if mid is None:
+                        result.skipped += 1
+                        continue
 
                     # Store identity via triple or direct beam write
                     # We use the Mnemosyne's beam directly for identity columns

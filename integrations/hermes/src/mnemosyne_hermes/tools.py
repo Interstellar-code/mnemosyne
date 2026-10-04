@@ -2,10 +2,10 @@
 
 32 tools: remember, recall, shared_remember, shared_recall, shared_forget,
 shared_stats, sleep, stats, invalidate, validate, get, triple_add, triple_query,
-triple_end, remember_canonical, recall_canonical, scratchpad_write, scratchpad_read,
-scratchpad_clear, export, update, forget, import, diagnose, graph_query, graph_link,
-sync_push, sync_pull, sync_status, persona_promote, persona_demote, persona_list,
-persona_reinforce.
+triple_end, remember_canonical, recall_canonical, forget_canonical, scratchpad_write,
+scratchpad_read, scratchpad_clear, export, update, forget, import, diagnose,
+graph_query, graph_link, sync_push, sync_pull, sync_status, persona_promote,
+persona_demote, persona_list, persona_reinforce.
 """
 
 # Import persona schemas from the dedicated module so tools.py stays focused
@@ -55,7 +55,8 @@ RECALL_SCHEMA = {
         "Search Mnemosyne for relevant memories. Uses hybrid ranking: by default "
         "50% vector similarity + 30% FTS5 text rank + 20% importance + optional "
         "temporal boost. Tune the per-query weights via vec_weight, fts_weight, "
-        "importance_weight (omit to use environment defaults). Returns ranked results."
+        "importance_weight (omit or pass null to resolve config.yaml, then environment variables, "
+        "then built-in defaults). Returns ranked results."
     ),
     "parameters": {
         "type": "object",
@@ -78,16 +79,16 @@ RECALL_SCHEMA = {
                 "default": 24,
             },
             "vec_weight": {
-                "type": "number",
-                "description": "Vector similarity weight in hybrid scoring. Omit (or pass null) to use MNEMOSYNE_VEC_WEIGHT env var or built-in default 0.5.",
+                "type": ["number", "null"],
+                "description": "Vector similarity weight in hybrid scoring. Omit (or pass null) to resolve config.yaml, then MNEMOSYNE_VEC_WEIGHT, then built-in default 0.5.",
             },
             "fts_weight": {
-                "type": "number",
-                "description": "Full-text search weight in hybrid scoring. Omit (or pass null) to use MNEMOSYNE_FTS_WEIGHT env var or built-in default 0.3.",
+                "type": ["number", "null"],
+                "description": "Full-text search weight in hybrid scoring. Omit (or pass null) to resolve config.yaml, then MNEMOSYNE_FTS_WEIGHT, then built-in default 0.3.",
             },
             "importance_weight": {
-                "type": "number",
-                "description": "Importance score weight in hybrid scoring. Omit (or pass null) to use MNEMOSYNE_IMPORTANCE_WEIGHT env var or built-in default 0.2.",
+                "type": ["number", "null"],
+                "description": "Importance score weight in hybrid scoring. Omit (or pass null) to resolve config.yaml, then MNEMOSYNE_IMPORTANCE_WEIGHT, then built-in default 0.2.",
             },
             "explain": {
                 "type": "boolean",
@@ -177,6 +178,31 @@ SLEEP_SCHEMA = {
     },
 }
 
+CROSS_SESSION_RESOLVE_SCHEMA = {
+    "name": "mnemosyne_resolve_conflicts",
+    "description": (
+        "Resolve factual contradictions among global-scope memories across "
+        "sessions. Marks the stale (older) copy superseded so recall and "
+        "prefetch stop presenting the outdated and current versions together, "
+        "while preserving history. Requires MNEMOSYNE_CROSS_SESSION_CONFLICT_RESOLUTION=1."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "dry_run": {
+                "type": "boolean",
+                "description": "If true, report what would be resolved without writing changes.",
+                "default": False,
+            },
+            "llm_eval": {
+                "type": "boolean",
+                "description": "Only meaningful with dry_run=true: also run LLM verification on flagged pairs (without mutating) so the exact apply-time verdict can be previewed. Default false keeps the dry run deterministic (no LLM calls).",
+                "default": False,
+            },
+        },
+    },
+}
+
 STATS_SCHEMA = {
     "name": "mnemosyne_stats",
     "description": "Return Mnemosyne memory statistics: working count, episodic count, BEAM tiers.",
@@ -197,6 +223,7 @@ INVALIDATE_SCHEMA = {
         "properties": {
             "memory_id": {"type": "string", "description": "ID of memory to invalidate."},
             "replacement_id": {"type": "string", "description": "Optional new memory that replaces this one.", "default": ""},
+            "bank": {"type": "string", "enum": ["private", "surface"], "description": "Which store holds the memory: 'private' (this profile's own memory) or 'surface' (the shared cross-agent surface DB). Default 'private'; ids beginning with 'sf_' auto-route to surface.", "default": "private"},
         },
         "required": ["memory_id"],
     },
@@ -237,16 +264,65 @@ VALIDATE_SCHEMA = {
                 "description": "Optional reason or evidence for this validation.",
                 "default": "",
             },
+            "store": {
+                "type": "string",
+                "enum": ["private", "surface"],
+                "description": "Which store holds the memory: 'private' (this profile's own memory) or 'surface' (the shared cross-agent surface). Default 'private'.",
+                "default": "private",
+            },
             "bank": {
                 "type": "string",
                 "enum": ["private", "surface"],
-                "description": "Which bank holds the memory. Default 'private'.",
-                "default": "private",
+                "description": "Deprecated alias for 'store'. Accepted until 5.0; pass 'store' instead.",
             },
         },
         "required": ["memory_id", "action"],
     },
 }
+
+REMEMBER_MEDIA_SCHEMA = {
+    "name": "mnemosyne_remember_media",
+    "description": (
+        "Remember a piece of media: an image, audio clip, video or document. It is "
+        "registered by reference and, when media understanding is enabled, turned into "
+        "located text memories (captions, timed transcript lines, timed video shots, "
+        "document passages by page) that mnemosyne_recall finds like any other memory. "
+        "Pass an https:// URL, a data: URI, a blob:// reference, or an absolute local "
+        "path inside MNEMOSYNE_MEDIA_ALLOWED_PATHS. Status 'unavailable' is a success: "
+        "the media was registered but nothing described it (no model configured, or "
+        "understanding is off)."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "ref": {
+                "type": "string",
+                "description": "https:// URL, data: URI, blob://sha256/... reference, or an absolute local path inside MNEMOSYNE_MEDIA_ALLOWED_PATHS.",
+            },
+            "modality": {
+                "type": "string",
+                "enum": ["image", "video", "audio", "document"],
+                "description": "Override the modality inferred from the extension or mime type.",
+            },
+            "mime": {"type": "string", "description": "Media type, e.g. image/png. Optional."},
+            "title": {"type": "string", "description": "Short human title for the media. Optional."},
+            "hint": {
+                "type": "string",
+                "description": "Guidance for the describer: what to look for, or names and jargon to expect in speech.",
+            },
+            "max_moments": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+                "description": "Cap on memories created from this media. Default from MNEMOSYNE_MODALITY_MAX_MOMENTS.",
+            },
+            "importance": {"type": "number", "minimum": 0, "maximum": 1, "default": 0.5},
+            "scope": {"type": "string", "enum": ["session", "global"], "description": "Defaults to the configured scope."},
+        },
+        "required": ["ref"],
+    },
+}
+
 
 GET_SCHEMA = {
     "name": "mnemosyne_get",
@@ -371,6 +447,24 @@ RECALL_CANONICAL_SCHEMA = {
     },
 }
 
+FORGET_CANONICAL_SCHEMA = {
+    "name": "mnemosyne_forget_canonical",
+    "description": (
+        "Retire a CANONICAL self-fact slot for the current profile. "
+        "Stamps valid_until on the current row, preserving it as history. "
+        "Returns whether a current row was retired. Nothing is deleted. "
+        "Use this to remove a canonical fact (e.g. a stale preference or identity)."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "category": {"type": "string", "description": "Slot group, e.g. 'identity', 'voice', 'preference'"},
+            "name": {"type": "string", "description": "Slot key within the category, e.g. 'name', 'pronouns'"},
+        },
+        "required": ["category", "name"],
+    },
+}
+
 MODEL_CARD_SCHEMA = {
     "name": "mnemosyne_model_card",
     "description": (
@@ -474,6 +568,50 @@ FORGET_SCHEMA = {
             "memory_id": {"type": "string", "description": "ID of the memory to delete"},
         },
         "required": ["memory_id"],
+    },
+}
+
+BATCH_SCHEMA = {
+    "name": "mnemosyne_batch",
+    "description": (
+        "Apply multiple Mnemosyne memory mutations atomically in one tool call. "
+        "Supported v1 actions: remember, update, forget, invalidate. "
+        "All operations are validated before mutation; on failure the whole batch rolls back. "
+        "Destructive actions require exact memory IDs. Recall/search/canonical/persona/shared-surface operations are not included in v1."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "operations": {
+                "type": "array",
+                "maxItems": 50,
+                "description": "Ordered mutation operations to apply atomically.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["remember", "update", "forget", "invalidate"]},
+                        "content": {"type": "string"},
+                        "memory_id": {"type": "string"},
+                        "importance": {"type": "number"},
+                        "source": {"type": "string"},
+                        "scope": {"type": "string"},
+                        "valid_until": {"type": "string"},
+                        "metadata": {"type": "object"},
+                        "extract_entities": {"type": "boolean"},
+                        "extract": {"type": "boolean"},
+                        "veracity": {"type": "string"},
+                        "replacement_id": {"type": "string"},
+                    },
+                    "required": ["action"],
+                },
+            },
+            "dry_run": {"type": "boolean", "default": False},
+            "bank": {"type": "string"},
+            "author_id": {"type": "string"},
+            "author_type": {"type": "string"},
+            "channel_id": {"type": "string"},
+        },
+        "required": ["operations"],
     },
 }
 
@@ -710,17 +848,40 @@ SYNC_STATUS_SCHEMA = {
     },
 }
 
+APPLY_PENDING_SCHEMA = {
+    "name": "mnemosyne_apply_pending",
+    "description": (
+        "Commit staged pending memory writes to Mnemosyne. "
+        "When memory.write_approval is enabled, calls to mnemosyne_remember "
+        "and mnemosyne_batch are staged to pending/memory/ instead of "
+        "written directly. This tool replays approved pending records "
+        "through the BEAM write path, committing them to the database."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "pending_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "List of pending record IDs to commit (e.g., ['a1b2c3d4']). From the staged response.",
+            },
+        },
+        "required": ["pending_ids"],
+    },
+}
+
 ALL_TOOL_SCHEMAS = [
     REMEMBER_SCHEMA, RECALL_SCHEMA, SHARED_REMEMBER_SCHEMA, SHARED_RECALL_SCHEMA,
-    SHARED_FORGET_SCHEMA, SHARED_STATS_SCHEMA, SLEEP_SCHEMA, STATS_SCHEMA,
+    SHARED_FORGET_SCHEMA, SHARED_STATS_SCHEMA, SLEEP_SCHEMA, CROSS_SESSION_RESOLVE_SCHEMA, STATS_SCHEMA,
     INVALIDATE_SCHEMA, VALIDATE_SCHEMA, GET_SCHEMA, TRIPLE_ADD_SCHEMA, TRIPLE_QUERY_SCHEMA,
     TRIPLE_END_SCHEMA,
-    REMEMBER_CANONICAL_SCHEMA, RECALL_CANONICAL_SCHEMA, MODEL_CARD_SCHEMA,
+    REMEMBER_CANONICAL_SCHEMA, RECALL_CANONICAL_SCHEMA, FORGET_CANONICAL_SCHEMA, APPLY_PENDING_SCHEMA, MODEL_CARD_SCHEMA,
     MODEL_REFRESH_SCHEMA, SCRATCHPAD_WRITE_SCHEMA, SCRATCHPAD_READ_SCHEMA, SCRATCHPAD_CLEAR_SCHEMA,
-    EXPORT_SCHEMA, UPDATE_SCHEMA, FORGET_SCHEMA, IMPORT_SCHEMA, DIAGNOSE_SCHEMA,
+    EXPORT_SCHEMA, UPDATE_SCHEMA, FORGET_SCHEMA, BATCH_SCHEMA, IMPORT_SCHEMA, DIAGNOSE_SCHEMA,
     RECALL_DIAGNOSTICS_SCHEMA,
     TASK_PROGRESS_SCHEMA,
     GRAPH_QUERY_SCHEMA, GRAPH_LINK_SCHEMA,
     SYNC_PUSH_SCHEMA, SYNC_PULL_SCHEMA, SYNC_STATUS_SCHEMA,
     PERSONA_PROMOTE_SCHEMA, PERSONA_DEMOTE_SCHEMA, PERSONA_LIST_SCHEMA, PERSONA_REINFORCE_SCHEMA,
+    REMEMBER_MEDIA_SCHEMA,
 ]  # noqa: E501

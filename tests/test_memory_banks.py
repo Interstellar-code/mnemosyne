@@ -22,7 +22,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from mnemosyne.core.banks import BankManager, create_bank, delete_bank, list_banks, bank_exists
+from mnemosyne.core.banks import (
+    BankManager,
+    create_bank,
+    delete_bank,
+    list_banks,
+    bank_exists,
+    bank_exists_read_only,
+    _validate_bank_name,
+)
 from mnemosyne.core.memory import Mnemosyne, set_bank, get_bank, remember, recall, get_stats
 
 
@@ -61,6 +69,41 @@ class TestBankManager:
                 mgr.create_bank("bank/with/slashes")
             with pytest.raises(ValueError):
                 mgr.create_bank("bank.with.dots")
+
+    @pytest.mark.parametrize(
+        ("name", "error"),
+        [
+            ("", "Bank name cannot be empty"),
+            ("../outside", "Invalid bank name"),
+            ("bank/with/slashes", "Invalid bank name"),
+            ("bank.with.dots", "Invalid bank name"),
+        ],
+    )
+    def test_path_based_operations_reject_invalid_bank_names(self, name, error):
+        """Path-based bank operations must not resolve invalid names."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir) / "data"
+            data_dir.mkdir()
+            outside = Path(tmpdir) / "outside"
+            outside.mkdir()
+            sentinel = outside / "keep.txt"
+            sentinel.write_text("do not delete")
+
+            mgr = BankManager(data_dir)
+
+            with pytest.raises(ValueError, match=error):
+                mgr.delete_bank(name, force=True)
+            with pytest.raises(ValueError, match=error):
+                mgr.bank_exists(name)
+            with pytest.raises(ValueError, match=error):
+                mgr.get_bank_db_path(name)
+            with pytest.raises(ValueError, match=error):
+                mgr.get_bank_stats(name)
+            with pytest.raises(ValueError, match=error):
+                mgr.rename_bank(name, "safe_name")
+
+            assert sentinel.exists()
+            assert outside.exists()
 
     def test_list_banks_includes_default(self):
         """list_banks() should always include 'default'."""
@@ -176,6 +219,35 @@ class TestBankManager:
             assert "mod_test" in banks
             delete_bank("mod_test", data_dir)
             assert not bank_exists("mod_test", data_dir)
+
+    def test_module_level_remember_forwards_veracity(self):
+        """Module-level remember() should preserve veracity like Mnemosyne.remember()."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            old_data_dir = os.environ.get("MNEMOSYNE_DATA_DIR")
+            os.environ["MNEMOSYNE_DATA_DIR"] = str(data_dir)
+            try:
+                set_bank("default")
+                memory_id = remember(
+                    "module-level veracity passthrough",
+                    source="test",
+                    veracity="tool",
+                )
+
+                mem = Mnemosyne()
+                row = mem.beam.conn.execute(
+                    "SELECT veracity FROM working_memory WHERE id = ?",
+                    (memory_id,),
+                ).fetchone()
+
+                assert row is not None
+                assert row[0] == "tool"
+            finally:
+                set_bank("default")
+                if old_data_dir is None:
+                    os.environ.pop("MNEMOSYNE_DATA_DIR", None)
+                else:
+                    os.environ["MNEMOSYNE_DATA_DIR"] = old_data_dir
 
 
 # ============================================================================
@@ -370,9 +442,99 @@ class TestBankEdgeCases:
             assert mn.bank == "work"  # Bank is still tracked
 
 
-# ============================================================================
+# ==========================================================================
+# bank_exists_read_only + _validate_bank_name focused unit tests
+# ==========================================================================
+
+def test_bank_exists_read_only_existing_bank():
+    """An existing named bank resolves True via the read-only helper."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        data_dir = Path(tmpdir)
+        mgr = BankManager(data_dir)
+        mgr.create_bank("work")
+        assert bank_exists_read_only("work", data_dir=data_dir) is True
+
+
+def test_bank_exists_read_only_missing_bank():
+    """A missing named bank resolves False via the read-only helper."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        data_dir = Path(tmpdir)
+        assert bank_exists_read_only("nope", data_dir=data_dir) is False
+
+
+def test_bank_exists_read_only_creates_no_directories():
+    """The read-only check must not materialize data_dir or banks/."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        data_dir = Path(tmpdir) / "absent" / "data"
+        banks_dir = data_dir / "banks"
+        assert not data_dir.exists()
+        assert not banks_dir.exists()
+        # Call with a missing parent; helper should short-circuit on is_dir().
+        result = bank_exists_read_only("ghost", data_dir=data_dir)
+        assert result is False
+        # Still no directories created on disk.
+        assert not data_dir.exists()
+        assert not banks_dir.exists()
+
+
+def test_bank_exists_read_only_explicit_data_dir_used():
+    """An explicit data_dir is honored over the module default."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        data_dir = Path(tmpdir) / "explicit"
+        data_dir.mkdir()
+        (data_dir / "banks").mkdir()
+        (data_dir / "banks" / "beta").mkdir()
+        # Sanity: the helper reads from the passed data_dir, not DEFAULT_DATA_DIR.
+        assert bank_exists_read_only("beta", data_dir=data_dir) is True
+
+
+def test_bank_exists_read_only_honors_env_override(monkeypatch):
+    """MNEMOSYNE_DATA_DIR is honored when data_dir is omitted.
+
+    `_default_data_dir()` re-reads MNEMOSYNE_DATA_DIR on every call, so we
+    rely solely on monkeypatch.setenv — no manual module-global mutation and
+    no try/finally restoration. monkeypatch reverts the env var automatically
+    after the test, so no process-global state leaks and no test-order
+    dependency is introduced.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        data_dir = Path(tmpdir) / "env_data"
+        (data_dir / "banks" / "gamma").mkdir(parents=True)
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(data_dir))
+        assert bank_exists_read_only("gamma") is True
+
+
+def test_validate_bank_name_malformed_raises():
+    """Malformed bank names raise ValueError."""
+    for bad in ("bad name!!", "way_too_long_" + "x" * 80, ""):
+        with pytest.raises(ValueError):
+            _validate_bank_name(bad)
+
+
+def test_validate_bank_name_long_name_raises():
+    """Over-length bank names raise ValueError."""
+    with pytest.raises(ValueError):
+        _validate_bank_name("a" * 65)
+
+
+def test_validate_bank_name_default_and_valid():
+    """'default' and normal names are accepted without error."""
+    _validate_bank_name("default")  # must not raise
+    _validate_bank_name("my-bank_1")  # must not raise
+
+
+def test_bank_exists_read_only_default_is_true():
+    """'default' is always treated as present, no FS access."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        data_dir = Path(tmpdir) / "ghost"
+        assert bank_exists_read_only("default", data_dir=data_dir) is True
+        # No directory materialized for the synthetic default path.
+        assert not data_dir.exists()
+
+
+# ==========================================================================
 # Run standalone
-# ============================================================================
+# ==========================================================================
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "--tb=short"])

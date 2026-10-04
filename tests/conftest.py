@@ -7,6 +7,16 @@ between tests, and that default-disable the local LLM so tests don't
 make real CPU inference calls when a model is available on disk.
 """
 
+import os
+
+# Scrub deployment env BEFORE any test module imports mnemosyne.core.beam:
+# the module-level RECALL_CONTENT_CAP constant resolves at
+# first import, so a deployment-exported value baked in during collection
+# (alphabetical order controls which file imports first) would otherwise make
+# default-behavior tests environment-dependent. Tests that want custom values
+# set them explicitly on the resolved module attributes.
+os.environ.pop("MNEMOSYNE_RECALL_CONTENT_CAP", None)
+
 import pytest
 
 
@@ -40,6 +50,17 @@ def _close_cached_connections():
     except Exception:
         pass
 
+    # MnemosyneConfig also caches the config path selected from the environment.
+    # A preceding test may initialize it using the ambient data directory while
+    # a later provider test swaps MNEMOSYNE_DATA_DIR to a temporary bank.  Keep
+    # that path selection test-local just like the database connection caches;
+    # otherwise the later provider reads stale skip_contexts configuration.
+    try:
+        from mnemosyne.core.config import MnemosyneConfig
+        MnemosyneConfig.reset_instance()
+    except Exception:
+        pass
+
     # Reset hermes_plugin singleton
     try:
         import hermes_plugin
@@ -58,9 +79,33 @@ def _close_cached_connections():
     except Exception:
         pass
 
+    # Same reasoning for the modality registry, which is also a process-global.
+    # This reset ships in the PR that introduces the registry: a later one is
+    # one bled-through global away from a flaky matrix, and the symptom would be
+    # a privacy test passing for the wrong reason.
+    try:
+        from mnemosyne.core import modality_backends as _modality_mod
+        _modality_mod.clear_modality_backends()
+    except Exception:
+        pass
+
+    # Same reasoning for the content-resolver registry. Note this clears only
+    # explicit registrations: the built-in blob resolver survives, so tests
+    # that read blobs still work after the reset.
+    try:
+        from mnemosyne.core import resolvers as _resolvers_mod
+        _resolvers_mod.clear_content_resolvers()
+    except Exception:
+        pass
+
+
+@pytest.fixture
+def _before_connection_reset():
+    """Overridable hook for setup that must precede connection imports."""
+
 
 @pytest.fixture(autouse=True)
-def _reset_thread_local_connections():
+def _reset_thread_local_connections(_before_connection_reset):
     """
     Auto-use fixture that resets thread-local SQLite connection caches
     before and after every test. This prevents connection leakage between

@@ -29,15 +29,23 @@ Usage:
     cache.put(query, results, embedding)
 """
 
-import hashlib
 import json
 import math
+import re
 import time
 import threading
-from datetime import datetime
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional
 from pathlib import Path
 import sqlite3
+from mnemosyne.core.journal import journal_mode
+
+
+_OPAQUE_V2_KEY_RE = re.compile(r"v2:[0-9a-f]{64}")
+
+
+def _is_opaque_v2_key(key: str) -> bool:
+    """Return whether *key* is an enhanced-recall request digest."""
+    return bool(_OPAQUE_V2_KEY_RE.fullmatch(key))
 
 
 class QueryCache:
@@ -65,6 +73,11 @@ class QueryCache:
         
         # Tier 4: Expanded query cache
         self._tier4: Dict[str, List[Dict]] = {}
+
+        # Opaque v2 request keys bypass every fuzzy tier.  They are used by
+        # enhanced recall, whose full request digest is not a natural-language
+        # query and must therefore be matched byte-for-byte.
+        self._opaque: Dict[str, List[Dict]] = {}
         
         # Thread safety
         self._lock = threading.Lock()
@@ -90,7 +103,7 @@ class QueryCache:
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute(f"PRAGMA journal_mode={journal_mode()}")
         self._conn.execute("""
             CREATE TABLE IF NOT EXISTS query_cache (
                 normalized TEXT PRIMARY KEY,
@@ -111,8 +124,12 @@ class QueryCache:
             for row in cursor.fetchall():
                 try:
                     results = json.loads(row["results_json"])
-                    self._tier1[row["normalized"]] = results
-                    self._tier4[row["normalized"]] = results
+                    key = row["normalized"]
+                    if _is_opaque_v2_key(key):
+                        self._opaque[key] = results
+                    else:
+                        self._tier1[key] = results
+                        self._tier4[key] = results
                 except Exception:
                     pass
         except Exception:
@@ -125,6 +142,7 @@ class QueryCache:
             self._tier1.clear()
             self._tier2_3.clear()
             self._tier4.clear()
+            self._opaque.clear()
             self._insert_times.clear()
             if self._conn:
                 self._conn.execute("DELETE FROM query_cache")
@@ -165,16 +183,10 @@ class QueryCache:
         return len(words_a & words_b) / len(words_a | words_b)
     
     def get(self, query: str, embedding: List[float] = None) -> Optional[List[Dict]]:
-        """
-        Try to retrieve cached results for a query.
-        
-        Args:
-            query: The search query
-            embedding: Pre-computed embedding of the query (for Tier 2-3 comparison)
-            
-        Returns:
-            Cached results or None if cache miss
-        """
+        """Retrieve a semantic entry, or exact-match an enhanced request digest."""
+        # Only complete SHA-256 request digests bypass the semantic tiers.
+        if _is_opaque_v2_key(query):
+            return self.get_opaque(query)
         normalized = self._normalize(query)
         
         with self._lock:
@@ -247,11 +259,29 @@ class QueryCache:
             
             self.misses += 1
             return None
+
+    def get_opaque(self, key: str) -> Optional[List[Dict]]:
+        """Retrieve an opaque v2 key without normalization or fuzzy matching."""
+        if not _is_opaque_v2_key(key):
+            return self.get(key)
+        with self._lock:
+            now = time.time()
+            if key in self._insert_times and now - self._insert_times[key] > self.ttl_seconds:
+                self._opaque.pop(key, None)
+                self._insert_times.pop(key, None)
+                self.misses += 1
+                return None
+            if key in self._opaque:
+                self.hits += 1
+                return self._opaque[key]
+            self.misses += 1
+            return None
     
     def put(self, query: str, results: List[Dict], embedding: List[float] = None):
-        """
-        Store results in all applicable cache tiers.
-        """
+        """Store a semantic entry, or an enhanced request digest as opaque."""
+        if _is_opaque_v2_key(query):
+            self.put_opaque(query, results)
+            return
         normalized = self._normalize(query)
         
         with self._lock:
@@ -279,6 +309,25 @@ class QueryCache:
             
             # Evict if over max_size
             self._evict_if_needed()
+
+    def put_opaque(self, key: str, results: List[Dict]):
+        """Store an opaque v2 key without adding it to any fuzzy tier."""
+        if not _is_opaque_v2_key(key):
+            self.put(key, results)
+            return
+        with self._lock:
+            self._opaque[key] = results
+            self._insert_times[key] = time.time()
+            if self._conn:
+                try:
+                    self._conn.execute(
+                        "INSERT OR REPLACE INTO query_cache (normalized, embedding_json, results_json) VALUES (?, ?, ?)",
+                        (key, None, json.dumps(results)),
+                    )
+                    self._conn.commit()
+                except Exception:
+                    pass
+            self._evict_if_needed()
     
     def _evict_if_needed(self):
         """LRU eviction if cache exceeds max_size. Also cleans TTL-expired entries."""
@@ -292,10 +341,11 @@ class QueryCache:
             self._tier1.pop(key, None)
             self._tier2_3.pop(key, None)
             self._tier4.pop(key, None)
+            self._opaque.pop(key, None)
             self._insert_times.pop(key, None)
         
         # Then evict oldest if still over max_size
-        total = len(self._tier1)
+        total = len(self._tier1) + len(self._opaque)
         if total > self.max_size:
             sorted_keys = sorted(
                 self._insert_times.keys(),
@@ -306,6 +356,7 @@ class QueryCache:
                 self._tier1.pop(key, None)
                 self._tier2_3.pop(key, None)
                 self._tier4.pop(key, None)
+                self._opaque.pop(key, None)
                 self._insert_times.pop(key, None)
     
     def close(self):
@@ -337,7 +388,7 @@ class QueryCache:
             "tier2_hits": self.tier2_hits,
             "tier3_hits": self.tier3_hits,
             "tier4_hits": self.tier4_hits,
-            "size": len(self._tier1),
+            "size": len(self._tier1) + len(self._opaque),
             "max_size": self.max_size,
             "version": self._cache_version,
         }

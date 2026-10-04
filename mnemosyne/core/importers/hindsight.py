@@ -24,9 +24,11 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
+from mnemosyne.core.beam import _normalize_valid_until
 from mnemosyne.core.importers.base import BaseImporter, ImporterResult
+from mnemosyne.core.user_agent import application_user_agent
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +95,10 @@ class HindsightImporter(BaseImporter):
         while True:
             query = urllib.parse.urlencode({"limit": self.page_size, "offset": offset})
             url = f"{self.base_url}/v1/default/banks/{self.bank}/memories/list?{query}"
-            with urllib.request.urlopen(url, timeout=60) as resp:
+            request = urllib.request.Request(
+                url, headers={"User-Agent": application_user_agent()}
+            )
+            with urllib.request.urlopen(request, timeout=60) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
             page = self._unwrap_items(data)
             if not page:
@@ -375,7 +380,7 @@ class HindsightImporter(BaseImporter):
             mem.get("veracity", "imported"),
             mem.get("created_at") or mem.get("timestamp"),
             None,
-            mem.get("valid_until"),
+            _normalize_valid_until(mem.get("valid_until")),
             mem.get("channel_id"),
             mem.get("author_id"),
             mem.get("scope", "global"),
@@ -393,7 +398,14 @@ class HindsightImporter(BaseImporter):
         if not (_embeddings and _embeddings.available()):
             logger.debug("backfill: embeddings unavailable, skipping vector for rowid=%s", rowid)
             return
-        vecs = _embeddings.embed([content])
+        try:
+            vecs = _embeddings.embed([content])
+        except Exception as exc:
+            logger.debug(
+                "backfill: embed() raised for rowid=%s (%s: %s); skipping vector",
+                rowid, type(exc).__name__, exc,
+            )
+            return
         if vecs is None:
             logger.debug("backfill: embed() returned None for rowid=%s, content=%.50r", rowid, content)
             return

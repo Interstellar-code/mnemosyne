@@ -154,7 +154,7 @@ def test_sweep_without_host_llm_skips_instead_of_aaak(temp_db, monkeypatch):
 
 def test_sleep_allow_aaak_false_unclaims_group_without_llm_summary(temp_db, monkeypatch):
     monkeypatch.setattr(local_llm, "llm_available", lambda: True)
-    monkeypatch.setattr(local_llm, "summarize_memories", lambda *a, **k: None)
+    monkeypatch.setattr(local_llm, "_summarize_memories", lambda *a, **k: None)
     beam = BeamMemory(session_id="s1", db_path=temp_db)
     _insert(temp_db, [("a", "s1", 400), ("b", "s1", 300)])
 
@@ -177,7 +177,8 @@ def test_failed_session_backs_off_then_is_retried(temp_db, monkeypatch):
     """A session whose LLM always fails must not hog the head of the queue."""
     monkeypatch.setattr(local_llm, "_host_backend_will_handle_call", lambda: True)
     monkeypatch.setattr(local_llm, "llm_available", lambda: True)
-    monkeypatch.setattr(local_llm, "summarize_memories",
+    # sleep() calls the private _summarize_memories since upstream 4.0.
+    monkeypatch.setattr(local_llm, "_summarize_memories",
                         lambda lines, **k: None if "bad" in lines[0] else "LLM SUMMARY")
     beam = BeamMemory(session_id="current", db_path=temp_db)
     _insert(temp_db, [("bad", "s1", 500), ("good", "s2", 400)])
@@ -202,7 +203,7 @@ def test_failed_session_backs_off_then_is_retried(temp_db, monkeypatch):
     conn.commit()
     conn.close()
     assert beam._count_unconsolidated_before(cutoff, respect_backoff=True) == 1
-    monkeypatch.setattr(local_llm, "summarize_memories", lambda lines, **k: "LLM SUMMARY")
+    monkeypatch.setattr(local_llm, "_summarize_memories", lambda lines, **k: "LLM SUMMARY")
     third = beam.sleep_all_sessions(max_sessions=1, require_host_llm=True)
     assert [r["session_id"] for r in third["session_results"]] == ["s1"]
     conn = sqlite3.connect(temp_db)

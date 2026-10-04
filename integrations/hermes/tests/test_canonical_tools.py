@@ -2,10 +2,30 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from mnemosyne_hermes import MnemosyneMemoryProvider
+
+# The #1050 canonical write guard compares the HOST-REPORTED turn profile
+# against the bound owner. On a bare interpreter the host module is absent
+# and the guard is exempt; inside a hermes venv a real active profile
+# (typically 'default') would clash with these tests' bound identities and
+# fail closed. Pin the turn profile to whatever the test last bound so the
+# guard sees a concordant owner in every environment.
+_BOUND = {"profile": "profile_a"}
+
+
+@pytest.fixture(autouse=True)
+def _align_turn_profile(monkeypatch):
+    try:
+        import hermes_cli.profiles as _prof
+    except Exception:
+        return
+    monkeypatch.setattr(_prof, "get_active_profile_name", lambda: _BOUND["profile"])
 
 
 def _provider(tmp_path, profile: str = "profile_a") -> MnemosyneMemoryProvider:
+    _BOUND["profile"] = profile
     provider = MnemosyneMemoryProvider()
     provider.initialize(
         "session-1",
@@ -139,3 +159,32 @@ def test_active_adapter_exposes_canonical_tool_schemas():
 
     assert "mnemosyne_remember_canonical" in names
     assert "mnemosyne_recall_canonical" in names
+
+
+def test_invalidate_reports_not_found_when_no_row_matched(tmp_path):
+    provider = _provider(tmp_path, profile="profile_a")
+    try:
+        audit_events = []
+        provider._audit_event = lambda action, **kwargs: audit_events.append((action, kwargs))
+
+        assert provider._beam.invalidate("missing-memory-id") is False
+        result = json.loads(provider.handle_tool_call(
+            "mnemosyne_invalidate",
+            {"memory_id": "missing-memory-id"},
+        ))
+        assert result["status"] == "memory_not_found"
+        assert result["memory_id"] == "missing-memory-id"
+        assert audit_events == [
+            (
+                "invalidate",
+                {
+                    "memory_id": "missing-memory-id",
+                    "bank": "private",
+                    "source_tool": "mnemosyne_invalidate",
+                    "metadata": {"invalidated": False},
+                },
+            ),
+        ]
+        assert audit_events[0][1]["metadata"]["invalidated"] is False
+    finally:
+        _close(provider)

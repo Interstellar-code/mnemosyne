@@ -60,7 +60,7 @@ def test_recall_through_real_engine(provider):
 def test_all_tools_registered(provider):
     names = {s["name"] for s in provider.get_tool_schemas()}
     assert {"memory_create_page", "memory_update_page", "memory_show_page"} <= names
-    assert len(names) == 36  # 33 Mnemosyne tools + 3 contract wiki tools
+    assert len(names) == 45  # 42 Mnemosyne tools (upstream 4.0) + 3 contract wiki tools
 
 
 # --- Tier 1 migration into the real vector store ----------------------------
