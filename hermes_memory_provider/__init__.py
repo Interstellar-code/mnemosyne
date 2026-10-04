@@ -2086,7 +2086,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             self._configured_tool_schemas()
         except Exception:
             self._deactivate_in_module()
-            if self._agent_context not in self._skip_contexts:
+            # Process-global backend: same last-primary gate as shutdown().
+            if not self._implicit_memory_off() and _active_provider_count == 0:
                 try:
                     from hermes_memory_provider.hermes_llm_adapter import unregister_hermes_host_llm
                     unregister_hermes_host_llm()
@@ -2729,7 +2730,9 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 # Reusing self._beam.conn from a daemon thread races with the
                 # main thread's sync_turn() writes, causing episodic INSERT
                 # failures (commit rolled back by concurrent main-thread writes).
-                # The provider Beam lock is held for the whole pass (#498).
+                # Beam access is serialized under the provider lock (#498):
+                # a session sleep holds it throughout; a sweep holds it per
+                # session so prefetch/tool calls can run between sessions.
                 beam_lock = self._ensure_beam_access_lock()
                 max_sessions = self._sweep_max_sessions
                 time_budget = self._sweep_time_budget
@@ -2748,18 +2751,19 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                             # so an in-flight sleep's claims are never stolen.
                             from mnemosyne.core.beam import CONSOLIDATION_RETRY_BACKOFF_SECONDS
                             sleep_beam.reclaim_orphans(stale_after_seconds=CONSOLIDATION_RETRY_BACKOFF_SECONDS)
-                            result = sleep_beam.sleep_all_sessions(
-                                max_sessions=max_sessions,
-                                time_budget_seconds=time_budget,
-                                require_host_llm=True,
-                            )
+                        result = sleep_beam.sleep_all_sessions(
+                            max_sessions=max_sessions,
+                            time_budget_seconds=time_budget,
+                            require_host_llm=True,
+                            session_lock=beam_lock,
+                        )
                         logger.info(
                             "Mnemosyne auto-sleep sweep: sessions=%s items=%s llm=%s stopped=%s",
                             result.get("sessions_consolidated"), result.get("items_consolidated"),
                             result.get("llm_used"), result.get("stopped_reason"),
                         )
                     except Exception as inner:
-                        logger.debug("Mnemosyne auto-sleep worker failed: %s", inner)
+                        logger.warning("Mnemosyne auto-sleep worker failed: %s", inner, exc_info=True)
                     finally:
                         if sweep:
                             MnemosyneMemoryProvider._SWEEP_HELD_SINCE = None
@@ -2779,8 +2783,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             sleep_thread.join(timeout=self._AUTO_SLEEP_TIMEOUT_SECONDS)
             if sleep_thread.is_alive():
                 logger.warning("Mnemosyne auto-sleep timed out after %.0fs — consolidation deferred", self._AUTO_SLEEP_TIMEOUT_SECONDS)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Mnemosyne auto-sleep failed: %s", exc, exc_info=True)
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         """Return configured tool schemas; independent of Beam initialization state."""
@@ -3004,8 +3008,15 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         """Adapter: contract write -> Mnemosyne remember. Tags ride in metadata."""
         if not self._beam:
             return None
+        from mnemosyne.core.filters import write_policy_operation
+
         metadata = {"tags": list(tags)} if tags else None
-        return self._beam.remember(content=content, source=source, metadata=metadata)
+        # Called from the wiki poll thread: serialize Beam access (#498).
+        with write_policy_operation(self._resolve_effective_write_policy()), self._ensure_beam_access_lock():
+            beam = self._beam
+            if not beam:
+                return None
+            return beam.remember(content=content, source=source, metadata=metadata)
 
     def _contract_graph_link_fn(self, source: str, target: str, relationship: str = "references"):
         """Adapter: wikilink -> episodic graph edge. Degrades gracefully when the

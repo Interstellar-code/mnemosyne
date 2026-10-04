@@ -12932,7 +12932,8 @@ class BeamMemory:
     def sleep_all_sessions(self, dry_run: bool = False, force: bool = False,
                            max_sessions: Optional[int] = None,
                            time_budget_seconds: Optional[float] = None,
-                           require_host_llm: bool = False) -> Dict:
+                           require_host_llm: bool = False,
+                           session_lock=None) -> Dict:
         """
         Consolidate eligible old working memories across all sessions.
 
@@ -12951,6 +12952,10 @@ class BeamMemory:
         when none is registered, never AAAK-encodes (groups without an LLM
         summary are un-claimed), and skips the degrade/dedup maintenance
         passes. Repeated calls drain the backlog.
+
+        session_lock (optional context manager) is held around each single
+        session's sleep and released between sessions, so a host serializing
+        Beam access (#498) is blocked for one session at a time, not the sweep.
         """
         import time
         from mnemosyne.core import local_llm
@@ -13041,16 +13046,17 @@ class BeamMemory:
                 # channel_id=caller surfaces alien content. Letting it default
                 # to the alien session_id is the semantically correct behavior.
                 # See C9 + adversarial review in the memory-contract ledger.
-                beam = self if session_id == self.session_id else BeamMemory(
-                    session_id=session_id,
-                    db_path=self.db_path,
-                    author_id=self.author_id,
-                    author_type=self.author_type,
-                )
-                result = beam.sleep(dry_run=dry_run, force=force,
-                                    allow_aaak=not require_host_llm,
-                                    run_maintenance=not require_host_llm,
-                                    _fleet_census=False)
+                with session_lock or contextlib.nullcontext():
+                    beam = self if session_id == self.session_id else BeamMemory(
+                        session_id=session_id,
+                        db_path=self.db_path,
+                        author_id=self.author_id,
+                        author_type=self.author_type,
+                    )
+                    result = beam.sleep(dry_run=dry_run, force=force,
+                                        allow_aaak=not require_host_llm,
+                                        run_maintenance=not require_host_llm,
+                                        _fleet_census=False)
                 result = dict(result)
                 result["session_id"] = session_id
                 result["eligible"] = row["eligible"] if hasattr(row, "keys") else row[1]

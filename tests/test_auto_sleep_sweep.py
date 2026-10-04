@@ -8,6 +8,7 @@ Hermes host LLM only, and never AAAK-encodes in that sweep.
 
 import logging
 import sqlite3
+import sys
 import tempfile
 import threading
 import time
@@ -228,6 +229,44 @@ def test_host_sweep_skips_maintenance_passes(temp_db, fake_host_llm, monkeypatch
 
 # --- provider._maybe_auto_sleep ---------------------------------------------
 
+def test_auto_sleep_sweep_holds_beam_lock_per_session_only(temp_db, fake_host_llm, monkeypatch):
+    """#498 lock is held during each session's sleep but free between sessions,
+    so prefetch/tool calls are not blocked for the whole sweep."""
+    provider = Provider()
+    provider._beam = BeamMemory(session_id="current", db_path=temp_db)
+    _insert(temp_db, [("a", "s1", 400), ("b", "s2", 300)])
+    provider._auto_sleep_threshold = 0
+    lock = provider._ensure_beam_access_lock()
+
+    def _free_for_other_thread():
+        got = []
+        t = threading.Thread(target=lambda: got.append(lock.acquire(blocking=False)) or (got[0] and lock.release()))
+        t.start()
+        t.join(5)
+        return got[0]
+
+    during, between = [], []
+    real_sleep = BeamMemory.sleep
+    monkeypatch.setattr(BeamMemory, "sleep",
+                        lambda self, **kw: during.append(_free_for_other_thread()) or real_sleep(self, **kw))
+    real_check = local_llm._host_backend_will_handle_call
+
+    def _check():
+        # the sweep loop's per-session host-LLM check runs between sessions
+        if sys._getframe(1).f_code.co_name == "sleep_all_sessions":
+            between.append(_free_for_other_thread())
+        return real_check()
+
+    monkeypatch.setattr(local_llm, "_host_backend_will_handle_call", _check)
+
+    provider._maybe_auto_sleep()
+    _wait_for_sweep(provider)
+
+    assert during == [False, False], "lock must be held during each session's sleep"
+    assert between == [True, True], "lock must be free between sessions"
+    assert all(_consolidated(temp_db).values())
+
+
 def test_auto_sleep_consolidates_other_sessions_with_host_llm(temp_db, fake_host_llm):
     """Repro for #252: old rows in OTHER sessions stayed unconsolidated forever."""
     current = BeamMemory(session_id="current", db_path=temp_db)
@@ -301,7 +340,8 @@ def test_auto_sleep_sweep_is_bounded_unjoined_and_not_overlapping(monkeypatch):
     _wait_for_sweep(provider)
     assert sweep_beam.sleep_all_sessions.call_count == 1
     assert sweep_beam.sleep_all_sessions.call_args.kwargs == {
-        "max_sessions": 4, "time_budget_seconds": 7.0, "require_host_llm": True}
+        "max_sessions": 4, "time_budget_seconds": 7.0, "require_host_llm": True,
+        "session_lock": provider._ensure_beam_access_lock()}
     sweep_beam.reclaim_orphans.assert_called_once_with(stale_after_seconds=6 * 3600)
 
     other._maybe_auto_sleep()  # lock released -> next sweep may run

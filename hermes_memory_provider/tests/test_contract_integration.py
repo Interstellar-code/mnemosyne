@@ -98,3 +98,24 @@ def test_create_page_apply_blocked_without_token(provider):
     out = _call(provider, "memory_create_page",
                 {"path": "entities/x.md", "content": "body", "dry_run": False})
     assert "error" in out  # destructive apply requires a confirm_token
+
+
+def test_wiki_poller_remember_holds_beam_lock_and_write_policy(provider):
+    """The wiki poll thread's write must serialize with other Beam access (#498)."""
+    import threading
+
+    from mnemosyne.core.filters import active_write_policy
+
+    lock = provider._ensure_beam_access_lock()
+    seen = []
+    real_remember = provider._beam.remember
+
+    def _remember(**kw):
+        seen.append((lock._is_owned(), active_write_policy() is not None))
+        return real_remember(**kw)
+
+    provider._beam.remember = _remember
+    t = threading.Thread(target=provider._contract_remember_fn, args=("wiki page body",))
+    t.start()
+    t.join(10)
+    assert seen == [(True, True)]

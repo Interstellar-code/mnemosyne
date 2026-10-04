@@ -111,3 +111,18 @@ def test_cron_shutdown_never_unregisters_host_llm(isolated):
         cron.shutdown()
     unreg.assert_not_called()
     assert hmp._active_provider_count == 0
+
+
+def test_failed_init_keeps_host_llm_while_another_primary_is_active(isolated):
+    """A second instance whose initialize() fails must not unregister the
+    process-global host LLM out from under a still-active primary."""
+    from mnemosyne.core.llm_backends import get_host_llm_backend
+
+    _init(isolated, "primary")
+    assert get_host_llm_backend() is not None
+    bad = MnemosyneMemoryProvider()
+    with patch.object(bad, "_configured_tool_schemas", side_effect=ValueError("bad tools")):
+        with pytest.raises(ValueError):
+            bad.initialize(session_id="s-bad", agent_context="primary")
+    assert hmp._active_provider_count == 1
+    assert get_host_llm_backend() is not None
