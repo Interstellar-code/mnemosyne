@@ -979,7 +979,7 @@ class TestMaybeAutoSleep:
         beam_mock.get_working_stats.return_value = {"total": 50}
         captured = {}
 
-        def spy_count(cutoff):
+        def spy_count(cutoff, session_id=None, respect_backoff=False):  # fork #252 kwargs
             captured["cutoff"] = cutoff
             return 5
 
