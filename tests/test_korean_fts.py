@@ -467,7 +467,8 @@ def test_public_working_recall(working_memory):
     ranks = _public_ranks(working_memory, _row_content)
     hit = sum(1 for _, r in ranks if r)
     top1 = sum(1 for _, r in ranks if r == 1)
-    assert hit == 38, f"public working R@5 moved to {hit}/{len(ranks)}, baseline 38/49"
+    # Fork: vector-only recall (sim >= 0.65, e8a9229) lifts R@5 to 39/49; floor, not pin.
+    assert hit >= 38, f"public working R@5 fell to {hit}/{len(ranks)}, floor 38/49"
     assert top1 >= 36, f"public working R@1 fell to {top1}/{len(ranks)}, floor 36/49"
 
 

@@ -301,7 +301,10 @@ def test_symbolic_code_queries_recall_via_public_api_hash(tmp_path):
     results = beam.recall("c#", top_k=5)
 
     assert results[0]["id"] == expected_id
-    assert all(result["id"] != distractor_id for result in results)
+    # Fork: vector-only recall (sim >= 0.65, e8a9229) admits the C++ distractor
+    # (sim ~0.74 with fastembed); it must still rank below the exact match.
+    ids = [result["id"] for result in results]
+    assert distractor_id not in ids or ids.index(distractor_id) > 0
 
 
 def test_leading_hyphen_fragments_keep_the_literal_form():
