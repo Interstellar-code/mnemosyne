@@ -13096,7 +13096,9 @@ class BeamMemory:
                     _y = float(os.environ.get("MNEMOSYNE_SLEEP_LOCK_YIELD", _SESSION_LOCK_YIELD_SECONDS))
                 except ValueError:
                     _y = _SESSION_LOCK_YIELD_SECONDS
-                time.sleep(_y)
+                if not math.isfinite(_y):
+                    _y = _SESSION_LOCK_YIELD_SECONDS
+                time.sleep(min(max(_y, 0.0), 1.0))
 
         # Run tiered degradation after all-sessions consolidation. The
         # unattended host-LLM sweep skips both passes: they run outside the

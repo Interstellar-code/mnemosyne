@@ -96,3 +96,38 @@ def test_update_dry_run_gate_off_keeps_row(provider):
 
 def test_remember_gate_off_still_writes(provider):
     assert _call(provider, "mnemosyne_remember", {"content": "plain write"}).get("status") == "stored"
+
+
+@pytest.mark.parametrize("flag", ["false", "0", "no", "off", "", False, 0, None])
+def test_non_true_dry_run_writes_gate_off(provider, flag):
+    out = _call(provider, "mnemosyne_remember", {"content": f"w {flag!r}", "dry_run": flag})
+    assert out.get("status") == "stored", out
+    mid = out["memory_id"]
+    out = _call(provider, "mnemosyne_forget", {"memory_id": mid, "dry_run": flag})
+    assert out.get("status") == "deleted", out
+
+
+@pytest.mark.parametrize("flag", ["true", "TRUE", " 1 ", "yes", 1, True])
+def test_true_dry_run_previews_gate_off(provider, flag):
+    mid = _call(provider, "mnemosyne_remember", {"content": "stay"})["memory_id"]
+    out = _call(provider, "mnemosyne_forget", {"memory_id": mid, "dry_run": flag})
+    assert out.get("dry_run") is True, out
+
+
+def test_prefetch_busy_warning_once_until_success(provider, monkeypatch, caplog):
+    import logging
+    monkeypatch.setattr(hmp, "_PREFETCH_LOCK_TIMEOUT_S", 0.1)
+    monkeypatch.setattr(provider, "_prefetch_locked", lambda q, session_id="": "ok")
+    caplog.set_level(logging.DEBUG, logger=hmp.logger.name)
+    t = _hold(provider, 1.0)
+    provider.prefetch("a")
+    provider.prefetch("b")
+    t.join()
+    busy = [r.levelno for r in caplog.records if "Beam lock busy" in r.getMessage()]
+    assert busy == [logging.WARNING, logging.DEBUG]
+    assert provider.prefetch("c") == "ok"
+    caplog.clear()
+    t = _hold(provider, 0.5)
+    provider.prefetch("d")
+    t.join()
+    assert [r.levelno for r in caplog.records if "Beam lock busy" in r.getMessage()] == [logging.WARNING]

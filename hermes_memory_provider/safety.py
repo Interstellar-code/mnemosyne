@@ -28,6 +28,13 @@ from typing import Callable
 # Tool classification
 # ---------------------------------------------------------------------------
 
+def is_true(v) -> bool:
+    """Strict truthiness for flags that may arrive as strings ("false"/"0" are False)."""
+    if isinstance(v, str):
+        return v.strip().lower() in {"1", "true", "yes", "on"}
+    return v is True or (isinstance(v, int) and not isinstance(v, bool) and v == 1)
+
+
 WRITE_TOOLS: frozenset[str] = frozenset(
     {
         "mnemosyne_remember",
@@ -162,7 +169,7 @@ class SafetyGate:
         """
         # Step 0 – disabled gate is a transparent passthrough, except that an
         # explicit dry_run=true on a write tool must still preview, never write.
-        if not self._enabled and not (tool_name in WRITE_TOOLS and bool(args.get("dry_run"))):
+        if not self._enabled and not (tool_name in WRITE_TOOLS and is_true(args.get("dry_run"))):
             return apply_fn()
 
         # Step 1 – non-write passthrough
@@ -171,7 +178,7 @@ class SafetyGate:
 
         # Step 2 – resolve dry_run
         if "dry_run" in args:
-            dry_run = bool(args["dry_run"])
+            dry_run = is_true(args["dry_run"])
         else:
             dry_run = not self.is_operator  # AGENT default=True, OPERATOR default=False
 

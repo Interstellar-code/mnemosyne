@@ -466,25 +466,31 @@ def test_sweep_yields_lock_before_census_after_last_session(temp_db, monkeypatch
         _insert(temp_db, [(f"r{i}", f"s{i}", 400 + i) for i in range(2)])
         lock = threading.RLock()
         events, started = [], threading.Event()
+        calls = []
         real_sleep = BeamMemory.sleep
         real_census = BeamMemory._attach_fleet_conflict_census
 
         def _sleep(self, **kw):
-            started.set()
+            calls.append(1)
+            if len(calls) == 2:  # last session is now running
+                started.set()
             return real_sleep(self, **kw)
 
-        def _census(self, result):
-            events.append("census")
-            return real_census(self, result)
+        def _census(self, result, *a, **kw):
+            # Per-session sleep() calls pass enabled=False; only the fleet
+            # census (enabled) counts.
+            if a[0] if a else kw.get("enabled", True):
+                events.append("census")
+            return real_census(self, result, *a, **kw)
 
         monkeypatch.setattr(BeamMemory, "sleep", _sleep)
         monkeypatch.setattr(BeamMemory, "_attach_fleet_conflict_census", _census)
-        sweep = threading.Thread(target=lambda: beam.sleep_all_sessions(
-            max_sessions=2, require_host_llm=True, session_lock=lock))
+        out = {}
+        sweep = threading.Thread(target=lambda: out.update(beam.sleep_all_sessions(
+            max_sessions=2, require_host_llm=True, session_lock=lock)))
         sweep.start()
-        assert started.wait(10)
-        # Let the first session finish so the waiter arrives during the last one.
-        time.sleep(0.5)
+        assert started.wait(60)
+        time.sleep(0.3)  # let session 2 take the lock; waiter then blocks on it
 
         def _waiter():
             with lock:
@@ -492,8 +498,30 @@ def test_sweep_yields_lock_before_census_after_last_session(temp_db, monkeypatch
 
         waiter = threading.Thread(target=_waiter)
         waiter.start()
-        waiter.join(60)
-        sweep.join(60)
+        waiter.join(120)
+        sweep.join(120)
+        assert out.get("errors") == 0, out.get("error_details")
         assert events[:2] == ["waiter", "census"], events
+    finally:
+        set_host_llm_backend(None)
+
+
+@pytest.mark.parametrize("bad", ["nan", "-1", "inf", "1e9", "garbage"])
+def test_sweep_survives_bad_yield_env(temp_db, monkeypatch, bad):
+    """A hostile MNEMOSYNE_SLEEP_LOCK_YIELD must not crash or stall the sweep."""
+    monkeypatch.setenv("MNEMOSYNE_SLEEP_LOCK_YIELD", bad)
+    monkeypatch.setattr(time, "sleep", lambda s: slept.append(s))
+    slept = []
+    monkeypatch.setattr(local_llm, "LLM_ENABLED", True)
+    monkeypatch.setattr(local_llm, "HOST_LLM_ENABLED", True)
+    set_host_llm_backend(CallableLLMBackend("fast-host", lambda prompt, **kw: "LLM SUMMARY"))
+    try:
+        beam = BeamMemory(session_id="current", db_path=temp_db)
+        _insert(temp_db, [(f"r{i}", f"s{i}", 400 + i) for i in range(2)])
+        out = beam.sleep_all_sessions(
+            max_sessions=2, require_host_llm=True, session_lock=threading.RLock())
+        assert out["errors"] == 0, out["error_details"]
+        assert out["sessions_consolidated"] == 2
+        assert all(0.0 <= s <= 1.0 for s in slept), slept
     finally:
         set_host_llm_backend(None)

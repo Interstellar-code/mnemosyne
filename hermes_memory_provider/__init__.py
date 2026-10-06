@@ -2261,11 +2261,16 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # until the call returns, so never block on a long lock holder (sleep).
         lock = self._ensure_beam_access_lock()
         if not lock.acquire(timeout=_PREFETCH_LOCK_TIMEOUT_S):
-            logger.warning(
+            # WARNING once per busy episode, DEBUG until the next success.
+            warned = self.__dict__.get("_prefetch_busy_warned", False)
+            self._prefetch_busy_warned = True
+            logger.log(
+                logging.DEBUG if warned else logging.WARNING,
                 "prefetch: Beam lock busy for %.0fs; skipping memory this turn",
                 _PREFETCH_LOCK_TIMEOUT_S,
             )
             return ""
+        self._prefetch_busy_warned = False
         try:
             return self._prefetch_locked(query, session_id=session_id)
         finally:
@@ -3057,12 +3062,12 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
 
         # Explicit dry_run=true must preview even with the safety gate off.
         # mnemosyne_import honours dry_run natively, so it keeps its own path.
-        from .safety import WRITE_TOOLS
+        from .safety import WRITE_TOOLS, is_true
 
         if (
             tool_name in WRITE_TOOLS
             and tool_name != "mnemosyne_import"
-            and bool(args.get("dry_run"))
+            and is_true(args.get("dry_run"))
         ):
             return safety.guard(tool_name, args, lambda: self._dispatch_raw(tool_name, args))
 
