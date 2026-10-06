@@ -434,17 +434,66 @@ def test_sweep_yields_lock_so_waiters_acquire_between_sessions(temp_db, monkeypa
         sweep.start()
         assert started.wait(10)
         for _ in range(3):
-            n0, at_acquire = len(done), []
+            at_acquire = []
 
             def _waiter():
+                n0 = len(done)
                 with lock:
-                    at_acquire.append(len(done))
+                    at_acquire.append(len(done) - n0)
 
             waiter = threading.Thread(target=_waiter)
             waiter.start()
             waiter.join(60)
             assert at_acquire, "waiter never acquired the lock"
-            assert at_acquire[0] - n0 <= 1, "waiter starved across multiple sessions"
+            assert at_acquire[0] <= 1, "waiter starved across multiple sessions"
         sweep.join(60)
+    finally:
+        set_host_llm_backend(None)
+
+
+def test_sweep_yields_lock_before_census_after_last_session(temp_db, monkeypatch):
+    """A waiter blocked during the LAST session must get the lock before the
+    fleet census re-acquires it."""
+    def _slow(prompt, **kwargs):
+        time.sleep(0.3)
+        return "LLM SUMMARY"
+
+    monkeypatch.setattr(local_llm, "LLM_ENABLED", True)
+    monkeypatch.setattr(local_llm, "HOST_LLM_ENABLED", True)
+    set_host_llm_backend(CallableLLMBackend("slow-host", _slow))
+    try:
+        beam = BeamMemory(session_id="current", db_path=temp_db)
+        _insert(temp_db, [(f"r{i}", f"s{i}", 400 + i) for i in range(2)])
+        lock = threading.RLock()
+        events, started = [], threading.Event()
+        real_sleep = BeamMemory.sleep
+        real_census = BeamMemory._attach_fleet_conflict_census
+
+        def _sleep(self, **kw):
+            started.set()
+            return real_sleep(self, **kw)
+
+        def _census(self, result):
+            events.append("census")
+            return real_census(self, result)
+
+        monkeypatch.setattr(BeamMemory, "sleep", _sleep)
+        monkeypatch.setattr(BeamMemory, "_attach_fleet_conflict_census", _census)
+        sweep = threading.Thread(target=lambda: beam.sleep_all_sessions(
+            max_sessions=2, require_host_llm=True, session_lock=lock))
+        sweep.start()
+        assert started.wait(10)
+        # Let the first session finish so the waiter arrives during the last one.
+        time.sleep(0.5)
+
+        def _waiter():
+            with lock:
+                events.append("waiter")
+
+        waiter = threading.Thread(target=_waiter)
+        waiter.start()
+        waiter.join(60)
+        sweep.join(60)
+        assert events[:2] == ["waiter", "census"], events
     finally:
         set_host_llm_backend(None)

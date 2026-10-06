@@ -13083,13 +13083,20 @@ class BeamMemory:
                     session_id, exc, exc_info=True,
                 )
                 errors.append({"session_id": session_id, "error": repr(exc)})
-            if session_lock is not None and attempted < len(session_rows):
+            if session_lock is not None:
                 # CPython locks are unfair: without a yield the loop
                 # re-acquires before a waiter wakes, starving it for the
                 # whole sweep. 10 ms (2x the 5 ms GIL switch interval) hands
                 # off reliably in the P4 probe; 0 ms never did. It counts
                 # toward time_budget elapsed, which is negligible.
-                time.sleep(_SESSION_LOCK_YIELD_SECONDS)
+                # Also runs after the last session so the fleet census
+                # below does not starve a waiter either. Tunable live via
+                # MNEMOSYNE_SLEEP_LOCK_YIELD (float seconds).
+                try:
+                    _y = float(os.environ.get("MNEMOSYNE_SLEEP_LOCK_YIELD", _SESSION_LOCK_YIELD_SECONDS))
+                except ValueError:
+                    _y = _SESSION_LOCK_YIELD_SECONDS
+                time.sleep(_y)
 
         # Run tiered degradation after all-sessions consolidation. The
         # unattended host-LLM sweep skips both passes: they run outside the
