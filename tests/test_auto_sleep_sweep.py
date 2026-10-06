@@ -399,3 +399,52 @@ def test_auto_sleep_warns_when_sweep_lock_held_too_long(monkeypatch, caplog):
         Provider._SWEEP_LOCK.release()
     assert "previous sweep may be hung" in caplog.text
     sweep_beam.sleep_all_sessions.assert_not_called()
+
+
+def test_sweep_yields_lock_so_waiters_acquire_between_sessions(temp_db, monkeypatch):
+    """CPython locks are unfair: releasing and immediately re-taking the Beam lock
+    starves a waiting thread for the whole sweep. Each waiter that arrives
+    mid-sweep must get the lock within one session, not after the sweep.
+    Three sequential waiters: an unfair re-acquire can win the race once by luck,
+    not three times."""
+    def _slow(prompt, **kwargs):
+        time.sleep(0.3)
+        return "LLM SUMMARY"
+
+    monkeypatch.setattr(local_llm, "LLM_ENABLED", True)
+    monkeypatch.setattr(local_llm, "HOST_LLM_ENABLED", True)
+    set_host_llm_backend(CallableLLMBackend("slow-host", _slow))
+    try:
+        beam = BeamMemory(session_id="current", db_path=temp_db)
+        _insert(temp_db, [(f"r{i}", f"s{i}", 400 + i) for i in range(6)])
+        lock = threading.RLock()
+        started = threading.Event()
+        done = []
+        real_sleep = BeamMemory.sleep
+
+        def _counting_sleep(self, **kw):
+            started.set()
+            out = real_sleep(self, **kw)
+            done.append(1)
+            return out
+
+        monkeypatch.setattr(BeamMemory, "sleep", _counting_sleep)
+        sweep = threading.Thread(target=lambda: beam.sleep_all_sessions(
+            max_sessions=6, require_host_llm=True, session_lock=lock))
+        sweep.start()
+        assert started.wait(10)
+        for _ in range(3):
+            n0, at_acquire = len(done), []
+
+            def _waiter():
+                with lock:
+                    at_acquire.append(len(done))
+
+            waiter = threading.Thread(target=_waiter)
+            waiter.start()
+            waiter.join(60)
+            assert at_acquire, "waiter never acquired the lock"
+            assert at_acquire[0] - n0 <= 1, "waiter starved across multiple sessions"
+        sweep.join(60)
+    finally:
+        set_host_llm_backend(None)

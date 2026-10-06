@@ -5598,6 +5598,8 @@ def _cross_session_max_llm_validations() -> int:
         return _CROSS_SESSION_MAX_LLM_VALIDATIONS
 
 
+_SESSION_LOCK_YIELD_SECONDS = 0.01
+
 class BeamMemory:
     """
     BEAM memory interface.
@@ -13081,6 +13083,13 @@ class BeamMemory:
                     session_id, exc, exc_info=True,
                 )
                 errors.append({"session_id": session_id, "error": repr(exc)})
+            if session_lock is not None and attempted < len(session_rows):
+                # CPython locks are unfair: without a yield the loop
+                # re-acquires before a waiter wakes, starving it for the
+                # whole sweep. 10 ms (2x the 5 ms GIL switch interval) hands
+                # off reliably in the P4 probe; 0 ms never did. It counts
+                # toward time_budget elapsed, which is negligible.
+                time.sleep(_SESSION_LOCK_YIELD_SECONDS)
 
         # Run tiered degradation after all-sessions consolidation. The
         # unattended host-LLM sweep skips both passes: they run outside the
