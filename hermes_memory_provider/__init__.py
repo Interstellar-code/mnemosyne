@@ -268,6 +268,9 @@ from mnemosyne.core.prefetch import (  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
+# Below Hermes's 8 s prefetch cap.
+_PREFETCH_LOCK_TIMEOUT_S = 5.0
+
 # ---------------------------------------------------------------------------
 # C13: provider-active flag for memory-context double-injection prevention.
 # ---------------------------------------------------------------------------
@@ -2254,8 +2257,19 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # Keep every Beam-backed source on the durable provider scope. Some
         # sources run after _prefetch_bank(), so locking only that helper would
         # let scoped replay leak its temporary session into prompt context.
-        with self._ensure_beam_access_lock():
+        # Bounded wait: Hermes caps prefetch at 8 s and then skips the provider
+        # until the call returns, so never block on a long lock holder (sleep).
+        lock = self._ensure_beam_access_lock()
+        if not lock.acquire(timeout=_PREFETCH_LOCK_TIMEOUT_S):
+            logger.warning(
+                "prefetch: Beam lock busy for %.0fs; skipping memory this turn",
+                _PREFETCH_LOCK_TIMEOUT_S,
+            )
+            return ""
+        try:
             return self._prefetch_locked(query, session_id=session_id)
+        finally:
+            lock.release()
 
     def _prefetch_locked(self, query: str, *, session_id: str = "") -> str:
         """Recall relevant context for injection, driven by the active profile.
@@ -3040,6 +3054,17 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         (fall through to raw Mnemosyne dispatch)."""
         self._ensure_contract()
         safety = self._safety
+
+        # Explicit dry_run=true must preview even with the safety gate off.
+        # mnemosyne_import honours dry_run natively, so it keeps its own path.
+        from .safety import WRITE_TOOLS
+
+        if (
+            tool_name in WRITE_TOOLS
+            and tool_name != "mnemosyne_import"
+            and bool(args.get("dry_run"))
+        ):
+            return safety.guard(tool_name, args, lambda: self._dispatch_raw(tool_name, args))
 
         # Tier 3 wiki tools -------------------------------------------------
         if tool_name == "memory_show_page":

@@ -160,8 +160,9 @@ class SafetyGate:
              invalidate token and call apply_fn().
           5. dry_run=False, non-destructive → call apply_fn().
         """
-        # Step 0 – disabled gate is a transparent passthrough
-        if not self._enabled:
+        # Step 0 – disabled gate is a transparent passthrough, except that an
+        # explicit dry_run=true on a write tool must still preview, never write.
+        if not self._enabled and not (tool_name in WRITE_TOOLS and bool(args.get("dry_run"))):
             return apply_fn()
 
         # Step 1 – non-write passthrough
