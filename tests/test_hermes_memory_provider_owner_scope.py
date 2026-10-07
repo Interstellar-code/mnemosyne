@@ -35,3 +35,13 @@ def test_sync_turn_stays_session_scoped_under_global_default(tmp_path, monkeypat
     conv = [c for c in calls if c.get("source") == "conversation"]
     assert len(conv) == 2
     assert {c["scope"] for c in conv} == {"session"}
+
+
+def test_session_end_sleep_beam_inherits_canonical_owner(tmp_path, monkeypatch):
+    from mnemosyne.core.beam import BeamMemory
+
+    p = _provider(tmp_path, monkeypatch)
+    seen = []
+    monkeypatch.setattr(BeamMemory, "sleep", lambda self, *a, **k: seen.append(self.canonical_owner_id))
+    p.on_session_end([])
+    assert seen == ["hermes-switch"]
