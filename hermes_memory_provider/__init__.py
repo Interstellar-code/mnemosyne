@@ -2520,7 +2520,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                         content=stored_user,
                         source="conversation",
                         importance=0.5,
-                        scope=self._default_scope,
+                        scope="session",
                         extract_entities=True,
                         _write_policy_content=user_content,
                     )
@@ -2536,7 +2536,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                         content=stored_assistant,
                         source="conversation",
                         importance=0.15,
-                        scope=self._default_scope,
+                        scope="session",
                         extract_entities=True,
                         _write_policy_content=assistant_content,
                     )
@@ -2760,6 +2760,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                         BeamClass = _get_beam_class()
                         with beam_lock:
                             sleep_beam = BeamClass(**sleep_args)
+                            sleep_beam.canonical_owner_id = self._canonical_owner()
+                            sleep_beam.agent_context = self._agent_context
                             if not sweep:
                                 sleep_beam.sleep()
                                 return
@@ -4736,6 +4738,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                     with beam_lock:
                         BeamClass = _get_beam_class()
                         sleep_beam = BeamClass(**sleep_args)
+                        sleep_beam.canonical_owner_id = self._canonical_owner()
+                        sleep_beam.agent_context = self._agent_context
                         sleep_beam.sleep()
                 except Exception as inner:
                     logger.warning("Mnemosyne session-end sleep failed: %s", inner)

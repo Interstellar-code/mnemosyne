@@ -112,7 +112,7 @@ class TestLegacyDefaultScope:
         )
 
     def test_sync_turn_passes_default_scope_user(self, monkeypatch):
-        """sync_turn passes _default_scope to beam.remember for user content."""
+        """sync_turn keeps user turns session-scoped even when _default_scope is global."""
         from hermes_memory_provider import MnemosyneMemoryProvider
 
         provider = MnemosyneMemoryProvider()
@@ -128,13 +128,13 @@ class TestLegacyDefaultScope:
 
         # First call is for user content
         user_call = beam.remember.call_args_list[0]
-        assert user_call.kwargs.get("scope") == "global", (
-            f"sync_turn should pass _default_scope for user content; "
+        assert user_call.kwargs.get("scope") == "session", (
+            f"sync_turn must keep user turns session-scoped regardless of _default_scope; "
             f"got scope={user_call.kwargs.get('scope')!r}"
         )
 
     def test_sync_turn_passes_default_scope_assistant(self, monkeypatch):
-        """sync_turn passes _default_scope to beam.remember for assistant content."""
+        """sync_turn keeps assistant turns session-scoped even when _default_scope is global."""
         from hermes_memory_provider import MnemosyneMemoryProvider
 
         provider = MnemosyneMemoryProvider()
@@ -150,8 +150,8 @@ class TestLegacyDefaultScope:
 
         # Second call is for assistant content
         assistant_call = beam.remember.call_args_list[1]
-        assert assistant_call.kwargs.get("scope") == "global", (
-            f"sync_turn should pass _default_scope for assistant content; "
+        assert assistant_call.kwargs.get("scope") == "session", (
+            f"sync_turn must keep assistant turns session-scoped regardless of _default_scope; "
             f"got scope={assistant_call.kwargs.get('scope')!r}"
         )
 
