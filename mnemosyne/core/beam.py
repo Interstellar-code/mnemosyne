@@ -12323,7 +12323,8 @@ class BeamMemory:
 
     def sleep(self, dry_run: bool = False, force: bool = False,
               allow_aaak: bool = True, run_maintenance: bool = True,
-              _fleet_census: bool = True) -> Dict:
+              _fleet_census: bool = True,
+              min_age_hours: Optional[float] = None) -> Dict:
         """
         Consolidate old working_memory for this session into episodic summaries.
         Uses a local lightweight LLM when available; falls back to aaak
@@ -12348,6 +12349,7 @@ class BeamMemory:
 
         When force=True, skips the age cutoff and consolidates all
         non-consolidated working memories immediately regardless of age.
+        min_age_hours overrides SLEEP_AGE_HOURS for this call only.
 
         Post-E8b (additive): every sleep pass also emits
         ``fleet_conflict_census`` — a read-only cross-bank census of conflict
@@ -12367,7 +12369,7 @@ class BeamMemory:
         cursor = self.conn.cursor()
         _cutoff_raw = (
             datetime.now(timezone.utc)
-            - timedelta(hours=SLEEP_AGE_HOURS)
+            - timedelta(hours=SLEEP_AGE_HOURS if min_age_hours is None else min_age_hours)
         ).isoformat()
         if force:
             # Skip age cutoff: consolidate all non-consolidated working memories
@@ -13002,7 +13004,8 @@ class BeamMemory:
                            max_sessions: Optional[int] = None,
                            time_budget_seconds: Optional[float] = None,
                            require_host_llm: bool = False,
-                           session_lock=None) -> Dict:
+                           session_lock=None,
+                           min_age_hours: Optional[float] = None) -> Dict:
         """
         Consolidate eligible old working memories across all sessions.
 
@@ -13025,6 +13028,9 @@ class BeamMemory:
         session_lock (optional context manager) is held around each single
         session's sleep and released between sessions, so a host serializing
         Beam access (#498) is blocked for one session at a time, not the sweep.
+
+        min_age_hours overrides SLEEP_AGE_HOURS for this sweep only (the
+        nightly run passes its own cutoff; the module global is never mutated).
         """
         import time
         from mnemosyne.core import local_llm
@@ -13036,7 +13042,7 @@ class BeamMemory:
             cursor = self.conn.cursor()
             _cutoff_raw = (
                 datetime.now(timezone.utc)
-                - timedelta(hours=SLEEP_AGE_HOURS)
+                - timedelta(hours=SLEEP_AGE_HOURS if min_age_hours is None else min_age_hours)
             ).isoformat()
             if force:
                 _cutoff_raw = datetime.max.isoformat()
@@ -13132,7 +13138,8 @@ class BeamMemory:
                     result = beam.sleep(dry_run=dry_run, force=force,
                                         allow_aaak=not require_host_llm,
                                         run_maintenance=not require_host_llm,
-                                        _fleet_census=False)
+                                        _fleet_census=False,
+                                        min_age_hours=min_age_hours)
                 result = dict(result)
                 result["session_id"] = session_id
                 result["eligible"] = row["eligible"] if hasattr(row, "keys") else row[1]

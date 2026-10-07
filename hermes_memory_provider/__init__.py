@@ -1359,6 +1359,148 @@ def _parse_env_optional_int(key: str, default: Optional[int]) -> Optional[int]:
     return _coerce_optional_int(os.environ.get(key), default)
 
 
+def _run_cross_session_sweep(sleep_args: Dict[str, Any], owner: str, agent_context: str, beam_lock,
+                             *, max_sessions: Optional[int], time_budget: Optional[float],
+                             min_age_hours: Optional[float] = None) -> Dict[str, Any]:
+    """Bounded host-LLM-only sleep_all_sessions() sweep. Caller holds _SWEEP_LOCK.
+
+    Shared by the every-N-turns auto-sleep and the nightly run. The sweep
+    beam carries the profile's canonical owner and agent context so model
+    refresh never writes owner "default" (alien beams inherit both)."""
+    from mnemosyne.core.beam import CONSOLIDATION_RETRY_BACKOFF_SECONDS
+    with beam_lock:
+        sleep_beam = _get_beam_class()(**sleep_args)
+        sleep_beam.canonical_owner_id = owner
+        sleep_beam.agent_context = agent_context
+        # Claims left by a sleep killed mid-run (e.g. a session-end thread
+        # outliving its process) are never retried otherwise. 6h staleness:
+        # well past any sweep's time budget, so in-flight claims are never stolen.
+        sleep_beam.reclaim_orphans(stale_after_seconds=CONSOLIDATION_RETRY_BACKOFF_SECONDS)
+    extra = {} if min_age_hours is None else {"min_age_hours": min_age_hours}
+    return sleep_beam.sleep_all_sessions(
+        max_sessions=max_sessions,
+        time_budget_seconds=time_budget,
+        require_host_llm=True,
+        session_lock=beam_lock,
+        **extra,
+    )
+
+
+# --- Nightly consolidation ---------------------------------------------------
+# One timer per DB per process: a gateway builds one provider instance per
+# agent session (agent/agent_init.py _init_memory -> load_memory_provider), so
+# the timer is keyed by db_path, not owned by an instance. It outlives idle
+# agent eviction (evicted agents are GC'd without shutdown()) and stops when the
+# last active primary provider shuts down, with the host LLM backend.
+_NIGHTLY_JOBS: Dict[str, Dict[str, Any]] = {}
+_NIGHTLY_JOBS_LOCK = threading.Lock()
+_NIGHTLY_POLL_SECONDS = 300.0
+# Last-run local date, in the DB so a restart (or a second process on the same
+# DB) never double-runs a night.
+_NIGHTLY_META_KEY = "nightly_sleep_last_run"
+
+
+def _nightly_now() -> datetime:
+    """Local wall clock (tests monkeypatch this)."""
+    return datetime.now()
+
+
+def _nightly_day_open(db_path: str, day: str, *, claim: bool) -> bool:
+    """True if `day` (YYYY-MM-DD) has no nightly run yet; claim=True claims it atomically."""
+    import sqlite3
+    from mnemosyne.migrations.e7_311_tables import _SYNC_META_DDL
+    conn = sqlite3.connect(db_path, timeout=30)
+    try:
+        conn.execute(_SYNC_META_DDL)
+        if not claim:
+            row = conn.execute("SELECT value FROM sync_meta WHERE key = ?", (_NIGHTLY_META_KEY,)).fetchone()
+            return row is None or (row[0] or "") < day
+        conn.execute("INSERT OR IGNORE INTO sync_meta (key, value) VALUES (?, '')", (_NIGHTLY_META_KEY,))
+        cur = conn.execute("UPDATE sync_meta SET value = ? WHERE key = ? AND value < ?",
+                           (day, _NIGHTLY_META_KEY, day))
+        conn.commit()
+        return cur.rowcount == 1
+    finally:
+        conn.close()
+
+
+def _default_owner_fact_count(db_path: str) -> int:
+    import sqlite3
+    conn = sqlite3.connect(db_path, timeout=30)
+    try:
+        return conn.execute("SELECT count(*) FROM canonical_facts "
+                            "WHERE owner_id = 'default' AND valid_until IS NULL").fetchone()[0]
+    except sqlite3.OperationalError:  # no canonical_facts table yet
+        return 0
+    finally:
+        conn.close()
+
+
+def _nightly_tick(job: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Run the nightly sweep if due; returns its result, or None when skipped."""
+    now = _nightly_now()
+    if now.hour < job["hour"]:
+        return None
+    day = now.date().isoformat()
+    if not _nightly_day_open(job["db_path"], day, claim=False):
+        return None
+    from mnemosyne.core import local_llm
+    if not local_llm._host_backend_will_handle_call():
+        # Never burn the day's claim without the host LLM; retried next tick.
+        logger.debug("Mnemosyne nightly sleep: no host LLM backend, deferring")
+        return None
+    provider_cls = MnemosyneMemoryProvider
+    if not provider_cls._SWEEP_LOCK.acquire(blocking=False):
+        logger.debug("Mnemosyne nightly sleep: a sweep is already running, deferring")
+        return None
+    provider_cls._SWEEP_HELD_SINCE = time.monotonic()
+    try:
+        if not _nightly_day_open(job["db_path"], day, claim=True):
+            return None
+        logger.info("Mnemosyne nightly sleep starting: db=%s age>=%sh budget=%ss max_sessions=%s",
+                    job["db_path"], job["age_hours"], job["time_budget"], job["max_sessions"])
+        result = _run_cross_session_sweep(
+            job["sleep_args"], job["owner"], job["agent_context"], job["beam_lock"],
+            max_sessions=job["max_sessions"], time_budget=job["time_budget"],
+            min_age_hours=job["age_hours"],
+        )
+        logger.info(
+            "Mnemosyne nightly sleep: sessions=%s items=%s summaries=%s llm=%s errors=%s stopped=%s",
+            result.get("sessions_consolidated"), result.get("items_consolidated"),
+            result.get("summaries_created"), result.get("llm_used"), result.get("errors"),
+            result.get("stopped_reason"),
+        )
+        stray = _default_owner_fact_count(job["db_path"])
+        if stray:
+            logger.warning("Mnemosyne nightly sleep: %d current canonical facts under owner 'default' "
+                           "(profile owner is %r)", stray, job["owner"])
+        return result
+    finally:
+        provider_cls._SWEEP_HELD_SINCE = None
+        provider_cls._SWEEP_LOCK.release()
+
+
+def _nightly_loop(job: Dict[str, Any]) -> None:
+    # Waits first: a short-lived process (CLI one-shot) never reaches a tick.
+    while not job["stop"].wait(_NIGHTLY_POLL_SECONDS):
+        try:
+            _nightly_tick(job)
+        except Exception as exc:
+            logger.warning("Mnemosyne nightly sleep failed: %s", exc, exc_info=True)
+
+
+def _stop_nightly_timers(timeout: float) -> None:
+    with _NIGHTLY_JOBS_LOCK:
+        jobs = list(_NIGHTLY_JOBS.values())
+        _NIGHTLY_JOBS.clear()
+    for job in jobs:
+        job["stop"].set()
+    for job in jobs:
+        # A sweep in flight finishes its current session; the per-session
+        # host-LLM check then stops it once the backend is unregistered.
+        job["thread"].join(timeout)
+
+
 class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
     """Mnemosyne native memory — local SQLite with vector + FTS5 hybrid search."""
 
@@ -1485,6 +1627,12 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # Negative max_sessions disables the cap.
         self._sweep_max_sessions = _parse_env_optional_int("MNEMOSYNE_SLEEP_SWEEP_MAX_SESSIONS", 10)
         self._sweep_time_budget = _parse_env_float("MNEMOSYNE_SLEEP_SWEEP_TIME_BUDGET", 120.0)
+        # Nightly cross-session consolidation (see _ensure_nightly_timer).
+        self._nightly_enabled = _parse_env_bool("MNEMOSYNE_NIGHTLY_SLEEP_ENABLED", False)
+        self._nightly_hour = _parse_env_float("MNEMOSYNE_NIGHTLY_SLEEP_HOUR", 3.0)
+        self._nightly_age_hours = _parse_env_float("MNEMOSYNE_NIGHTLY_SLEEP_AGE_HOURS", 24.0)
+        self._nightly_time_budget = _parse_env_float("MNEMOSYNE_NIGHTLY_SLEEP_TIME_BUDGET", 1800.0)
+        self._nightly_max_sessions = _parse_env_optional_int("MNEMOSYNE_NIGHTLY_SLEEP_MAX_SESSIONS", None)
         # Reflection/sleep guardrails.  "reflection" maps to Mnemosyne's
         # sleep/consolidation path in the Hermes provider.  Cron skipping is
         # default-on per issue #337; max_calls_per_session defaults to 3 and
@@ -1704,6 +1852,23 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             except (TypeError, ValueError):
                 logger.warning("Mnemosyne: invalid sleep_sweep_time_budget=%r, keeping %s",
                                sweep_budget, self._sweep_time_budget)
+
+        # nightly consolidation: kwargs > config.yaml > env/defaults (__init__)
+        def _cfg(key):
+            val = kwargs.get(key)
+            return self._read_config_key(key) if val is None else val
+        self._nightly_enabled = _coerce_bool(_cfg("nightly_sleep_enabled"), getattr(self, "_nightly_enabled", False))
+        for key, attr in (("nightly_sleep_hour", "_nightly_hour"),
+                          ("nightly_sleep_age_hours", "_nightly_age_hours"),
+                          ("nightly_sleep_time_budget", "_nightly_time_budget")):
+            raw = _cfg(key)
+            if raw is not None:
+                try:
+                    setattr(self, attr, float(raw))
+                except (TypeError, ValueError):
+                    logger.warning("Mnemosyne: invalid %s=%r, keeping %s", key, raw, getattr(self, attr, None))
+        self._nightly_max_sessions = _coerce_optional_int(_cfg("nightly_sleep_max_sessions"),
+                                                          getattr(self, "_nightly_max_sessions", None))
 
         # reflect guardrails: prefer kwargs, then memory.mnemosyne.reflect,
         # then flat memory.mnemosyne keys, then env/defaults set in __init__.
@@ -1962,7 +2127,12 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
 
     def get_config_schema(self) -> List[Dict[str, Any]]:
         return [
-            {"key": "auto_sleep", "description": "Auto-run sleep() when working memory exceeds threshold. Set false to disable. Backward-compatible with MNEMOSYNE_AUTO_SLEEP_ENABLED env var.", "default": True},
+            {"key": "auto_sleep", "description": "Every-10-turns auto-sleep when working memory exceeds threshold (the only thing it gates: session-end sleep and the nightly run are unaffected). Set false to disable. Backward-compatible with MNEMOSYNE_AUTO_SLEEP_ENABLED env var.", "default": True},
+            {"key": "nightly_sleep_enabled", "description": "Run one cross-session consolidation sweep per local day from the gateway process (host LLM only). Env: MNEMOSYNE_NIGHTLY_SLEEP_ENABLED.", "default": False},
+            {"key": "nightly_sleep_hour", "description": "Local hour (0-23) at/after which the nightly sweep runs; a missed night runs on the first check after. Env: MNEMOSYNE_NIGHTLY_SLEEP_HOUR.", "default": 3},
+            {"key": "nightly_sleep_age_hours", "description": "Nightly sweep consolidates working memories older than this many hours. Env: MNEMOSYNE_NIGHTLY_SLEEP_AGE_HOURS.", "default": 24},
+            {"key": "nightly_sleep_time_budget", "description": "Seconds after which the nightly sweep stops starting new sessions. Env: MNEMOSYNE_NIGHTLY_SLEEP_TIME_BUDGET.", "default": 1800},
+            {"key": "nightly_sleep_max_sessions", "description": "Max sessions per nightly sweep; unset or negative = no cap. Env: MNEMOSYNE_NIGHTLY_SLEEP_MAX_SESSIONS.", "default": None},
             {"key": "sleep_threshold", "description": "Working memory count before auto-sleep triggers", "default": 50},
             {"key": "recall_include_canonical", "description": "Merge the profile's current canonical facts matching the query into mnemosyne_recall results (ranked first, max 3) and prefetch context. Env: MNEMOSYNE_RECALL_INCLUDE_CANONICAL.", "default": True},
             {"key": "sleep_sweep_max_sessions", "description": "Max sessions (oldest first) consolidated per cross-session auto-sleep sweep. Negative disables the cap. Env: MNEMOSYNE_SLEEP_SWEEP_MAX_SESSIONS.", "default": 10},
@@ -2219,6 +2389,49 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                     self._wiki.start_polling()
             except Exception as exc:
                 logger.warning("matrix-memory contract init skipped: %s", exc)
+            # Cron/subagent/passive instances never own the nightly timer.
+            if not self._implicit_memory_off():
+                self._ensure_nightly_timer()
+
+    def _ensure_nightly_timer(self) -> None:
+        """Start the per-DB nightly consolidation timer once per process.
+
+        Off the chat path: a daemon thread that wakes every
+        _NIGHTLY_POLL_SECONDS and runs the shared cross-session sweep once per
+        local day. Config, owner and the Beam lock are snapshotted from the
+        first primary instance on this DB."""
+        beam = self._beam
+        if not getattr(self, "_nightly_enabled", False) or beam is None:
+            return
+        db_path = str(beam.db_path)
+        with _NIGHTLY_JOBS_LOCK:
+            job = _NIGHTLY_JOBS.get(db_path)
+            if job is not None and job["thread"].is_alive():
+                return
+            job = {
+                "db_path": db_path,
+                "sleep_args": {
+                    "session_id": beam.session_id,
+                    "db_path": beam.db_path,
+                    "author_id": beam.author_id,
+                    "author_type": beam.author_type,
+                    "channel_id": beam.channel_id,
+                },
+                "owner": self._canonical_owner(),
+                "agent_context": self._agent_context,
+                "beam_lock": self._ensure_beam_access_lock(),
+                "hour": self._nightly_hour,
+                "age_hours": self._nightly_age_hours,
+                "time_budget": self._nightly_time_budget,
+                "max_sessions": self._nightly_max_sessions,
+                "stop": threading.Event(),
+            }
+            job["thread"] = threading.Thread(target=_nightly_loop, args=(job,),
+                                             name="mnemosyne-nightly-sleep", daemon=True)
+            _NIGHTLY_JOBS[db_path] = job
+            job["thread"].start()
+        logger.info("Mnemosyne nightly sleep timer started: db=%s hour=%s owner=%s",
+                    db_path, job["hour"], job["owner"])
 
 
     def system_prompt_block(self) -> str:
@@ -2775,26 +2988,17 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 time_budget = self._sweep_time_budget
                 def _sleep_isolated():
                     try:
-                        BeamClass = _get_beam_class()
-                        with beam_lock:
-                            sleep_beam = BeamClass(**sleep_args)
-                            sleep_beam.canonical_owner_id = self._canonical_owner()
-                            sleep_beam.agent_context = self._agent_context
-                            if not sweep:
+                        if not sweep:
+                            BeamClass = _get_beam_class()
+                            with beam_lock:
+                                sleep_beam = BeamClass(**sleep_args)
+                                sleep_beam.canonical_owner_id = self._canonical_owner()
+                                sleep_beam.agent_context = self._agent_context
                                 sleep_beam.sleep()
-                                return
-                            # Claims left by a sleep killed mid-run (e.g. a
-                            # session-end thread outliving its process) are
-                            # never retried otherwise.
-                            # 6h staleness: well past any sweep's time budget,
-                            # so an in-flight sleep's claims are never stolen.
-                            from mnemosyne.core.beam import CONSOLIDATION_RETRY_BACKOFF_SECONDS
-                            sleep_beam.reclaim_orphans(stale_after_seconds=CONSOLIDATION_RETRY_BACKOFF_SECONDS)
-                        result = sleep_beam.sleep_all_sessions(
-                            max_sessions=max_sessions,
-                            time_budget_seconds=time_budget,
-                            require_host_llm=True,
-                            session_lock=beam_lock,
+                            return
+                        result = _run_cross_session_sweep(
+                            sleep_args, self._canonical_owner(), self._agent_context, beam_lock,
+                            max_sessions=max_sessions, time_budget=time_budget,
                         )
                         logger.info(
                             "Mnemosyne auto-sleep sweep: sessions=%s items=%s llm=%s stopped=%s",
@@ -4888,6 +5092,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # other sessions and any in-flight auto-sleep sweep (#252).
         # Skip and passive contexts (cron runs inside the gateway) never unregister it.
         if not self._implicit_memory_off() and _active_provider_count == 0:
+            # The nightly timer lives exactly as long as the host backend it needs.
+            _stop_nightly_timers(self.SHUTDOWN_DRAIN_TIMEOUT_SECONDS)
             try:
                 from hermes_memory_provider.hermes_llm_adapter import unregister_hermes_host_llm
                 unregister_hermes_host_llm()
