@@ -380,6 +380,9 @@ def _default_db_path() -> Path:
 EMBEDDING_DIM = _embeddings.EMBEDDING_DIM
 WORKING_MEMORY_MAX_ITEMS = int(os.environ.get("MNEMOSYNE_WM_MAX_ITEMS", "10000"))
 WORKING_MEMORY_TTL_HOURS = int(os.environ.get("MNEMOSYNE_WM_TTL_HOURS", "168"))
+# Min age before sleep consolidates a row. Decoupled from the TTL so raising the
+# TTL (to stop trim deleting unconsolidated rows) does not also stop consolidation.
+SLEEP_AGE_HOURS = int(os.environ.get("MNEMOSYNE_SLEEP_AGE_HOURS", str(WORKING_MEMORY_TTL_HOURS // 2)))
 WM_BUMP_CAP_HOURS = int(os.environ.get("MNEMOSYNE_WM_BUMP_CAP_HOURS", "24"))
 WM_PINNED_IDS = set(
     pid.strip() for pid in os.environ.get("MNEMOSYNE_WM_PINNED_IDS", "").split(",")
@@ -9041,7 +9044,11 @@ class BeamMemory:
             ratio = sum(weight[t] for t in hit) / total
             # >= 2 distinct hits (when the query has 2+ tokens) stops one rare
             # word alone ("live") from carrying a row.
-            if len(hit) >= min(2, len(q)) and ratio >= min_ratio:
+            # At least one matched token must be uncommon across the owner's
+            # cards, so words on many cards ("rohit", "live") cannot carry a row.
+            # (Skipped for tiny owners: with <4 cards every word is "common".)
+            rare = len(rows) < 4 or any(df[t] <= len(rows) / (3 if len(q) == 1 else 2) for t in hit)
+            if len(hit) >= min(2, len(q)) and ratio >= min_ratio and rare:
                 scored.append((ratio, len(label_hit), float(row.get("confidence") or 0.0), row))
         scored.sort(key=lambda s: s[:3], reverse=True)
         return [
@@ -12360,7 +12367,7 @@ class BeamMemory:
         cursor = self.conn.cursor()
         _cutoff_raw = (
             datetime.now(timezone.utc)
-            - timedelta(hours=WORKING_MEMORY_TTL_HOURS // 2)
+            - timedelta(hours=SLEEP_AGE_HOURS)
         ).isoformat()
         if force:
             # Skip age cutoff: consolidate all non-consolidated working memories
@@ -13029,7 +13036,7 @@ class BeamMemory:
             cursor = self.conn.cursor()
             _cutoff_raw = (
                 datetime.now(timezone.utc)
-                - timedelta(hours=WORKING_MEMORY_TTL_HOURS // 2)
+                - timedelta(hours=SLEEP_AGE_HOURS)
             ).isoformat()
             if force:
                 _cutoff_raw = datetime.max.isoformat()

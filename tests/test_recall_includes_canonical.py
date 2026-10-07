@@ -76,3 +76,22 @@ def test_low_overlap_rows_not_returned(tmp_path, monkeypatch):
     p = _provider(tmp_path, monkeypatch)
     # one of four meaningful tokens ("india") -> below the 0.5 threshold
     assert p._beam.canonical_hits("India cooking recipes vegetarian", "hermes-switch") == []
+
+
+def test_canonical_hits_are_additive_to_limit(tmp_path, monkeypatch):
+    p = _provider(tmp_path, monkeypatch)
+    for i in range(4):
+        p._beam.remember(f"Air India flight note {i} BLR DEL", source="conversation", importance=0.5)
+    res = _recall(p, "Which Air India flights are BLR-DEL?", limit=2)
+    assert [r["source"] for r in res][0] == "canonical"
+    assert sum(r["source"] != "canonical" for r in res) == 2
+
+
+def test_common_owner_word_alone_does_not_match(tmp_path, monkeypatch):
+    p = _provider(tmp_path, monkeypatch)
+    store = p._beam.canonical
+    store.remember("hermes-switch", "model:user", "identity", "Rohit lives in Waldkirch, Germany.")
+    for name in ("subshero", "switchui", "lifeplan", "construct"):
+        store.remember("hermes-switch", "project", name, f"Rohit project {name}, live at https://{name}.example")
+    hits = p._beam.canonical_hits("where does Rohit live", "hermes-switch")
+    assert not [h for h in hits if h["category"] == "project"]

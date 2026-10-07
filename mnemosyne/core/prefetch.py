@@ -480,7 +480,9 @@ def render_canonical_facts(beam: Any, query: str, profile: "PrefetchProfile", *,
     except Exception as e:
         logger.debug("Mnemosyne canonical prefetch failed (non-fatal): %s", e)
         return ""
-    content_limit = _prefetch_content_char_limit() or profile.content_char_limit
+    # 600-char default: canonical bodies can run to several KB and this block is
+    # injected every turn when the profile sets no content limit.
+    content_limit = _prefetch_content_char_limit() or profile.content_char_limit or 600
     lines = ["## Mnemosyne Canonical Facts"]
     for h in hits:
         body = " ".join(_format_prefetch_content(h["content"], content_limit).split())

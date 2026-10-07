@@ -219,7 +219,7 @@ if str(_mnemosyne_root) not in sys.path:
     sys.path.insert(0, str(_mnemosyne_root))
 
 from mnemosyne.core.episodic_graph import GraphEdge
-from mnemosyne.core.beam import WORKING_MEMORY_TTL_HOURS
+from mnemosyne.core.beam import SLEEP_AGE_HOURS, WORKING_MEMORY_TTL_HOURS
 from mnemosyne.batch_tool import (
     BatchValidationError,
     apply_beam_batch,
@@ -2702,7 +2702,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         from mnemosyne.core import local_llm
         cutoff = (
             datetime.now(timezone.utc).replace(tzinfo=None)
-            - timedelta(hours=WORKING_MEMORY_TTL_HOURS // 2)
+            - timedelta(hours=SLEEP_AGE_HOURS)
         ).strftime("%Y-%m-%d %H:%M:%S")
         # With the Hermes host LLM backend (registered in initialize())
         # sweep old memories across ALL sessions -- sleep() alone strands
@@ -3416,7 +3416,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 seen = {norm(h["content"]) for h in hits}
                 for h in hits:
                     h["bank"] = "private"
-                results = (hits + [r for r in results if norm(r.get("content")) not in seen])[:top_k]
+                # Additive: canonical hits do not take normal result slots.
+                results = hits + [r for r in results if norm(r.get("content")) not in seen][:top_k]
             if explain_payload is not None:
                 explain_payload.setdefault("provider", {})["canonical_hits"] = len(hits)
 
