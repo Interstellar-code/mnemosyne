@@ -120,6 +120,18 @@ def test_sweep_caps_sessions_oldest_first_and_drains_over_runs(temp_db):
     assert _consolidated(temp_db)["c"]
 
 
+def test_sweep_alien_beams_inherit_canonical_owner(temp_db, monkeypatch):
+    beam = BeamMemory(session_id="current", db_path=temp_db)
+    beam.canonical_owner_id = "hermes-switch"
+    beam.agent_context = "cron"
+    _insert(temp_db, [("a", "s1", 400)])
+    seen = []
+    monkeypatch.setattr(BeamMemory, "sleep",
+                        lambda self, **k: seen.append((self.canonical_owner_id, self.agent_context)) or {})
+    beam.sleep_all_sessions(max_sessions=1)
+    assert seen == [("hermes-switch", "cron")]
+
+
 def test_sweep_time_budget_counts_attempted_sessions_including_errors(temp_db, monkeypatch):
     beam = BeamMemory(session_id="current", db_path=temp_db)
     _insert(temp_db, [("a", "s1", 400), ("b", "s2", 300)])

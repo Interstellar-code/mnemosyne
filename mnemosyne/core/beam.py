@@ -13058,6 +13058,10 @@ class BeamMemory:
                         author_id=self.author_id,
                         author_type=self.author_type,
                     )
+                    # Alien beams default canonical_owner_id to "default"; inherit
+                    # the caller's so model refresh writes into the right owner.
+                    beam.canonical_owner_id = self.canonical_owner_id
+                    beam.agent_context = self.agent_context
                     result = beam.sleep(dry_run=dry_run, force=force,
                                         allow_aaak=not require_host_llm,
                                         run_maintenance=not require_host_llm,
