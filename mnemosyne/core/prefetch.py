@@ -464,6 +464,33 @@ def render_model_slots(beam: Any, query: str, profile: "PrefetchProfile", *, can
     return "\n".join(lines) if len(lines) > 1 else ""
 
 
+def render_canonical_facts(beam: Any, query: str, profile: "PrefetchProfile", *,
+                           canonical_owner: str = "default", existing: str = "",
+                           limit: int = 3) -> str:
+    """Render the owner's current canonical facts matching ``query``.
+
+    Uses ``BeamMemory.canonical_hits`` (same matcher as tool recall). Lines use
+    the model-slot format so a fact already in ``existing`` (the model-slot
+    block) is skipped. Bounded: ``limit`` rows x content_char_limit.
+    """
+    if beam is None or not hasattr(beam, "canonical_hits"):
+        return ""
+    try:
+        hits = beam.canonical_hits(query, canonical_owner, limit=limit)
+    except Exception as e:
+        logger.debug("Mnemosyne canonical prefetch failed (non-fatal): %s", e)
+        return ""
+    content_limit = _prefetch_content_char_limit() or profile.content_char_limit
+    lines = ["## Mnemosyne Canonical Facts"]
+    for h in hits:
+        body = " ".join(_format_prefetch_content(h["content"], content_limit).split())
+        name = str(h.get("name") or "fact").replace("_", " ")
+        line = f"  [{h.get('category') or 'canonical'}] {name}: {body}"
+        if body and line not in existing:
+            lines.append(line)
+    return "\n".join(lines) if len(lines) > 1 else ""
+
+
 def render_bank_source(
     beam: Any,
     query: str,

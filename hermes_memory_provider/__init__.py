@@ -262,6 +262,7 @@ from mnemosyne.core.prefetch import (  # noqa: F401
     identity_rows,
     register_profile,
     render_bank_source,
+    render_canonical_facts,
     render_identity,
     render_model_slots,
 )
@@ -1478,6 +1479,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         }
         self._auto_sleep_threshold = 50
         self._auto_sleep_enabled = _parse_env_bool("MNEMOSYNE_AUTO_SLEEP_ENABLED", True)
+        # Merge matching current canonical facts into recall + prefetch.
+        self._recall_include_canonical = _parse_env_bool("MNEMOSYNE_RECALL_INCLUDE_CANONICAL", True)
         # Bounds for the cross-session auto-sleep sweep (oldest sessions first).
         # Negative max_sessions disables the cap.
         self._sweep_max_sessions = _parse_env_optional_int("MNEMOSYNE_SLEEP_SWEEP_MAX_SESSIONS", 10)
@@ -1667,6 +1670,13 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         if auto_sleep is not None:
             self._auto_sleep_enabled = _coerce_bool(auto_sleep, self._auto_sleep_enabled)
         # env var/default is already applied in __init__, so it is the base default
+
+        include_canonical = kwargs.get("recall_include_canonical")
+        if include_canonical is None:
+            include_canonical = self._read_config_key("recall_include_canonical")
+        if include_canonical is not None:
+            self._recall_include_canonical = _coerce_bool(
+                include_canonical, getattr(self, "_recall_include_canonical", True))
 
         # sleep_threshold: prefer kwargs, then config.yaml, then default 50
         sleep_threshold = kwargs.get("sleep_threshold")
@@ -1954,6 +1964,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         return [
             {"key": "auto_sleep", "description": "Auto-run sleep() when working memory exceeds threshold. Set false to disable. Backward-compatible with MNEMOSYNE_AUTO_SLEEP_ENABLED env var.", "default": True},
             {"key": "sleep_threshold", "description": "Working memory count before auto-sleep triggers", "default": 50},
+            {"key": "recall_include_canonical", "description": "Merge the profile's current canonical facts matching the query into mnemosyne_recall results (ranked first, max 3) and prefetch context. Env: MNEMOSYNE_RECALL_INCLUDE_CANONICAL.", "default": True},
             {"key": "sleep_sweep_max_sessions", "description": "Max sessions (oldest first) consolidated per cross-session auto-sleep sweep. Negative disables the cap. Env: MNEMOSYNE_SLEEP_SWEEP_MAX_SESSIONS.", "default": 10},
             {"key": "sleep_sweep_time_budget", "description": "Seconds after which a cross-session auto-sleep sweep stops starting new sessions. Env: MNEMOSYNE_SLEEP_SWEEP_TIME_BUDGET.", "default": 120},
             {"key": "reflect", "description": "Reflection/sleep guardrails. Supports disabled_for_cron (default true) and max_calls_per_session (default 3; negative disables cap). Env: MNEMOSYNE_REFLECT_DISABLED_FOR_CRON, MNEMOSYNE_REFLECT_MAX_CALLS_PER_SESSION.", "default": {"disabled_for_cron": True, "max_calls_per_session": 3}},
@@ -2312,6 +2323,13 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # strictly to the active session_id, deduplicated against whatever
         # recall already surfaced. No identity rows == no-op (legacy behavior).
         model_block = self._prefetch_model_slots(query, profile) if query.strip() else ""
+        if query.strip() and getattr(self, "_recall_include_canonical", True):
+            canonical_block = render_canonical_facts(
+                self._beam, query, profile,
+                canonical_owner=self._canonical_owner(), existing=model_block,
+            )
+            if canonical_block:
+                blocks.insert(0, canonical_block)
         if model_block:
             blocks.insert(0, model_block)
         identity_block = self._prefetch_identity(blocks, profile)
@@ -3384,6 +3402,23 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                         explain_payload.setdefault("provider", {})["shared_surface_untraced"] = len(surface_results)
                 except Exception as exc:
                     logger.warning("Mnemosyne shared surface recall failed: %s", exc)
+
+        # Canonical facts rank first (max 3, owner-scoped, current rows only);
+        # normal results whose content duplicates a hit are dropped.
+        if getattr(self, "_recall_include_canonical", True):
+            try:
+                hits = list(self._beam.canonical_hits(query, self._canonical_owner(), limit=min(3, top_k)))
+            except Exception as exc:
+                logger.debug("Mnemosyne canonical recall merge failed: %s", exc)
+                hits = []
+            if hits:
+                norm = lambda c: " ".join(str(c or "").split()).lower()
+                seen = {norm(h["content"]) for h in hits}
+                for h in hits:
+                    h["bank"] = "private"
+                results = (hits + [r for r in results if norm(r.get("content")) not in seen])[:top_k]
+            if explain_payload is not None:
+                explain_payload.setdefault("provider", {})["canonical_hits"] = len(hits)
 
         response = {
             "query": query,

@@ -9001,6 +9001,66 @@ class BeamMemory:
 
         return build_evidence_pack(primary_rows, candidate_rows, max_items=pack_k)
 
+    def canonical_hits(self, query: str, owner_id: Optional[str] = None, *,
+                       limit: int = 3, min_ratio: float = 0.5) -> List[Dict]:
+        """Current canonical facts of ``owner_id`` that lexically match ``query``.
+
+        Scores each current (``valid_until IS NULL``) row by the IDF-weighted
+        share of meaningful query tokens (``_recall_tokens``, stopwords dropped,
+        compounds like ``blr-del`` split) found in its category+name+body; IDF is
+        over the owner's own rows, so a word on every card (the user's name)
+        counts little. Rows below ``min_ratio``, or matching only one token of
+        a multi-token query, are dropped. Ties break on
+        category/name overlap, then confidence. Uses the Beam connection.
+        """
+        def toks(text: str) -> Set[str]:
+            out: Set[str] = set()
+            for t in _recall_tokens(text):
+                parts = [p for p in re.split(r"[_.:/+-]+", t) if _is_meaningful_recall_token(p)]
+                out.update(parts if len(parts) > 1 else [t])
+            return out
+
+        q = toks(query)
+        if not q or limit <= 0:
+            return []
+        owner = (owner_id or getattr(self, "canonical_owner_id", "") or "default").strip()
+
+        def overlap(row_toks: Set[str]) -> Set[str]:
+            # ponytail: plural-only folding ("live" ~ "lives"); real stemmer if needed.
+            return {t for t in q if t in row_toks or f"{t}s" in row_toks or f"{t}es" in row_toks}
+
+        rows = []
+        for row in self.canonical.list(owner):
+            label = toks(f"{row.get('category') or ''} {row.get('name') or ''}")
+            rows.append((row, overlap(label), overlap(label | toks(str(row.get("body") or "")))))
+        df = {t: sum(t in hit for _, _, hit in rows) for t in q}
+        weight = {t: math.log((len(rows) + 1) / (df[t] + 0.5)) for t in q}
+        total = sum(weight.values())
+        scored = []
+        for row, label_hit, hit in rows:
+            ratio = sum(weight[t] for t in hit) / total
+            # >= 2 distinct hits (when the query has 2+ tokens) stops one rare
+            # word alone ("live") from carrying a row.
+            if len(hit) >= min(2, len(q)) and ratio >= min_ratio:
+                scored.append((ratio, len(label_hit), float(row.get("confidence") or 0.0), row))
+        scored.sort(key=lambda s: s[:3], reverse=True)
+        return [
+            {
+                "id": f"canonical:{row['id']}",
+                "canonical_id": row["id"],
+                "content": row.get("body") or "",
+                "category": row.get("category"),
+                "name": row.get("name"),
+                "source": "canonical",
+                "tier": "canonical",
+                "score": round(ratio, 4),
+                "importance": row.get("confidence"),
+                "timestamp": row.get("valid_from"),
+                "version": row.get("version"),
+            }
+            for ratio, _, _, row in scored[:limit]
+        ]
+
     def recall(self, query: str, top_k: int = 40, *,
                from_date: Optional[str] = None, to_date: Optional[str] = None,
                source: Optional[str] = None, topic: Optional[str] = None,
