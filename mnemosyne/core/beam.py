@@ -12321,10 +12321,77 @@ class BeamMemory:
             result["fleet_conflict_census"] = {"error": type(exc).__name__}
         return result
 
+    def _consolidate_without_summary(self, rows, reason: str, dry_run: bool) -> Dict:
+        """Sleep hygiene: mark rows consolidated with no LLM call and no episodic
+        summary. consolidation_claimed_at stays NULL, so reclaim_orphans() never
+        re-queues them."""
+        ids = [row["id"] for row in rows]
+        skipped = len(ids)
+        if not dry_run:
+            now_iso = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+            placeholders = ",".join("?" * len(ids))
+            cursor = self.conn.execute(
+                f"UPDATE working_memory SET consolidated_at = ?, consolidation_claimed_at = NULL "
+                f"WHERE id IN ({placeholders}) AND consolidated_at IS NULL",
+                (now_iso, *ids),
+            )
+            skipped = cursor.rowcount
+            self.conn.commit()
+            self._invalidate_query_cache_after_commit("sleep.hygiene_skip")
+        logger.debug("sleep: hygiene skip (%s) session=%r rows=%d dry_run=%s",
+                     reason, self.session_id, skipped, dry_run)
+        return {"status": "skipped", "reason": reason, "dry_run": dry_run,
+                "items_skipped": skipped, "items_consolidated": 0, "summaries_created": 0,
+                "llm_used": 0, "conflicts_resolved": 0, "conflicts_detected_only": 0}
+
+    def archive_consolidated(self, older_than_days: float, max_rows: Optional[int] = 2000) -> int:
+        """Retention: archive conversation rows consolidated more than N days ago.
+
+        Same convention as manual cleanups (valid_until = now, superseded_by =
+        'archived:consolidated'), which recall and sleep already honour. Pinned
+        rows and every non-conversation source are never touched. At most
+        max_rows (None = no cap), oldest first. Returns the archived count and
+        writes one audit_log row when that table exists."""
+        now = datetime.now(timezone.utc)
+        cutoff = (now - timedelta(days=float(older_than_days))).replace(tzinfo=None).isoformat()
+        cursor = self.conn.execute(
+            """
+            UPDATE working_memory
+            SET valid_until = ?, superseded_by = 'archived:consolidated'
+            WHERE id IN (
+                SELECT id FROM working_memory
+                WHERE source = 'conversation'
+                  AND consolidated_at IS NOT NULL
+                  AND datetime(consolidated_at) < datetime(?)
+                  AND superseded_by IS NULL
+                  AND (pinned IS NULL OR pinned = 0)
+                ORDER BY datetime(consolidated_at) ASC
+                LIMIT ?
+            )
+            """,
+            (now.isoformat(), cutoff, -1 if max_rows is None else max(0, int(max_rows))),
+        )
+        archived = cursor.rowcount
+        if archived and self.conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'audit_log'").fetchone():
+            self.conn.execute(
+                "INSERT INTO audit_log (timestamp, action, source_tool, reason, metadata_json) "
+                "VALUES (?, 'archive_consolidated', 'nightly_sleep', ?, ?)",
+                (now.timestamp(), f"consolidated more than {older_than_days} days ago",
+                 json.dumps({"count": archived, "cutoff": cutoff,
+                             "superseded_by": "archived:consolidated"})),
+            )
+        self.conn.commit()
+        if archived:
+            self._invalidate_query_cache_after_commit("archive_consolidated")
+        return archived
+
     def sleep(self, dry_run: bool = False, force: bool = False,
               allow_aaak: bool = True, run_maintenance: bool = True,
               _fleet_census: bool = True,
-              min_age_hours: Optional[float] = None) -> Dict:
+              min_age_hours: Optional[float] = None,
+              skip_session_patterns=None,
+              min_session_chars: int = 0) -> Dict:
         """
         Consolidate old working_memory for this session into episodic summaries.
         Uses a local lightweight LLM when available; falls back to aaak
@@ -12351,6 +12418,12 @@ class BeamMemory:
         non-consolidated working memories immediately regardless of age.
         min_age_hours overrides SLEEP_AGE_HOURS for this call only.
 
+        Hygiene (both off by default): when this session id matches
+        skip_session_patterns (see filters.compile_hygiene_patterns), or the
+        eligible rows total fewer than min_session_chars characters, the rows
+        are marked consolidated with no LLM call and no episodic summary
+        (status "skipped"), so they never come back.
+
         Post-E8b (additive): every sleep pass also emits
         ``fleet_conflict_census`` — a read-only cross-bank census of conflict
         rows (see :mod:`mnemosyne.core.fleet_census`) recomputed here rather
@@ -12363,7 +12436,9 @@ class BeamMemory:
         """
         from mnemosyne.core.aaak import encode as aaak_encode
         from mnemosyne.core import local_llm
-        from mnemosyne.core.filters import current_write_policy
+        from mnemosyne.core.filters import (
+            compile_hygiene_patterns, current_write_policy, matches_hygiene_patterns,
+        )
 
         sleep_write_policy = None
         cursor = self.conn.cursor()
@@ -12474,6 +12549,16 @@ class BeamMemory:
             # The bound is recomputed on the no-op path too: a pass with
             # nothing to consolidate still ran a sleep.
             return self._attach_fleet_conflict_census(result, _fleet_census)
+
+        skip_reason = None
+        if skip_session_patterns and matches_hygiene_patterns(
+                compile_hygiene_patterns(skip_session_patterns), self.session_id or ""):
+            skip_reason = "session_pattern"
+        elif min_session_chars and sum(len(r["content"] or "") for r in rows) < min_session_chars:
+            skip_reason = "min_session_chars"
+        if skip_reason:
+            return self._attach_fleet_conflict_census(
+                self._consolidate_without_summary(rows, skip_reason, dry_run), _fleet_census)
 
         # Atomic claim: mark rows consolidated_at BEFORE writing the
         # episodic summary, gated on consolidated_at IS STILL NULL.
@@ -13005,7 +13090,9 @@ class BeamMemory:
                            time_budget_seconds: Optional[float] = None,
                            require_host_llm: bool = False,
                            session_lock=None,
-                           min_age_hours: Optional[float] = None) -> Dict:
+                           min_age_hours: Optional[float] = None,
+                           skip_session_patterns=None,
+                           min_session_chars: int = 0) -> Dict:
         """
         Consolidate eligible old working memories across all sessions.
 
@@ -13031,9 +13118,15 @@ class BeamMemory:
 
         min_age_hours overrides SLEEP_AGE_HOURS for this sweep only (the
         nightly run passes its own cutoff; the module global is never mutated).
+
+        skip_session_patterns / min_session_chars are passed to each sleep()
+        (see there); skipped sessions are counted in sessions_skipped/items_skipped.
         """
         import time
         from mnemosyne.core import local_llm
+        from mnemosyne.core.filters import compile_hygiene_patterns
+        if skip_session_patterns:
+            skip_session_patterns = compile_hygiene_patterns(skip_session_patterns)
 
         started = time.monotonic()
         # The select and the census below share the DB with the host's Beam:
@@ -13094,6 +13187,8 @@ class BeamMemory:
         attempted = 0
         conflicts_resolved = 0
         conflicts_detected_only = 0
+        sessions_skipped = 0
+        items_skipped = 0
 
         for row in session_rows:
             if (time_budget_seconds is not None and attempted
@@ -13139,7 +13234,9 @@ class BeamMemory:
                                         allow_aaak=not require_host_llm,
                                         run_maintenance=not require_host_llm,
                                         _fleet_census=False,
-                                        min_age_hours=min_age_hours)
+                                        min_age_hours=min_age_hours,
+                                        skip_session_patterns=skip_session_patterns,
+                                        min_session_chars=min_session_chars)
                 result = dict(result)
                 result["session_id"] = session_id
                 result["eligible"] = row["eligible"] if hasattr(row, "keys") else row[1]
@@ -13155,6 +13252,9 @@ class BeamMemory:
                     refresh = result.get("model_refresh") or {}
                     model_refresh_proposals += int(refresh.get("proposals", 0) or 0)
                     model_refresh_applied += int(refresh.get("applied", 0) or 0)
+                elif result.get("status") == "skipped":
+                    sessions_skipped += 1
+                    items_skipped += int(result.get("items_skipped", 0) or 0)
             except Exception as exc:
                 logger.error(
                     "sleep_all_sessions: session %r consolidation failed: %s",
@@ -13193,6 +13293,8 @@ class BeamMemory:
             "status": "dry_run" if dry_run else ("consolidated" if items_consolidated else "no_op"),
             "sessions_scanned": len(session_rows),
             "sessions_consolidated": sessions_consolidated,
+            "sessions_skipped": sessions_skipped,
+            "items_skipped": items_skipped,
             "stopped_reason": stopped_reason,
             "items_consolidated": items_consolidated,
             "summaries_created": summaries_created,

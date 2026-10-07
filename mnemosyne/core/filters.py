@@ -395,6 +395,35 @@ def write_policy_operation(
 # Public API
 # ---------------------------------------------------------------------------
 
+def compile_hygiene_patterns(raw: object) -> Tuple[re.Pattern, ...]:
+    """Memory-hygiene rules: a list, or a comma/newline-separated string.
+
+    Case-insensitive regex search; an invalid regex matches as a literal
+    substring. List items are never split, so use a list for regexes with commas.
+    """
+    if isinstance(raw, (list, tuple, set, frozenset)):
+        items = list(raw)
+    else:
+        items = str(raw or "").replace(",", "\n").split("\n")
+    out = []
+    for item in items:
+        if isinstance(item, re.Pattern):
+            out.append(item)
+            continue
+        pattern = str(item).strip()
+        if not pattern:
+            continue
+        try:
+            out.append(re.compile(pattern, re.IGNORECASE))
+        except re.error:
+            out.append(re.compile(re.escape(pattern), re.IGNORECASE))
+    return tuple(out)
+
+
+def matches_hygiene_patterns(patterns, text: str) -> bool:
+    return any(p.search(text or "") for p in patterns)
+
+
 def matches_patterns(content: str, patterns: List[str]) -> bool:
     """Check if content matches any regex pattern.
 

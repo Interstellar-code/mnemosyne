@@ -364,6 +364,33 @@ def _sync_turn_assistant_limit() -> int:
         )
         return 800
 
+
+# Leading reply/quote prefixes that carry earlier assistant text back in on a
+# user turn (strip_reply_quotes). Hermes gateway (Telegram etc.):
+# gateway/run_inbound.py _prepend_inbound_reply_context. SwitchUI chat:
+# src/screens/chat/quote-markers.ts (quote blocks, then a one-line reply marker).
+# ponytail: the first `"]` + blank line ends a gateway quote; a quoted reply
+# that itself contains `"]\n\n` leaves its tail in the stored text.
+_REPLY_QUOTE_PREFIXES = (
+    re.compile(r'\[Replying to(?: your previous message)?: ".*?"\]\n\n', re.DOTALL),
+    re.compile(r'> ?\[Quote: ?#\d+\][ \t]*\n(?:>[^\n]*\n)*\n'),
+    re.compile(r'(?:> ?\[Re: ?#\d+\]|​\[reply:#\d+\])[^\n]*\n\n'),
+)
+
+
+def _strip_reply_quotes(text: str) -> str:
+    """Drop leading reply/quote prefixes, keeping only the user's own words."""
+    rest = text
+    while True:
+        for pattern in _REPLY_QUOTE_PREFIXES:
+            match = pattern.match(rest)
+            if match:
+                rest = rest[match.end():]
+                break
+        else:
+            return rest.lstrip() if rest is not text else text
+
+
 def _sanitize_prefetch_query(query: str) -> str:
     """Use core's shared sanitizer lazily to preserve diagnostic CLI imports."""
     from mnemosyne.core.query_sanitize import sanitize_prefetch_query
@@ -1361,7 +1388,8 @@ def _parse_env_optional_int(key: str, default: Optional[int]) -> Optional[int]:
 
 def _run_cross_session_sweep(sleep_args: Dict[str, Any], owner: str, agent_context: str, beam_lock,
                              *, max_sessions: Optional[int], time_budget: Optional[float],
-                             min_age_hours: Optional[float] = None) -> Dict[str, Any]:
+                             min_age_hours: Optional[float] = None,
+                             hygiene: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Bounded host-LLM-only sleep_all_sessions() sweep. Caller holds _SWEEP_LOCK.
 
     Shared by the every-N-turns auto-sleep and the nightly run. The sweep
@@ -1376,7 +1404,9 @@ def _run_cross_session_sweep(sleep_args: Dict[str, Any], owner: str, agent_conte
         # outliving its process) are never retried otherwise. 6h staleness:
         # well past any sweep's time budget, so in-flight claims are never stolen.
         sleep_beam.reclaim_orphans(stale_after_seconds=CONSOLIDATION_RETRY_BACKOFF_SECONDS)
-    extra = {} if min_age_hours is None else {"min_age_hours": min_age_hours}
+    extra = dict(hygiene or {})  # sleep_skip_session_patterns / sleep_min_session_chars
+    if min_age_hours is not None:
+        extra["min_age_hours"] = min_age_hours
     return sleep_beam.sleep_all_sessions(
         max_sessions=max_sessions,
         time_budget_seconds=time_budget,
@@ -1462,14 +1492,25 @@ def _nightly_tick(job: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         result = _run_cross_session_sweep(
             job["sleep_args"], job["owner"], job["agent_context"], job["beam_lock"],
             max_sessions=job["max_sessions"], time_budget=job["time_budget"],
-            min_age_hours=job["age_hours"],
+            min_age_hours=job["age_hours"], hygiene=job.get("hygiene"),
         )
         logger.info(
-            "Mnemosyne nightly sleep: sessions=%s items=%s summaries=%s llm=%s errors=%s stopped=%s",
+            "Mnemosyne nightly sleep: sessions=%s items=%s summaries=%s llm=%s errors=%s stopped=%s "
+            "skipped_sessions=%s skipped_items=%s",
             result.get("sessions_consolidated"), result.get("items_consolidated"),
             result.get("summaries_created"), result.get("llm_used"), result.get("errors"),
-            result.get("stopped_reason"),
+            result.get("stopped_reason"), result.get("sessions_skipped"), result.get("items_skipped"),
         )
+        if job.get("archive_after_days"):
+            try:
+                with job["beam_lock"]:
+                    archived = _get_beam_class()(**job["sleep_args"]).archive_consolidated(
+                        job["archive_after_days"], job.get("archive_max_rows", 2000))
+                result["archived"] = archived
+                logger.info("Mnemosyne nightly retention: archived %d conversation row(s) "
+                            "consolidated more than %s day(s) ago", archived, job["archive_after_days"])
+            except Exception as exc:
+                logger.warning("Mnemosyne nightly retention failed: %s", exc, exc_info=True)
         stray = _default_owner_fact_count(job["db_path"])
         if stray:
             logger.warning("Mnemosyne nightly sleep: %d current canonical facts under owner 'default' "
@@ -1515,6 +1556,15 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
 
     # Class-level fallback for instances built via __new__ (tests); __init__ sets {"cron"}.
     _passive_skip_contexts: Set[str] = frozenset()
+    # Memory hygiene (config: see get_config_schema); class-level = off, for __new__ tests.
+    _skip_session_patterns: tuple = ()
+    _skip_turn_patterns: tuple = ()
+    _min_turn_chars: int = 0
+    _strip_reply_quotes_enabled: bool = False
+    _sleep_skip_session_patterns: tuple = ()
+    _sleep_min_session_chars: int = 0
+    _archive_after_days: Optional[int] = None
+    _archive_max_rows: Optional[int] = 2000
 
     # One cross-session auto-sleep sweep in flight per process. Class-level
     # because a gateway runs one provider instance per agent session, all
@@ -1618,6 +1668,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             "max_duration_ms": 0.0,
             "last_error": None,
             "in_flight": 0,
+            "hygiene_skipped": 0,
         }
         self._auto_sleep_threshold = 50
         self._auto_sleep_enabled = _parse_env_bool("MNEMOSYNE_AUTO_SLEEP_ENABLED", True)
@@ -1869,6 +1920,22 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                     logger.warning("Mnemosyne: invalid %s=%r, keeping %s", key, raw, getattr(self, attr, None))
         self._nightly_max_sessions = _coerce_optional_int(_cfg("nightly_sleep_max_sessions"),
                                                           getattr(self, "_nightly_max_sessions", None))
+
+        # memory hygiene: kwargs > config.yaml > MNEMOSYNE_<KEY> env > off
+        from mnemosyne.core.filters import compile_hygiene_patterns
+
+        def _hyg(key):
+            val = _cfg(key)
+            return os.environ.get(f"MNEMOSYNE_{key.upper()}") if val is None else val
+        self._skip_session_patterns = compile_hygiene_patterns(_hyg("skip_session_patterns"))
+        self._skip_turn_patterns = compile_hygiene_patterns(_hyg("skip_turn_patterns"))
+        self._sleep_skip_session_patterns = compile_hygiene_patterns(_hyg("sleep_skip_session_patterns"))
+        self._strip_reply_quotes_enabled = _coerce_bool(_hyg("strip_reply_quotes"), False)
+        self._min_turn_chars = _coerce_optional_int(_hyg("min_turn_chars"), 0) or 0
+        self._sleep_min_session_chars = _coerce_optional_int(_hyg("sleep_min_session_chars"), 0) or 0
+        # Only a positive day count enables retention.
+        self._archive_after_days = _coerce_optional_int(_hyg("archive_consolidated_after_days"), None) or None
+        self._archive_max_rows = _coerce_optional_int(_hyg("archive_consolidated_max_rows"), 2000)
 
         # reflect guardrails: prefer kwargs, then memory.mnemosyne.reflect,
         # then flat memory.mnemosyne keys, then env/defaults set in __init__.
@@ -2133,6 +2200,14 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             {"key": "nightly_sleep_age_hours", "description": "Nightly sweep consolidates working memories older than this many hours. Env: MNEMOSYNE_NIGHTLY_SLEEP_AGE_HOURS.", "default": 24},
             {"key": "nightly_sleep_time_budget", "description": "Seconds after which the nightly sweep stops starting new sessions. Env: MNEMOSYNE_NIGHTLY_SLEEP_TIME_BUDGET.", "default": 1800},
             {"key": "nightly_sleep_max_sessions", "description": "Max sessions per nightly sweep; unset or negative = no cap. Env: MNEMOSYNE_NIGHTLY_SLEEP_MAX_SESSIONS.", "default": None},
+            {"key": "skip_session_patterns", "description": "Regexes/substrings (list, or comma-separated) matched against the stored session id (hermes_<id>); a match means the turn is not stored. Env: MNEMOSYNE_SKIP_SESSION_PATTERNS.", "default": []},
+            {"key": "skip_turn_patterns", "description": "Regexes/substrings matched against the user text (after strip_reply_quotes); a match means the turn is not stored. Env: MNEMOSYNE_SKIP_TURN_PATTERNS.", "default": []},
+            {"key": "min_turn_chars", "description": "User text shorter than this (after strip_reply_quotes and whitespace trim) is not stored. 0 = off. Env: MNEMOSYNE_MIN_TURN_CHARS.", "default": 0},
+            {"key": "strip_reply_quotes", "description": "Store only the user's own words: drop leading gateway '[Replying to: \"...\"]' and SwitchUI '> [Quote: #N]' / '> [Re: #N]' prefixes. Env: MNEMOSYNE_STRIP_REPLY_QUOTES.", "default": False},
+            {"key": "sleep_skip_session_patterns", "description": "Sessions whose id matches are not LLM-summarised by sleep; their eligible rows are marked consolidated with no summary. Env: MNEMOSYNE_SLEEP_SKIP_SESSION_PATTERNS.", "default": []},
+            {"key": "sleep_min_session_chars", "description": "A session whose sleep-eligible rows total fewer chars is marked consolidated with no LLM summary. 0 = off. Env: MNEMOSYNE_SLEEP_MIN_SESSION_CHARS.", "default": 0},
+            {"key": "archive_consolidated_after_days", "description": "Nightly run: archive conversation rows consolidated more than N days ago (valid_until=now, superseded_by='archived:consolidated'); never pinned or non-conversation rows. Unset/0 = off. Env: MNEMOSYNE_ARCHIVE_CONSOLIDATED_AFTER_DAYS.", "default": None},
+            {"key": "archive_consolidated_max_rows", "description": "Max rows archived per night (oldest first); negative = no cap. Env: MNEMOSYNE_ARCHIVE_CONSOLIDATED_MAX_ROWS.", "default": 2000},
             {"key": "sleep_threshold", "description": "Working memory count before auto-sleep triggers", "default": 50},
             {"key": "recall_include_canonical", "description": "Merge the profile's current canonical facts matching the query into mnemosyne_recall results (ranked first, max 3) and prefetch context. Env: MNEMOSYNE_RECALL_INCLUDE_CANONICAL.", "default": True},
             {"key": "sleep_sweep_max_sessions", "description": "Max sessions (oldest first) consolidated per cross-session auto-sleep sweep. Negative disables the cap. Env: MNEMOSYNE_SLEEP_SWEEP_MAX_SESSIONS.", "default": 10},
@@ -2424,6 +2499,9 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 "age_hours": self._nightly_age_hours,
                 "time_budget": self._nightly_time_budget,
                 "max_sessions": self._nightly_max_sessions,
+                "hygiene": self._sleep_hygiene_kwargs(),
+                "archive_after_days": self._archive_after_days,
+                "archive_max_rows": self._archive_max_rows,
                 "stop": threading.Event(),
             }
             job["thread"] = threading.Thread(target=_nightly_loop, args=(job,),
@@ -2627,6 +2705,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 "max_duration_ms": 0.0,
                 "last_error": None,
                 "in_flight": 0,
+                "hygiene_skipped": 0,
             }
 
     def _ensure_beam_access_lock(self):
@@ -2699,6 +2778,20 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                     if had_memory_channel:
                         memory.channel_id = memory_channel
 
+    def _sleep_hygiene_kwargs(self) -> Dict[str, Any]:
+        """sleep()/sleep_all_sessions() hygiene args; empty when off (current behaviour)."""
+        out: Dict[str, Any] = {}
+        if self._sleep_skip_session_patterns:
+            out["skip_session_patterns"] = self._sleep_skip_session_patterns
+        if self._sleep_min_session_chars:
+            out["min_session_chars"] = self._sleep_min_session_chars
+        return out
+
+    def _note_hygiene_skip(self, reason: str) -> None:
+        logger.debug("Mnemosyne sync_turn: not stored (%s)", reason)
+        with self._sync_turn_lock:
+            self._sync_turn_telemetry["hygiene_skipped"] = self._sync_turn_telemetry.get("hygiene_skipped", 0) + 1
+
     def _sync_turn_diagnostics(self) -> Dict[str, Any]:
         """Return a PII-safe snapshot of sync_turn telemetry."""
         self._ensure_sync_turn_telemetry()
@@ -2733,7 +2826,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 in_flight,
             )
         try:
-            from mnemosyne.core.filters import write_policy_operation
+            from mnemosyne.core.filters import matches_hygiene_patterns, write_policy_operation
             policy = self._resolve_effective_write_policy()
             with write_policy_operation(
                 policy
@@ -2741,9 +2834,27 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 ledger_session_id = str(session_id or "").strip()
                 if ledger_session_id and not getattr(self, "_active_session_id", ""):
                     self._active_session_id = ledger_session_id
-                if "user" in self._sync_roles and user_content and len(user_content) > 5:
+                # Write-time hygiene (all off by default). Session/turn patterns
+                # drop the whole turn; min_turn_chars drops only the user row.
+                user_text = user_content or ""
+                if user_text and self._strip_reply_quotes_enabled:
+                    user_text = _strip_reply_quotes(user_text)
+                skip = None
+                if self._skip_session_patterns and matches_hygiene_patterns(
+                        self._skip_session_patterns, str(getattr(self._beam, "session_id", "") or "")):
+                    skip = "session_pattern"
+                elif user_text and self._skip_turn_patterns and matches_hygiene_patterns(
+                        self._skip_turn_patterns, user_text):
+                    skip = "turn_pattern"
+                if skip:
+                    self._note_hygiene_skip(skip)
+                store_user = not skip and "user" in self._sync_roles and len(user_text) > 5
+                if store_user and len(user_text.strip()) < self._min_turn_chars:
+                    self._note_hygiene_skip("min_turn_chars")
+                    store_user = False
+                if store_user:
                     user_limit = _sync_turn_user_limit()
-                    uc = user_content[:user_limit] if user_limit > 0 else user_content
+                    uc = user_text[:user_limit] if user_limit > 0 else user_text
                     stored_user = f"[USER] {uc}"
                     capture = ledger.capture if ledger else None
                     remember = (lambda **kw: capture(ledger_session_id, ticket, self._beam, user_content, **kw)) if capture else self._beam.remember
@@ -2753,11 +2864,11 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                         importance=0.5,
                         scope="session",
                         extract_entities=True,
-                        _write_policy_content=user_content,
+                        _write_policy_content=user_text,
                     )
                     if user_memory_id is not None:
-                        self._capture_identity_signals(user_content)
-                if "assistant" in self._sync_roles and assistant_content and len(assistant_content) > 10:
+                        self._capture_identity_signals(user_text)
+                if not skip and "assistant" in self._sync_roles and assistant_content and len(assistant_content) > 10:
                     assistant_limit = _sync_turn_assistant_limit()
                     ac = assistant_content[:assistant_limit] if assistant_limit > 0 else assistant_content
                     stored_assistant = f"[ASSISTANT] {ac}"
@@ -2986,6 +3097,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 beam_lock = self._ensure_beam_access_lock()
                 max_sessions = self._sweep_max_sessions
                 time_budget = self._sweep_time_budget
+                hygiene = self._sleep_hygiene_kwargs()
                 def _sleep_isolated():
                     try:
                         if not sweep:
@@ -2994,11 +3106,11 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                                 sleep_beam = BeamClass(**sleep_args)
                                 sleep_beam.canonical_owner_id = self._canonical_owner()
                                 sleep_beam.agent_context = self._agent_context
-                                sleep_beam.sleep()
+                                sleep_beam.sleep(**hygiene)
                             return
                         result = _run_cross_session_sweep(
                             sleep_args, self._canonical_owner(), self._agent_context, beam_lock,
-                            max_sessions=max_sessions, time_budget=time_budget,
+                            max_sessions=max_sessions, time_budget=time_budget, hygiene=hygiene,
                         )
                         logger.info(
                             "Mnemosyne auto-sleep sweep: sessions=%s items=%s llm=%s stopped=%s",
@@ -4966,6 +5078,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                     "channel_id": beam.channel_id,
                 }
                 beam_lock = self._ensure_beam_access_lock()
+                hygiene = self._sleep_hygiene_kwargs()
 
             def _sleep_with_logging():
                 # Wrap the target so exceptions get logged at the same
@@ -4980,7 +5093,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                         sleep_beam = BeamClass(**sleep_args)
                         sleep_beam.canonical_owner_id = self._canonical_owner()
                         sleep_beam.agent_context = self._agent_context
-                        sleep_beam.sleep()
+                        sleep_beam.sleep(**hygiene)
                 except Exception as inner:
                     logger.warning("Mnemosyne session-end sleep failed: %s", inner)
 
