@@ -17,7 +17,7 @@ def beam(tmp_path, monkeypatch):
     monkeypatch.setattr(lcd, "CONFLICT_LLM_BASE_URL", "https://validator.test/v1")
     monkeypatch.setattr(lcd, "CONFLICT_LLM_API_KEY", "fake-key")
     monkeypatch.setattr("mnemosyne.core.local_llm.llm_available", lambda: False)
-    monkeypatch.setattr("mnemosyne.core.model_refresh.infer_model_update_proposals", lambda items: [])
+    monkeypatch.setattr("mnemosyne.core.model_refresh.infer_model_update_proposals", lambda items, **_: [])
     memory = BeamMemory(session_id="first-session", db_path=tmp_path / "memory.db")
     for session in ("first-session", "second-session"):
         for i in range(3):

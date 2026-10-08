@@ -29,7 +29,7 @@ def isolated_conflict_config(monkeypatch):
     monkeypatch.setattr(beam_module, "_CONFLICT_PAIR_BUDGET", 20)
     monkeypatch.setattr(beam_module, "_CONFLICT_TIME_BUDGET_S", 300.0)
     monkeypatch.setattr("mnemosyne.core.local_llm.llm_available", lambda: False)
-    monkeypatch.setattr("mnemosyne.core.model_refresh.infer_model_update_proposals", lambda items: [])
+    monkeypatch.setattr("mnemosyne.core.model_refresh.infer_model_update_proposals", lambda items, **_: [])
 
 
 @pytest.fixture

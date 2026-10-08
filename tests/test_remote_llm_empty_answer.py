@@ -330,9 +330,9 @@ class TestSleepWarning:
         _seed_old_wm(temp_db, "empty-answer", "conversation", n=2)
 
         monkeypatch.setattr(local_llm, "llm_available", lambda: True)
-        monkeypatch.setattr(local_llm, "chunk_memories_by_budget", lambda lines, source=None: [lines])
+        monkeypatch.setattr(local_llm, "chunk_memories_by_budget", lambda lines, source=None, **_: [lines])
 
-        def fake_summarize(lines, source=None):
+        def fake_summarize(lines, source=None, **_):
             local_llm._last_llm_failure = (
                 f"thinking-model: HTTP 200 with no usable choices ({EMPTY_REASON})"
             )

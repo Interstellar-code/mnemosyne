@@ -216,7 +216,7 @@ class TestSleepPostClaimRobustness:
         conn.commit()
         conn.close()
 
-        def fake_infer(items):
+        def fake_infer(items, **_):
             return [
                 _proposal(evidence_ids=[item["id"] for item in items], confidence="high")
             ]

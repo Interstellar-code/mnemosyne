@@ -78,10 +78,10 @@ class TestSleepLockHygiene:
         monkeypatch.setattr(
             local_llm,
             "chunk_memories_by_budget",
-            lambda lines, source=None: [lines],
+            lambda lines, source=None, **_: [lines],
         )
 
-        def fake_summarize(lines, source=None):
+        def fake_summarize(lines, source=None, **_):
             txn_open_during_summarize.append(beam.conn.in_transaction)
             return f"summary of {len(lines)} items"
 

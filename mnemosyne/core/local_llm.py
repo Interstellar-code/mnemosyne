@@ -363,32 +363,217 @@ def _memory_lines(memories: List[str]) -> str:
     return "\n".join(f"- {m}" for m in memories if m)
 
 
-def _format_sleep_prompt(memories: List[str], source: str = "") -> Optional[str]:
-    """Render MNEMOSYNE_SLEEP_PROMPT when configured.
+# --- Dynamic sleep prompts ----------------------------------------------------
+# Prompt templates are looked up when a sweep starts (resolve_prompt_vars), so
+# an edited prompt file applies on the next night without a restart. Per kind:
+# (config key naming a file, default file name in the profile's Mnemosyne
+# config dir, config key holding the template text itself).
+_PROMPT_SOURCES = {
+    "sleep": ("sleep_prompt_file", "sleep_prompt.md", "sleep_prompt"),
+    "model_refresh": ("sleep_model_refresh_prompt_file", "model_refresh_prompt.md",
+                      "sleep_model_refresh_prompt"),
+}
+# Keys in prompt_vars carrying the templates resolved for this sweep.
+_TEMPLATE_KEYS = {"sleep": "_sleep_template", "model_refresh": "_model_refresh_template"}
+PROMPT_VAR_DEFAULTS = {
+    "principal": "the user",
+    "principal_card": "(no description on file)",
+    "existing_slots": "(none)",
+    "profile": "default",
+    "session_kind": "chat",
+    "date_range": "unknown date",
+}
+_render_warned = False
 
-    Supported placeholders:
-    - {source}: source label passed by sleep() / summarize_memories()
-    - {memories}: newline-separated bullet list of source memories
-    - {memory_count}: number of non-empty memories in this chunk
+
+def _prompt_setting(key: str, settings: Optional[dict] = None):
+    """settings (host config, e.g. Hermes memory.mnemosyne.*) > Mnemosyne
+    config.yaml > env. Blank counts as unset at every level, so a seeded empty
+    config.yaml value never shadows the env var."""
+    val = (settings or {}).get(key)
+    if val in (None, ""):
+        try:
+            from mnemosyne.core.config import ENV_VAR_MAP, get_config
+            val = get_config().get(key)
+            if val in (None, ""):
+                env = ENV_VAR_MAP.get(key)
+                val = os.environ.get(env) if env else None
+        except Exception:
+            val = None
+    return None if val in (None, "") else val
+
+
+def _sleep_prompt_template(kind: str, settings: Optional[dict] = None) -> Optional[str]:
+    """Return the operator's template for ``kind`` ("sleep"/"model_refresh"), or None.
+
+    Precedence: configured file path > ``<profile mnemosyne dir>/<kind file>``
+    if it exists > template text from config/env (MNEMOSYNE_SLEEP_PROMPT /
+    MNEMOSYNE_SLEEP_MODEL_REFRESH_PROMPT) > None (built-in prompt).
     """
-    if not SLEEP_PROMPT:
+    file_key, default_name, text_key = _PROMPT_SOURCES[kind]
+    paths = []
+    configured = _prompt_setting(file_key, settings)
+    if configured:
+        paths.append(Path(str(configured)).expanduser())
+    try:
+        from mnemosyne.core.config import _default_config_path
+        paths.append(_default_config_path().parent / default_name)
+    except Exception:
+        pass
+    for i, path in enumerate(paths):
+        try:
+            text = path.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            if configured and i == 0:
+                logger.warning("sleep prompt: cannot read %s=%s (%s); trying the next source",
+                               file_key, path, exc)
+            continue
+        if text:
+            return text
+    text = str(_prompt_setting(text_key, settings) or "").strip()
+    if not text and kind == "sleep":
+        text = SLEEP_PROMPT  # import-time env value, kept for compatibility
+    return text or None
+
+
+class _PromptVars(dict):
+    def __missing__(self, key):  # unknown placeholder -> "" instead of KeyError
+        return ""
+
+
+def _render_prompt(template: str, values: dict) -> Optional[str]:
+    """Render ``template`` with str.format_map; None (+ one WARNING) on error."""
+    global _render_warned
+    try:
+        return template.format_map(_PromptVars(values))
+    except (ValueError, IndexError, KeyError, AttributeError, TypeError) as exc:
+        if not _render_warned:
+            _render_warned = True
+            logger.warning("sleep prompt: template does not render (%s: %s); using the "
+                           "built-in prompt. Literal braces must be doubled: {{ }}",
+                           type(exc).__name__, exc)
         return None
-    non_empty = [m for m in memories if m]
-    return SLEEP_PROMPT.format(
-        source=source,
-        memories=_memory_lines(memories),
-        memory_count=len(non_empty),
+
+
+def _first_sentence_name(body: str) -> Optional[str]:
+    """Name from an identity body such as "Rohit Sharma. Lives in ..."."""
+    first = re.split(r"(?<=[.!?])\s", body.strip(), maxsplit=1)[0].strip().rstrip(".!?").strip()
+    first = re.sub(r"^(?:the\s+)?user(?:'s\s+name)?\s+is\s+", "", first, flags=re.I)
+    first = re.split(r"[,;(]", first, maxsplit=1)[0].strip()  # "Rohit, 45, ..." -> "Rohit"
+    return first if 0 < len(first) <= 40 else None
+
+
+def _cut_card(body: str, limit: int) -> str:
+    body = " ".join(body.split())
+    if len(body) <= limit:
+        return body
+    head = body[:limit]
+    ends = [m.end() for m in re.finditer(r"[.!?](?=\s|$)", head)]
+    return head[:ends[-1]] if ends else head.rsplit(" ", 1)[0]
+
+
+def resolve_prompt_vars(conn, db_path, owner_id: str, *, card_chars: Optional[int] = None,
+                        settings: Optional[dict] = None) -> dict:
+    """Resolve the per-sweep prompt variables and templates. Never raises.
+
+    {principal}: setting principal_name > first sentence of the owner's
+    model:user/identity slot > "the user". {principal_card}: that slot only,
+    cut at a sentence end within sleep_prompt_card_chars (0 = omit).
+    {existing_slots}: the owner's model:* slot names. Templates are read here,
+    once per sweep, so every chunk of the sweep sees the same prompt.
+    """
+    global _render_warned
+    _render_warned = False
+    out = dict(PROMPT_VAR_DEFAULTS)
+    out["profile"] = owner_id or "default"
+    out["_slot_names"] = None  # unknown: parse keeps names verbatim
+    for kind, key in _TEMPLATE_KEYS.items():
+        try:
+            out[key] = _sleep_prompt_template(kind, settings)
+        except Exception as exc:
+            logger.debug("sleep prompt: %s template lookup failed: %s", kind, exc)
+            out[key] = None
+    name = str(_prompt_setting("principal_name", settings) or "").strip()
+    if name:
+        out["principal"] = name
+    if card_chars is None:
+        try:
+            raw = _prompt_setting("sleep_prompt_card_chars", settings)
+            card_chars = 300 if raw is None else int(raw)
+        except (TypeError, ValueError):
+            card_chars = 300
+    try:
+        from mnemosyne.core.canonical import CanonicalStore
+        store = CanonicalStore(db_path=db_path, conn=conn)
+        row = store.recall(out["profile"], "model:user", "identity")
+        body = str((row or {}).get("body") or "").strip()
+        if body and card_chars > 0:
+            out["principal_card"] = _cut_card(body, card_chars)
+        out["principal"] = name or (_first_sentence_name(body) if body else None) or "the user"
+        slots = [f"{r['category']}/{r['name']}" for r in store.list(out["profile"])
+                 if str(r.get("category") or "").startswith("model:")]
+        out["_slot_names"] = tuple(slots)
+        if slots:
+            out["existing_slots"] = "\n".join(f"- {s}" for s in slots)
+    except Exception as exc:
+        logger.debug("sleep prompt: variable resolution failed, using defaults: %s", exc)
+    return out
+
+
+def session_kind(session_id: Optional[str]) -> str:
+    """dm / group / api / cli from the stored session id shape; else "chat"."""
+    sid = str(session_id or "")
+    if ":dm:" in sid:
+        return "dm"
+    if ":group:" in sid:
+        return "group"
+    if sid.startswith("hermes_api_"):
+        return "api"
+    if sid.startswith("hermes_") and ":" not in sid:
+        return "cli"
+    return "chat"
+
+
+def date_range(items) -> str:
+    """"YYYY-MM-DD" or "YYYY-MM-DD to YYYY-MM-DD" over the rows' timestamps."""
+    days = sorted(
+        str(item.get("timestamp") or "")[:10] for item in items or ()
+        if re.match(r"\d{4}-\d{2}-\d{2}", str(item.get("timestamp") or ""))
     )
+    if not days:
+        return "unknown date"
+    return days[0] if days[0] == days[-1] else f"{days[0]} to {days[-1]}"
 
 
-def _build_prompt(memories: List[str], source: str = "") -> str:
+def _format_sleep_prompt(memories: List[str], source: str = "",
+                         prompt_vars: Optional[dict] = None) -> Optional[str]:
+    """Render the operator's sleep prompt, or None for the built-in prompt.
+
+    Placeholders: {source}, {memories} (bullet list), {memory_count},
+    {principal}, {principal_card}, {profile}, {session_kind}, {date_range};
+    unknown ones render empty. A render error returns None (built-in prompt),
+    so a broken template never strands claimed rows.
+    """
+    if prompt_vars is not None and _TEMPLATE_KEYS["sleep"] in prompt_vars:
+        template = prompt_vars[_TEMPLATE_KEYS["sleep"]]
+    else:
+        template = _sleep_prompt_template("sleep")
+    if not template:
+        return None
+    values = {**PROMPT_VAR_DEFAULTS, **(prompt_vars or {})}
+    values.update(source=source, memories=_memory_lines(memories),
+                  memory_count=len([m for m in memories if m]))
+    return _render_prompt(template, values)
+
+
+def _build_prompt(memories: List[str], source: str = "", prompt_vars: Optional[dict] = None) -> str:
     """Build a consolidation prompt from a list of memory strings.
 
     Uses a plain-text instruction format (no special model tokens)
     suitable for both local GGUF models and any LLM. For host LLM
     calls, use :func:`_build_host_prompt` instead.
     """
-    custom = _format_sleep_prompt(memories, source=source)
+    custom = _format_sleep_prompt(memories, source=source, prompt_vars=prompt_vars)
     if custom is not None:
         return custom
 
@@ -403,14 +588,14 @@ def _build_prompt(memories: List[str], source: str = "") -> str:
     return prompt
 
 
-def _build_host_prompt(memories: List[str], source: str = "") -> str:
+def _build_host_prompt(memories: List[str], source: str = "", prompt_vars: Optional[dict] = None) -> str:
     """Plain-text consolidation prompt for host LLMs (no local-model tokens).
 
     The host adapter wraps this string as the user-message content of a
     Chat Completions call; embedding local-model chat-template tokens here
     would degrade output quality on every modern aux provider.
     """
-    custom = _format_sleep_prompt(memories, source=source)
+    custom = _format_sleep_prompt(memories, source=source, prompt_vars=prompt_vars)
     if custom is not None:
         return custom
 
@@ -501,6 +686,34 @@ def _is_invalid_reasoning_output(value: object) -> bool:
     return value is _INVALID_REASONING_OUTPUT
 
 
+NOTHING_DURABLE = "NOTHING_DURABLE"
+
+
+class _NothingDurable:
+    """Private marker: the model judged the notes not worth remembering.
+
+    Falsy like _INVALID_REASONING_OUTPUT, so callers that only test truthiness
+    treat it as "no text"; sleep() checks it explicitly so the rows are closed
+    instead of retried (a retried group would be a paid call every night)."""
+
+    def __bool__(self) -> bool:
+        return False
+
+
+_NOTHING_DURABLE = _NothingDurable()
+
+
+def _is_nothing_durable(value: object) -> bool:
+    return value is _NOTHING_DURABLE
+
+
+def _nothing_durable_or(text):
+    """Map a bare NOTHING_DURABLE reply to the sentinel; pass anything else through."""
+    if isinstance(text, str) and re.fullmatch(r"\W*NOTHING_DURABLE\W*", text, re.I):
+        return _NOTHING_DURABLE
+    return text
+
+
 def _sanitize_reasoning_output(text: str):
     """Remove balanced think traces and reject malformed traces fail-closed."""
     if not isinstance(text, str):
@@ -563,7 +776,8 @@ def _prompt_token_budget() -> int:
     return max(64, n_ctx - overhead - output_reserve - safety_margin)
 
 
-def chunk_memories_by_budget(memories: List[str], source: str = "") -> List[List[str]]:
+def chunk_memories_by_budget(memories: List[str], source: str = "",
+                             prompt_vars: Optional[dict] = None) -> List[List[str]]:
     """Split memories into chunks that fit within the LLM context window."""
     if not memories:
         return []
@@ -573,12 +787,15 @@ def chunk_memories_by_budget(memories: List[str], source: str = "") -> List[List
     current_chunk = []
     current_tokens = 0
 
-    header = (
-        "Summarize the following memories into 1-3 concise sentences. "
-        "Preserve facts, names, preferences, and decisions. Discard fluff."
-    )
-    if source:
-        header += f" Source: {source}."
+    # A custom template's size counts against the budget, not the built-in's.
+    header = _format_sleep_prompt([], source=source, prompt_vars=prompt_vars)
+    if header is None:
+        header = (
+            "Summarize the following memories into 1-3 concise sentences. "
+            "Preserve facts, names, preferences, and decisions. Discard fluff."
+        )
+        if source:
+            header += f" Source: {source}."
     header_tokens = _estimate_tokens(header + "\n\n")
 
     format_overhead = _estimate_tokens("- \n")
@@ -857,7 +1074,7 @@ def _call_remote_llm(prompt: str, temperature: float = 0.3) -> Optional[str]:
 
 
 def _summarize_memories(
-    memories: List[str], source: str = ""
+    memories: List[str], source: str = "", *, prompt_vars: Optional[dict] = None
 ):
     """Summarize a batch of working-memory items into a single episodic string.
 
@@ -874,6 +1091,10 @@ def _summarize_memories(
     2. llama-cpp-python (ARM64 + x86_64 native).
     3. ctransformers (x86_64 only, legacy).
     4. Return None → caller falls back to AAAK encoding.
+
+    A reply of exactly NOTHING_DURABLE (any backend) becomes the
+    ``_NOTHING_DURABLE`` sentinel: such chunks are dropped, and the sentinel is
+    returned only when every chunk was judged not durable.
     """
     # A failure left by an earlier call must not be reported for this one.
     global _last_llm_failure
@@ -883,12 +1104,15 @@ def _summarize_memories(
 
     # Chunk large memory lists to stay within context window limits.
     # chunk_memories_by_budget() respects LLM_N_CTX and safety margins.
-    chunks = chunk_memories_by_budget(memories, source=source)
+    chunks = chunk_memories_by_budget(memories, source=source, prompt_vars=prompt_vars)
 
     def _summarize_chunk(chunk_memories: List[str], chunk_source: str = ""):
+        return _nothing_durable_or(_summarize_chunk_text(chunk_memories, chunk_source))
+
+    def _summarize_chunk_text(chunk_memories: List[str], chunk_source: str = ""):
         """Summarize a single chunk of memories via the fallback chain."""
-        host_prompt = _build_host_prompt(chunk_memories, source=chunk_source)
-        prompt = _build_prompt(chunk_memories, source=chunk_source)
+        host_prompt = _build_host_prompt(chunk_memories, source=chunk_source, prompt_vars=prompt_vars)
+        prompt = _build_prompt(chunk_memories, source=chunk_source, prompt_vars=prompt_vars)
 
         # 0. Host backend.
         attempted, text = _try_host_llm(host_prompt, max_tokens=LLM_MAX_TOKENS, temperature=0.3)
@@ -925,15 +1149,18 @@ def _summarize_memories(
 
     # Summarize each chunk individually.
     chunk_summaries = []
+    nothing_durable = 0
     for chunk in chunks:
         summary = _summarize_chunk(chunk, chunk_source=source)
         if _is_invalid_reasoning_output(summary):
             return _INVALID_REASONING_OUTPUT
-        if summary:
+        if _is_nothing_durable(summary):
+            nothing_durable += 1
+        elif summary:
             chunk_summaries.append(summary)
 
     if not chunk_summaries:
-        return None
+        return _NOTHING_DURABLE if chunks and nothing_durable == len(chunks) else None
 
     # If multiple chunks, do a second-pass summary to consolidate chunk summaries.
     if len(chunk_summaries) > 1:
@@ -945,7 +1172,8 @@ def _summarize_memories(
     return chunk_summaries[0]
 
 
-def summarize_memories(memories: List[str], source: str = "") -> Optional[str]:
-    """Public summary API; malformed reasoning degrades to no LLM output."""
-    summary = _summarize_memories(memories, source=source)
+def summarize_memories(memories: List[str], source: str = "", *,
+                       prompt_vars: Optional[dict] = None) -> Optional[str]:
+    """Public summary API; malformed reasoning and NOTHING_DURABLE degrade to None."""
+    summary = _summarize_memories(memories, source=source, prompt_vars=prompt_vars)
     return summary if isinstance(summary, str) else None

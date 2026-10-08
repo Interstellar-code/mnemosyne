@@ -5626,6 +5626,9 @@ class BeamMemory:
         # set this attribute after construction.
         self.canonical_owner_id = "default"
         self.agent_context = "primary"
+        # Sleep prompt variables resolved once per sweep by sleep_all_sessions()
+        # and handed to alien beams like canonical_owner_id; None = resolve in sleep().
+        self._sleep_prompt_vars: Optional[dict] = None
         # Coerce path-like inputs (e.g. tempfile-produced strings) to a
         # Path so downstream consumers like _get_connection that do
         # `path.parent.mkdir(...)` don't blow up with
@@ -12391,7 +12394,8 @@ class BeamMemory:
               _fleet_census: bool = True,
               min_age_hours: Optional[float] = None,
               skip_session_patterns=None,
-              min_session_chars: int = 0) -> Dict:
+              min_session_chars: int = 0,
+              prompt_settings: Optional[dict] = None) -> Dict:
         """
         Consolidate old working_memory for this session into episodic summaries.
         Uses a local lightweight LLM when available; falls back to aaak
@@ -12423,6 +12427,14 @@ class BeamMemory:
         eligible rows total fewer than min_session_chars characters, the rows
         are marked consolidated with no LLM call and no episodic summary
         (status "skipped"), so they never come back.
+
+        Dynamic prompts: the sleep / model-refresh templates and their
+        variables ({principal}, {principal_card}, {existing_slots}, ...) are
+        resolved once per call (or once per sweep, via _sleep_prompt_vars);
+        prompt_settings carries host-config overrides (principal_name,
+        sleep_prompt_file, ...). A group the LLM answers with NOTHING_DURABLE
+        is closed like a hygiene skip: no episodic row, no model refresh, no
+        retry; counted in items_skipped and nothing_durable.
 
         Post-E8b (additive): every sleep pass also emits
         ``fleet_conflict_census`` — a read-only cross-bank census of conflict
@@ -12636,9 +12648,22 @@ class BeamMemory:
         conflict_calls = 0
         pairs_skipped_budget = 0
         superseded_older_ids = set()
+        nothing_durable_groups = 0
+        nothing_durable_items = 0
+        base_prompt_vars = getattr(self, "_sleep_prompt_vars", None)
+        if base_prompt_vars is None and not dry_run and local_llm.llm_available():
+            base_prompt_vars = local_llm.resolve_prompt_vars(
+                self.conn, self.db_path,
+                str(getattr(self, "canonical_owner_id", "") or "").strip() or "default",
+                settings=prompt_settings)
         for source, items in grouped.items():
             lines = [item["content"] for item in items]
             ids = [item["id"] for item in items]
+            prompt_vars = None
+            if base_prompt_vars is not None:
+                prompt_vars = {**base_prompt_vars,
+                               "session_kind": local_llm.session_kind(self.session_id),
+                               "date_range": local_llm.date_range(items)}
 
             # Aggregate scope: if ANY item is global, the summary is global
             aggregated_scope = "session"
@@ -12771,24 +12796,30 @@ class BeamMemory:
                 if compression_plugin and compression_plugin.enabled:
                     lines = compression_plugin.compress_lines(lines)
 
-                chunks = local_llm.chunk_memories_by_budget(lines, source=source)
+                chunks = local_llm.chunk_memories_by_budget(lines, source=source, prompt_vars=prompt_vars)
                 if chunks:
                     invalid_reasoning = False
                     if len(chunks) == 1:
                         # All memories fit in one prompt.
-                        summary = local_llm._summarize_memories(chunks[0], source=source)
+                        summary = local_llm._summarize_memories(chunks[0], source=source, prompt_vars=prompt_vars)
                         invalid_reasoning = local_llm._is_invalid_reasoning_output(summary)
                     else:
                         # Multi-chunk: any malformed trace invalidates the
                         # complete LLM result instead of silently dropping it.
                         chunk_summaries = []
+                        nothing_durable_chunks = 0
                         for chunk in chunks:
-                            chunk_summary = local_llm._summarize_memories(chunk, source=source)
+                            chunk_summary = local_llm._summarize_memories(
+                                chunk, source=source, prompt_vars=prompt_vars)
                             if local_llm._is_invalid_reasoning_output(chunk_summary):
                                 invalid_reasoning = True
                                 break
-                            if chunk_summary:
+                            if local_llm._is_nothing_durable(chunk_summary):
+                                nothing_durable_chunks += 1
+                            elif chunk_summary:
                                 chunk_summaries.append(chunk_summary)
+                        if not invalid_reasoning and nothing_durable_chunks == len(chunks):
+                            summary = local_llm._NOTHING_DURABLE
                         if not invalid_reasoning and chunk_summaries:
                             # Second-pass: summarize the chunk summaries.
                             if len(chunk_summaries) == 1:
@@ -12797,6 +12828,7 @@ class BeamMemory:
                                 summary = local_llm._summarize_memories(
                                     chunk_summaries,
                                     source=f"{source} (consolidated)",
+                                    prompt_vars=prompt_vars,
                                 )
                                 invalid_reasoning = local_llm._is_invalid_reasoning_output(summary)
                                 # Preserve the existing non-reasoning fallback.
@@ -12813,6 +12845,25 @@ class BeamMemory:
                     if summary:
                         llm_used_count += 1
                         llm_succeeded = True
+
+            if local_llm._is_nothing_durable(summary):
+                # The LLM judged the group not worth remembering. Close it like
+                # a hygiene skip (consolidated_at stays from the claim, claim
+                # marker cleared): no episodic row, no AAAK, no model refresh,
+                # and never un-claimed -- a retry would be a paid call per night.
+                logger.info("sleep: NOTHING_DURABLE session=%r source=%r rows=%d — "
+                            "closed without a summary", self.session_id, source, len(ids))
+                if not dry_run:
+                    group_placeholders = ",".join("?" * len(ids))
+                    cursor.execute(
+                        f"UPDATE working_memory SET consolidation_claimed_at = NULL "
+                        f"WHERE id IN ({group_placeholders})",
+                        tuple(ids),
+                    )
+                    self.conn.commit()
+                nothing_durable_groups += 1
+                nothing_durable_items += len(ids)
+                continue
 
             if summary is None and not allow_aaak:
                 logger.warning(
@@ -12854,9 +12905,11 @@ class BeamMemory:
             if not dry_run and agent_context != "cron":
                 try:
                     from mnemosyne.core import model_refresh
-                    proposals = model_refresh.infer_model_update_proposals(items)
+                    proposals = model_refresh.infer_model_update_proposals(items, prompt_vars=prompt_vars)
                 except Exception:
                     proposals = []
+                # Only updates can become canonical; keep/ignore rows were pure noise.
+                proposals = [p for p in proposals if str(p.get("action") or "update") == "update"]
             model_refresh_proposals += len(proposals)
 
             if not dry_run:
@@ -13033,10 +13086,22 @@ class BeamMemory:
 
         method = "llm" if llm_used_count == summaries_created else ("llm+aaak" if llm_used_count > 0 else "aaak")
         if not dry_run and not consolidated_ids:
-            # Only reachable with allow_aaak=False: every group was un-claimed.
+            if nothing_durable_groups and nothing_durable_groups == len(grouped):
+                # Every group was NOTHING_DURABLE: report it like a hygiene skip.
+                return self._attach_fleet_conflict_census(
+                    {"status": "skipped", "reason": "nothing_durable", "dry_run": False,
+                     "items_skipped": nothing_durable_items,
+                     "nothing_durable": nothing_durable_groups,
+                     "items_consolidated": 0, "summaries_created": 0, "llm_used": 0,
+                     "conflicts_resolved": conflicts_resolved,
+                     "conflicts_detected_only": conflicts_detected_only},
+                    _fleet_census)
+            # Otherwise only reachable with allow_aaak=False: groups were un-claimed.
             return self._attach_fleet_conflict_census(
                 {"status": "no_op", "message": "No LLM summary; rows left for a later sleep",
-                 "items_consolidated": 0, "summaries_created": 0, "llm_used": 0},
+                 "items_consolidated": 0, "summaries_created": 0, "llm_used": 0,
+                 "items_skipped": nothing_durable_items,
+                 "nothing_durable": nothing_durable_groups},
                 _fleet_census)
         if not dry_run:
             cursor.execute("""
@@ -13076,6 +13141,8 @@ class BeamMemory:
             "conflicts_detected_only": conflicts_detected_only,
             "llm_used": llm_used_count,
             "method": method,
+            "items_skipped": nothing_durable_items,
+            "nothing_durable": nothing_durable_groups,
             "consolidated_ids": consolidated_ids,
             "degradation": degrade_result,
             "model_refresh": {
@@ -13092,7 +13159,8 @@ class BeamMemory:
                            session_lock=None,
                            min_age_hours: Optional[float] = None,
                            skip_session_patterns=None,
-                           min_session_chars: int = 0) -> Dict:
+                           min_session_chars: int = 0,
+                           prompt_settings: Optional[dict] = None) -> Dict:
         """
         Consolidate eligible old working memories across all sessions.
 
@@ -13121,6 +13189,12 @@ class BeamMemory:
 
         skip_session_patterns / min_session_chars are passed to each sleep()
         (see there); skipped sessions are counted in sessions_skipped/items_skipped.
+
+        Sleep prompt variables and templates are resolved ONCE here (see
+        local_llm.resolve_prompt_vars) and handed to every per-session beam,
+        so a model refresh that rewrites the identity slot mid-sweep cannot
+        change the prompt between sessions, and an edited prompt file applies
+        from the next sweep. prompt_settings: see sleep().
         """
         import time
         from mnemosyne.core import local_llm
@@ -13189,6 +13263,14 @@ class BeamMemory:
         conflicts_detected_only = 0
         sessions_skipped = 0
         items_skipped = 0
+        nothing_durable = 0
+        sweep_prompt_vars = None
+        if not dry_run:
+            with session_lock or contextlib.nullcontext():
+                sweep_prompt_vars = local_llm.resolve_prompt_vars(
+                    self.conn, self.db_path,
+                    str(getattr(self, "canonical_owner_id", "") or "").strip() or "default",
+                    settings=prompt_settings)
 
         for row in session_rows:
             if (time_budget_seconds is not None and attempted
@@ -13230,13 +13312,18 @@ class BeamMemory:
                     # the caller's so model refresh writes into the right owner.
                     beam.canonical_owner_id = self.canonical_owner_id
                     beam.agent_context = self.agent_context
-                    result = beam.sleep(dry_run=dry_run, force=force,
-                                        allow_aaak=not require_host_llm,
-                                        run_maintenance=not require_host_llm,
-                                        _fleet_census=False,
-                                        min_age_hours=min_age_hours,
-                                        skip_session_patterns=skip_session_patterns,
-                                        min_session_chars=min_session_chars)
+                    saved_prompt_vars = getattr(beam, "_sleep_prompt_vars", None)
+                    beam._sleep_prompt_vars = sweep_prompt_vars
+                    try:
+                        result = beam.sleep(dry_run=dry_run, force=force,
+                                            allow_aaak=not require_host_llm,
+                                            run_maintenance=not require_host_llm,
+                                            _fleet_census=False,
+                                            min_age_hours=min_age_hours,
+                                            skip_session_patterns=skip_session_patterns,
+                                            min_session_chars=min_session_chars)
+                    finally:
+                        beam._sleep_prompt_vars = saved_prompt_vars
                 result = dict(result)
                 result["session_id"] = session_id
                 result["eligible"] = row["eligible"] if hasattr(row, "keys") else row[1]
@@ -13254,7 +13341,8 @@ class BeamMemory:
                     model_refresh_applied += int(refresh.get("applied", 0) or 0)
                 elif result.get("status") == "skipped":
                     sessions_skipped += 1
-                    items_skipped += int(result.get("items_skipped", 0) or 0)
+                items_skipped += int(result.get("items_skipped", 0) or 0)
+                nothing_durable += int(result.get("nothing_durable", 0) or 0)
             except Exception as exc:
                 logger.error(
                     "sleep_all_sessions: session %r consolidation failed: %s",
@@ -13295,6 +13383,7 @@ class BeamMemory:
             "sessions_consolidated": sessions_consolidated,
             "sessions_skipped": sessions_skipped,
             "items_skipped": items_skipped,
+            "nothing_durable": nothing_durable,
             "stopped_reason": stopped_reason,
             "items_consolidated": items_consolidated,
             "summaries_created": summaries_created,

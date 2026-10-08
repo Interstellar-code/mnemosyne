@@ -247,7 +247,7 @@ def test_sleep_proposal_is_system_derived_exempt(tmp_path: Path, monkeypatch):
             (f"source-{index}", f"evidence {index}", old),
         )
     beam.conn.commit()
-    monkeypatch.setattr(model_refresh, "infer_model_update_proposals", lambda _items: [{
+    monkeypatch.setattr(model_refresh, "infer_model_update_proposals", lambda _items, **_: [{
         "category": "model:workflow", "name": "issue821",
         "body": "ISSUE821 derived proposal", "confidence": 0.5,
         "evidence_ids": ["source-0", "source-1"], "action": "update",
@@ -329,7 +329,7 @@ def test_sleep_consolidation_is_system_derived_exempt(tmp_path: Path, monkeypatc
         )
     beam.conn.commit()
     monkeypatch.setattr(local_llm, "llm_available", lambda: False)
-    monkeypatch.setattr(model_refresh, "infer_model_update_proposals", lambda _items: [])
+    monkeypatch.setattr(model_refresh, "infer_model_update_proposals", lambda _items, **_: [])
     monkeypatch.setattr(beam_module._embeddings, "available", lambda: False)
     strict = WritePolicySnapshot((r"^\[conversation\]",), "strict")
     resolutions = 0

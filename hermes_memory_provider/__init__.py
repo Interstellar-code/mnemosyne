@@ -2206,6 +2206,11 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             {"key": "strip_reply_quotes", "description": "Store only the user's own words: drop leading gateway '[Replying to: \"...\"]' and SwitchUI '> [Quote: #N]' / '> [Re: #N]' prefixes. Env: MNEMOSYNE_STRIP_REPLY_QUOTES.", "default": False},
             {"key": "sleep_skip_session_patterns", "description": "Sessions whose id matches are not LLM-summarised by sleep; their eligible rows are marked consolidated with no summary. Env: MNEMOSYNE_SLEEP_SKIP_SESSION_PATTERNS.", "default": []},
             {"key": "sleep_min_session_chars", "description": "A session whose sleep-eligible rows total fewer chars is marked consolidated with no LLM summary. 0 = off. Env: MNEMOSYNE_SLEEP_MIN_SESSION_CHARS.", "default": 0},
+            {"key": "principal_name", "description": "Name of the person the agent works for, used as {principal} in the sleep and model-refresh prompts. Unset: first sentence of the profile's model:user/identity slot, else 'the user'. Env: MNEMOSYNE_PRINCIPAL_NAME.", "default": None},
+            {"key": "sleep_prompt_file", "description": "Sleep summary prompt template file, read at each sweep (no restart). Default <profile mnemosyne dir>/sleep_prompt.md if it exists, then MNEMOSYNE_SLEEP_PROMPT, then built-in. Placeholders: {principal} {principal_card} {profile} {session_kind} {date_range} {source} {memory_count} {memories}; literal braces doubled. Env: MNEMOSYNE_SLEEP_PROMPT_FILE.", "default": None},
+            {"key": "sleep_model_refresh_prompt_file", "description": "Model-refresh prompt template file, read at each sweep. Default <profile mnemosyne dir>/model_refresh_prompt.md if it exists, then sleep_model_refresh_prompt, then built-in. Extra placeholders: {existing_slots} {categories}. Env: MNEMOSYNE_SLEEP_MODEL_REFRESH_PROMPT_FILE.", "default": None},
+            {"key": "sleep_model_refresh_prompt", "description": "Model-refresh prompt template text (used when no prompt file is found). Env: MNEMOSYNE_SLEEP_MODEL_REFRESH_PROMPT.", "default": None},
+            {"key": "sleep_prompt_card_chars", "description": "Max chars of the model:user/identity slot rendered as {principal_card}, cut at a sentence end. 0 = omit. Env: MNEMOSYNE_SLEEP_PROMPT_CARD_CHARS.", "default": 300},
             {"key": "archive_consolidated_after_days", "description": "Nightly run: archive conversation rows consolidated more than N days ago (valid_until=now, superseded_by='archived:consolidated'); never pinned or non-conversation rows. Unset/0 = off. Env: MNEMOSYNE_ARCHIVE_CONSOLIDATED_AFTER_DAYS.", "default": None},
             {"key": "archive_consolidated_max_rows", "description": "Max rows archived per night (oldest first); negative = no cap. Env: MNEMOSYNE_ARCHIVE_CONSOLIDATED_MAX_ROWS.", "default": 2000},
             {"key": "sleep_threshold", "description": "Working memory count before auto-sleep triggers", "default": 50},
@@ -2785,7 +2790,22 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             out["skip_session_patterns"] = self._sleep_skip_session_patterns
         if self._sleep_min_session_chars:
             out["min_session_chars"] = self._sleep_min_session_chars
+        # Sleep-prompt settings from Hermes memory.mnemosyne.* (the engine alone
+        # only sees Mnemosyne config.yaml/env). Prompt FILES are read per sweep.
+        prompt = {}
+        for key in self._SLEEP_PROMPT_KEYS:
+            try:
+                val = self._read_config_key(key)
+            except Exception:
+                val = None
+            if val not in (None, ""):
+                prompt[key] = val
+        if prompt:
+            out["prompt_settings"] = prompt
         return out
+
+    _SLEEP_PROMPT_KEYS = ("principal_name", "sleep_prompt_file", "sleep_model_refresh_prompt_file",
+                          "sleep_model_refresh_prompt", "sleep_prompt_card_chars")
 
     def _note_hygiene_skip(self, reason: str) -> None:
         logger.debug("Mnemosyne sync_turn: not stored (%s)", reason)

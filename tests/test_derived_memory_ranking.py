@@ -329,7 +329,7 @@ class TestProposalImportanceCap:
 
         from mnemosyne.core import model_refresh
 
-        def fake_proposals(items):
+        def fake_proposals(items, **_):
             return [{
                 "category": "project",
                 "name": "test_slot",
@@ -381,7 +381,7 @@ class TestProposalImportanceCap:
 
         from mnemosyne.core import model_refresh
 
-        def fake_proposals(items):
+        def fake_proposals(items, **_):
             return [{
                 "category": "project",
                 "name": "auto_apply_slot",

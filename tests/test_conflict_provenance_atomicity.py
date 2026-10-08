@@ -16,7 +16,7 @@ def memory(tmp_path, monkeypatch):
     monkeypatch.setattr(lcd, "CONFLICT_LLM_API_KEY", "fake-key")
     monkeypatch.setattr(lcd, "validate_conflict_pair", lambda *a, **kw: (True, 0.97, "corrected"))
     monkeypatch.setattr("mnemosyne.core.local_llm.llm_available", lambda: False)
-    monkeypatch.setattr("mnemosyne.core.model_refresh.infer_model_update_proposals", lambda items: [])
+    monkeypatch.setattr("mnemosyne.core.model_refresh.infer_model_update_proposals", lambda items, **_: [])
     mem = bm.BeamMemory(session_id="atomic", db_path=tmp_path / "memory.db")
     for i in range(3):
         mem.conn.execute(

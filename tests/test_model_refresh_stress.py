@@ -45,7 +45,7 @@ def test_sleep_model_refresh_auto_applies_good_and_rejects_bad(tmp_path, monkeyp
         ],
     )
 
-    def fake_infer(items):
+    def fake_infer(items, **_):
         return [
             {
                 "category": "model:workflow",
@@ -119,7 +119,7 @@ def test_sleep_model_refresh_auto_apply_uses_beam_owner_namespace(tmp_path, monk
         ],
     )
 
-    def fake_infer(items):
+    def fake_infer(items, **_):
         return [
             {
                 "category": "model:workflow",
@@ -156,7 +156,7 @@ def test_sleep_model_refresh_skips_cron_context(tmp_path, monkeypatch):
         ],
     )
 
-    def fake_infer(items):
+    def fake_infer(items, **_):
         raise AssertionError("cron sleep must not run model-refresh inference")
 
     monkeypatch.setattr(model_refresh, "infer_model_update_proposals", fake_infer)
